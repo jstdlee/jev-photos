@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=jev photos
+Name[zh_CN]=jev 照片整理
+Comment=Organize photos by recovered capture date, with jev decisions and vision tagging
+Comment[zh_CN]=按还原的拍摄日期整理照片，jev 决策与视觉识别打标签
+Exec=jev-photos
+Icon=image-x-generic
+Terminal=false
+Categories=Graphics;Photography;
+StartupWMClass=jev-photos
