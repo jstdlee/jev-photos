@@ -45,7 +45,7 @@ Settings → *File operation*:
 *Names*: `20190512_00001.jpg`, or **keep the original name** as a prefix. The prefix is the old name without its
 dates, times, serial numbers and copy markers: `IMG_20190512_123456.jpg` → `IMG_20190512_00001.jpg`,
 `Paris trip 2019-05-12 (3).jpg` → `Paris trip_20190512_00001.jpg`, `Screenshot 2024-01-02 at 10.11.12.png` →
-`Screenshot_20240102_00001.png`, `DSC01234.JPG` → `DSC_…`. Both choices sit at the top of Actions → Organize files (and in
+`Screenshot_20240102_00001.png`, `DSC01234.JPG` → `DSC_…`. Both choices sit at the top of Actions → Organization (and in
 Settings); changing one rebuilds the list, and **Apply all** does the renames/copies and the metadata together.
 
 ### Preview before anything changes
@@ -58,11 +58,11 @@ row shows the exact exiv2 commands (additions only). You can untick items or use
 Apply re-checks that the destination is still free and the source hasn't changed since the scan. Results appear per
 row.
 
-Actions → Organize files is a **From → To** table with the total files, bytes and an estimated time (copying ~150 MB/s,
+Actions → Organization is a **From → To** table with the total files, bytes and an estimated time (copying ~150 MB/s,
 metadata ~40 ms per file). *Move extra copies to Trash…* shows the same kind of table (group, file moving to the
 Trash, the copy that stays, size) with totals and a time estimate before anything moves.
 
-![Actions → Organize files: From → To table with totals and estimated time](docs/review.png)
+![Actions → Organization: From → To table with totals and estimated time](docs/review.png)
 
 ### Duplicates, sizes and fast hashing
 
@@ -184,7 +184,7 @@ already has:
 4. Otherwise, by *Settings → Existing descriptions* (default: **Rules + LLM, jev cross-checks**). The LLM chooses
    keep / append / replace. jev answers two yes/no statements ("is this a placeholder?", "does ours add
    information?"). When they agree, the choice is applied. When they disagree, the photo is marked **you decide**
-   in Actions → Organize files (*N descriptions to decide*, buttons keep / append / replace), and it stays unchanged until you choose.
+   in Actions → Organization (*N descriptions to decide*, buttons keep / append / replace), and it stays unchanged until you choose.
    Other settings: only fill empty fields; Rules + LLM; always ask.
 
 *Replace* always keeps the old text in `Xmp.jev.PreviousDescription`. Choices are remembered per (old text, new
@@ -225,23 +225,45 @@ and searchable. A long name (more than 4 words or 30 characters) is reduced by t
 | Tab | |
 |---|---|
 | Overview | what was found, and what to do next |
-| Photos | browse and search; **★ Favorites** (only starred photos) and **Grid** (thumbnails) are view options |
-| Actions | everything that changes files or the catalog: **Organize files** · **Tags & metadata** · **Corrections** · **Duplicates**; a "What is what" line explains file name, tags, keywords, description and EXIF/XMP |
+| Photos | browse and search; **★ Favorites** (only starred photos), **Grid** (thumbnails), and **Move to Trash…** for the selected photos (Ctrl/Shift+click selects several; Delete key; asks first, restorable) |
+| Actions | everything that changes files or the catalog, in this order: **Duplicates** (best done first) · **Organization** (files only: copy, move or rename into month folders, with the name style) · **Metadata** (each photo's tags, *Fill in missing tags*, the tag list editor, and *Write into files*: missing dates, keywords, descriptions and places) · **CLIP** (image analysis: missing / quick / re-analyse / re-tag, and *Smart update*) · **Corrections** |
 | Settings | models, servers, naming, decision rules |
 
-The main action of each screen is in the accent colour; actions that change or remove original files (move, rename
-in place, write into originals, move to Trash, replace a description) are red. Every button and option has a tooltip.
+The window has no system title bar: drag the top bar to move it, double-click to maximise, and use the grip in the
+bottom-right corner to resize. Panes are separated by splitters you can drag. **?** (top right) opens help: what is
+what (file name, tags, CLIP, keywords, description, EXIF/XMP, AI prompt, corrections, jev, LLM), keys, the search
+syntax, credits and the project page.
+
+The main action of each screen is in the accent colour. Actions that change or remove original files (move, rename
+in place, write into originals, move to Trash, replace a description, delete a tag) are red. Every button and option
+explains itself after the mouse rests on it for 2 seconds. Labels in the detail panes (paths, dates, places, tags,
+prompts, metadata values) are copied to the clipboard with a click. Features that need the LLM or jev are greyed out,
+with a note, while that server is down (Ask search, the LLM check in Analyze), and their fallbacks are used.
 
 **Analyze** first asks how much image analysis to do, because it is the slow part (CLIP ViT-L/14 is about 0.35 s per
 photo with 8 threads). Image analysis: *only photos not analysed yet* (default), *all photos again*, *quick* (ViT-B/32,
 about 6× faster and less accurate, upgraded on a later normal run) or *skip*. Tags: *only missing or outdated*
-(default), *re-tag all* (seconds: from the stored analysis), or *photos with few tags*. Each choice shows its count
-and an estimated time, and the CPU threads can be set there. *Don't ask again* uses the defaults; Settings turns the
-question back on.
+(default), *re-tag all* (seconds: from the stored analysis), or *photos with few tags*. The check of generated tags
+against AI prompts uses the LLM on the GPU server, so it is off unless ticked there; *Corrections → Check again…*
+also asks first.
+
+**Edit tag list** (Metadata or CLIP): a paged, searchable table of the tags CLIP chooses from, with a category filter,
+add, edit (rename or move to another category) and delete. *Save and re-tag* writes `tags.txt` and recomputes every
+photo's tags from the stored analysis in seconds.
+
+**Smart update** (CLIP): lists the photos worth updating, each with why and who decided. Not analysed yet, or
+analysed with the quick model and weakly tagged: re-analyse (rules). Already well tagged by the quick model: a close
+call, which jev decides ("is re-analysing worth the time?"). Same model with weak or few tags: re-tag with the
+current list (re-analysing would give the same result). You tick and run.
+
+**When the LLM declines** (it refuses some explicit prompts) or is down: prompt keywords come from the prompt's own
+most frequent words and short CJK phrases; corrections use the rules; description decisions go to you; Ask search
+falls back to local ranking.
 
 ### Favorites
 
-Click the star in the Photos table (or press **f**, also in the viewer and the grid). **★ Favorites** in the Photos
+Click the star in the Photos table (or press **f**, also in the viewer and the grid). Favorites are a filter of
+the Photos tab, not a tab of their own. **★ Favorites** in the Photos
 tab shows only starred photos; with **Grid** they are a thumbnail grid (arrows, Enter to view, f to unstar,
 right-click for Find similar). Tags have stars too, in the detail panes:
 starred tags become one-click filter chips under the search box and in Favorites. `is:fav` finds favorites in
@@ -274,7 +296,7 @@ no tags, weak tags only, older tag list, edited by me, no date/keywords/descript
   `tags.txt` takes effect the same way.
 * **Edit tags**: type your own comma-separated tags for a photo. They replace the automatic ones in search and in
   the files, and *Back to automatic tags* undoes that.
-* **Fill in missing metadata…** builds the *Add metadata only* list in Actions → Organize files: every date, keyword, description
+* **Fill in missing metadata…** builds the list under Metadata → *Write into files*: every date, keyword, description
   and place that would be added. The detail pane shows the exact change for the selected photo before you apply.
 * **Rewrite tags**: keywords jev-photos wrote on an earlier run are recorded in `Xmp.jev.Keywords`. When the tags
   improve, those keywords (and only those) are replaced. Keywords the file had on its own are never touched. For

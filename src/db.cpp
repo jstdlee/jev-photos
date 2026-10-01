@@ -686,6 +686,24 @@ void Db::save_name_keywords(int64_t id, const std::string& j) {
     reindex(id);
 }
 
+std::vector<ClipRow> Db::clip_rows(const std::string& folders) {
+    Lock l(mu_);
+    std::string sql = R"(SELECT id, src_path, COALESCE(clip_model,''), COALESCE(clip_tags,''), COALESCE(width,0), COALESCE(height,0),
+                         COALESCE(user_tags,'') FROM photos WHERE (dup_of IS NULL OR dup_of=0))";
+    std::vector<std::string> binds;
+    if (std::string u = under_sql(folders, "src_path", binds); !u.empty()) sql += " AND " + u;
+    Stmt s(db_, sql.c_str());
+    for (auto& b : binds) s.b(b);
+    std::vector<ClipRow> out;
+    while (s.step()) {
+        ClipRow r;
+        r.id = s.i(0); r.src_path = s.t(1); r.clip_model = s.t(2); r.tags = parse_tag_list(s.t(3));
+        r.width = int(s.i(4)); r.height = int(s.i(5)); r.user_tags = !s.t(6).empty();
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
 ClipCounts Db::clip_counts(const std::string& folders, const std::string& model_id, const std::string& vocab) {
     Lock l(mu_);
     ClipCounts k;

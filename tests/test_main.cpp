@@ -2,6 +2,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <ctime>
@@ -526,6 +527,10 @@ static void test_genmeta() {
     auto kw = prompt_keywords(a.prompt);
     CHECK(kw.size() == 3 && kw[0] == "1girl" && kw[1] == "red hat" && kw[2] == "beach");  // "masterpiece" is boilerplate
     CHECK(prompt_keywords("A cinematic photo of an old fisherman mending his nets at dawn, warm light").empty());  // prose
+    auto lk = local_keywords("A cinematic photo of an old fisherman mending his nets at dawn, fisherman smiling, warm light");
+    CHECK(!lk.empty() && lk[0] == "fisherman");  // most frequent meaningful word first; "cinematic", "photo", "light" dropped
+    auto zk = local_keywords("海边的女孩，戴着草帽、微笑");
+    CHECK(std::find(zk.begin(), zk.end(), "戴着草帽") != zk.end());
 
     // ComfyUI graph: text reached through a concatenate node; negative zeroed; seed from a seed node; LoRA; input image
     GenInfo c = parse_comfy_prompt(R"({

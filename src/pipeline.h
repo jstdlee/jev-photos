@@ -57,6 +57,8 @@ struct RunOptions {
     int clip_mode = 0;
     // Tags from the stored analysis: 0 missing or outdated, 1 all, 2 photos with fewer than 2 confident tags
     int tag_mode = 0;
+    // The CLIP tab's smart update: exactly these photos are re-analysed / re-tagged (when either is set).
+    std::vector<int64_t> reanalyse_ids, retag_ids;
 };
 
 // One planned file-system/metadata change, shown in the preview before anything is touched.

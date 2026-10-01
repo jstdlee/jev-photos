@@ -715,6 +715,20 @@ std::vector<TagDef> load_tag_vocabulary() {
     return parse_vocabulary(s);
 }
 
+bool save_tag_vocabulary(const std::vector<TagDef>& tags) {
+    // Keep each category together, in the order categories first appear.
+    std::vector<std::string> cats;
+    for (auto& t : tags)
+        if (std::find(cats.begin(), cats.end(), t.category) == cats.end()) cats.push_back(t.category);
+    std::string out = "# jev-photos tag vocabulary: one tag per line, \"# name\" starts a category.\n# vocabulary-version: 2\n";
+    for (auto& c : cats) {
+        out += "# " + c + "\n";
+        for (auto& t : tags)
+            if (t.category == c && !util::trim(t.tag).empty()) out += util::trim(t.tag) + "\n";
+    }
+    return util::write_file(tag_vocabulary_path(), out);
+}
+
 // Prompt ensembles (as in the CLIP paper): several phrasings per tag, averaged. Single prompts are noisy, and
 // "a photo of ..." alone biases everything towards photographs.
 static bool plural_like(const std::string& t) {

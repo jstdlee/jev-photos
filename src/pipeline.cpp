@@ -739,6 +739,13 @@ void Pipeline::tag(const Config& c_in, const RunOptions& o) {
     else if (o.clip_mode != 3) todo = scoped("(dup_of IS NULL OR dup_of=0) AND (clip_model IS NULL OR clip_model<>'" + info.id + "')", o);
     std::vector<int64_t> tagged = scoped("(dup_of IS NULL OR dup_of=0) AND clip_model='" + info.id + "'", o);
     if (o.clip_mode == 1) tagged.clear();  // they are all re-encoded (and re-tagged) anyway
+    bool chosen = !o.reanalyse_ids.empty() || !o.retag_ids.empty();  // the CLIP tab's smart update
+    if (chosen) {
+        std::set<int64_t> re(o.reanalyse_ids.begin(), o.reanalyse_ids.end()), rt(o.retag_ids.begin(), o.retag_ids.end());
+        todo = scoped("(dup_of IS NULL OR dup_of=0)", o);
+        todo.erase(std::remove_if(todo.begin(), todo.end(), [&](int64_t id) { return !re.count(id); }), todo.end());
+        tagged.erase(std::remove_if(tagged.begin(), tagged.end(), [&](int64_t id) { return !rt.count(id) || re.count(id); }), tagged.end());
+    }
     ClipModel model;
     std::string err;
     if (!model.load(info, c.clip_device, c.clip_threads, !todo.empty(), true, err)) {
@@ -758,7 +765,7 @@ void Pipeline::tag(const Config& c_in, const RunOptions& o) {
     for (int64_t id : tagged) {
         Photo p;
         if (!db_.load(id, p)) continue;
-        bool again = o.retag_all || o.tag_mode == 1 || p.clip_vocab != idx.vocab_hash;
+        bool again = chosen || o.retag_all || o.tag_mode == 1 || p.clip_vocab != idx.vocab_hash;
         if (!again && o.tag_mode == 2) {  // few confident tags: worth another look with the current list
             int sure = 0;
             for (auto& [t, conf] : parse_tag_list(p.clip_tags)) sure += conf >= kTagWordMin;
@@ -859,7 +866,7 @@ void Pipeline::prompt_keywords_llm(const Config& c, const RunOptions& o) {
     if (todo.empty()) return;
     begin(ST_TAG, int(todo.size()));
     std::map<std::string, std::string> done;  // prompt -> keywords JSON
-    int calls = 0, failed = 0;
+    int calls = 0, failed = 0, declined = 0;
     for (int64_t id : todo) {
         if (stop_) return;
         progress.done++;
@@ -881,12 +888,16 @@ void Pipeline::prompt_keywords_llm(const Config& c, const RunOptions& o) {
                 for (auto& k : j["keywords"])
                     if (k.is_string() && !util::trim(k.get<std::string>()).empty() && kw.size() < 10) kw.push_back(util::lower(util::trim(k.get<std::string>())));
             calls++;
+            if (kw.empty() && err.empty()) {
+                // The LLM answered but gave nothing (it declines some prompts): fall back to the prompt's own words.
+                for (auto& k : local_keywords(g.prompt)) kw.push_back(k);
+                if (!kw.empty()) declined++;
+            }
             if (kw.empty()) {
                 failed++;
                 if (!err.empty() && failed == 1) log_.add(1, "prompt keywords: LLM unavailable (" + err + ")");
-                if (failed >= 3 && calls == failed) {  // nothing works (LLM down, or it declines these prompts): next run
-                    log_.add(1, util::fmt("prompt keywords: the LLM gave none for %d prompts%s; stopped, tried again next run", failed,
-                                          err.empty() ? " (it may decline them)" : (" (" + err + ")").c_str()));
+                if (failed >= 3 && calls == failed) {  // the LLM is down: next run
+                    log_.add(1, util::fmt("prompt keywords: the LLM is unavailable%s; tried again next run", err.empty() ? "" : (" (" + err + ")").c_str()));
                     return;
                 }
                 continue;
@@ -896,6 +907,7 @@ void Pipeline::prompt_keywords_llm(const Config& c, const RunOptions& o) {
         db_.save_gen_keywords(id, done[pr]);
     }
     log_.add(0, util::fmt("prompt keywords: %zu photos, %d distinct prompts read by the LLM", todo.size(), calls) +
+                    (declined ? util::fmt(", %d declined by the LLM (keywords taken from the prompt's own words instead)", declined) : "") +
                     (failed ? util::fmt(", %d gave no keywords (tried again next run; the prompt text itself is still searchable)", failed) : ""));
 }
 

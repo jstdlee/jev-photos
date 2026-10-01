@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <regex>
 #include <set>
 
@@ -462,5 +463,58 @@ std::vector<std::string> prompt_keywords(const std::string& prompt, size_t max_n
         if (seen.insert(t).second) out.push_back(t);
         if (out.size() >= max_n) break;
     }
+    return out;
+}
+
+std::vector<std::string> local_keywords(const std::string& prompt, size_t max_n) {
+    static const std::set<std::string> stop = {
+        "the", "and", "with", "from", "that", "this", "into", "onto", "over", "under", "very", "high", "best", "quality", "detailed", "details",
+        "masterpiece", "highly", "ultra", "realistic", "photorealistic", "style", "image", "picture", "photo", "photograph", "background", "lighting",
+        "light", "shot", "view", "looking", "wearing", "standing", "sitting", "their", "there", "while", "without", "only", "should", "would", "keep",
+        "make", "made", "like", "just", "also", "more", "most", "much", "some", "each", "other", "than", "then", "them", "they", "what", "when",
+        "which", "your", "have", "been", "being", "around", "behind", "front", "side", "left", "right", "near", "large", "small", "full", "body",
+        "resolution", "sharp", "focus", "cinematic", "professional", "absolutely", "text", "words", "letters", "typography", "logo", "watermark"};
+    std::string s = clean_prompt(prompt);
+    std::map<std::string, int> freq;
+    std::vector<std::string> order;
+    std::string w;
+    auto flush = [&] {
+        std::string t = util::lower(w);
+        w.clear();
+        if (t.size() < 4 || stop.count(t)) return;
+        if (!freq[t]++) order.push_back(t);
+    };
+    std::vector<std::string> cjk;
+    std::string seg;
+    auto flush_seg = [&] {
+        size_t chars = util::utf8_len(seg);
+        if (chars >= 2 && chars <= 6 && std::find(cjk.begin(), cjk.end(), seg) == cjk.end()) cjk.push_back(seg);
+        seg.clear();
+    };
+    for (size_t i = 0; i < s.size();) {
+        unsigned char c = s[i];
+        size_t n = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
+        if (c < 0x80) {
+            flush_seg();
+            if (isalpha(c)) w += char(c);
+            else flush();
+        } else {
+            flush();
+            std::string ch = s.substr(i, n);
+            // CJK punctuation (U+3000..U+303F, fullwidth forms U+FF00..) ends a phrase
+            bool punct = n == 3 && (((unsigned char)ch[0] == 0xE3 && (unsigned char)ch[1] == 0x80) || ((unsigned char)ch[0] == 0xEF && (unsigned char)ch[1] == 0xBC));
+            if (punct) flush_seg();
+            else seg += ch;
+        }
+        i += n;
+    }
+    flush();
+    flush_seg();
+    std::stable_sort(order.begin(), order.end(), [&](const std::string& x, const std::string& y) { return freq[x] > freq[y]; });
+    std::vector<std::string> out;
+    for (auto& t : order)
+        if (out.size() < max_n) out.push_back(t);
+    for (auto& c : cjk)
+        if (out.size() < max_n + 4) out.push_back(c);
     return out;
 }

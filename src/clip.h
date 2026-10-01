@@ -81,6 +81,7 @@ struct TagDef {
 // the built-in list on first use.
 std::vector<TagDef> load_tag_vocabulary();
 std::string tag_vocabulary_path();
+bool save_tag_vocabulary(const std::vector<TagDef>& tags);  // writes tags.txt (grouped by category, in order)
 
 struct TagIndex {  // text embeddings of the vocabulary prompts (ensembled), for one model
     std::string model_id;

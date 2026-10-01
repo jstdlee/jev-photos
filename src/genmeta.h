@@ -43,3 +43,5 @@ GenInfo parse_comfy_prompt(const std::string& json);  // ComfyUI API graph
 std::string clean_prompt(const std::string& prompt);
 // Tag-style prompts ("1girl, solo, hat, beach") -> their short phrases; empty for prose prompts.
 std::vector<std::string> prompt_keywords(const std::string& prompt, size_t max_n = 20);
+// Without an LLM (or when it declines): the prompt's most frequent meaningful words, and short CJK phrases.
+std::vector<std::string> local_keywords(const std::string& prompt, size_t max_n = 10);
