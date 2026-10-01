@@ -141,6 +141,7 @@ void load_config(Config& c, const std::string& path_in) {
             else if (k == "scan_threads") c.scan_threads = iclamp(v, 1, 32);
             else if (k == "dry_run") c.dry_run = v == "1";
             else if (k == "preview_first") c.preview_first = v == "1";
+            else if (k == "analyze_ask") c.analyze_ask = v == "1";
             else if (k == "last_path") c.last_path = v;
             else if (k == "verify_dupes") c.verify_dupes = v == "1";
             else if (k == "similar_check") c.similar_check = v == "1";
@@ -178,7 +179,7 @@ void save_config(const Config& c, const std::string& path_in) {
       << "\nreview_below=" << c.review_below << "\njev_margin=" << c.jev_margin << "\njev_date_weight=" << c.jev_date_weight
       << "\nloc_w_rules=" << c.loc_w_rules << "\nloc_w_vl=" << c.loc_w_vl << "\nloc_w_jev=" << c.loc_w_jev
       << "\nloc_accept=" << c.loc_accept << "\nmin_year=" << c.min_year << "\nscan_threads=" << c.scan_threads
-      << "\ndry_run=" << c.dry_run << "\npreview_first=" << c.preview_first << "\nlast_path=" << c.last_path
+      << "\ndry_run=" << c.dry_run << "\npreview_first=" << c.preview_first << "\nanalyze_ask=" << c.analyze_ask << "\nlast_path=" << c.last_path
       << "\nverify_dupes=" << c.verify_dupes << "\nsimilar_check=" << c.similar_check << "\nsimilar_threshold=" << c.similar_threshold << "\n";
     util::write_file(path, f.str(), 0600);  // may hold API keys
 }

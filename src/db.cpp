@@ -686,6 +686,25 @@ void Db::save_name_keywords(int64_t id, const std::string& j) {
     reindex(id);
 }
 
+ClipCounts Db::clip_counts(const std::string& folders, const std::string& model_id, const std::string& vocab) {
+    Lock l(mu_);
+    ClipCounts k;
+    std::string sql = "SELECT COALESCE(clip_model,''), COALESCE(clip_vocab,''), COALESCE(clip_tags,'') FROM photos WHERE (dup_of IS NULL OR dup_of=0)";
+    std::vector<std::string> binds;
+    if (std::string u = under_sql(folders, "src_path", binds); !u.empty()) sql += " AND " + u;
+    Stmt s(db_, sql.c_str());
+    for (auto& b : binds) s.b(b);
+    while (s.step()) {
+        k.total++;
+        if (s.t(0) != model_id) { k.no_vec++; continue; }
+        if (s.t(1) != vocab) k.stale++;
+        int sure = 0;
+        for (auto& [t, c] : parse_tag_list(s.t(2))) sure += c >= kTagWordMin;
+        k.few += sure < 2;
+    }
+    return k;
+}
+
 void Db::set_fix_checked(int64_t id, const std::string& key) {
     Lock l(mu_);
     Stmt s(db_, "UPDATE photos SET fix_checked=? WHERE id=?");

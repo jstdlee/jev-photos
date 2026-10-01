@@ -53,6 +53,10 @@ struct RunOptions {
     bool apply_plan = false;    // organize stage executes the stored plan (included items only)
     bool retag_all = false;     // tag stage recomputes every photo's tags (e.g. after tuning the vocabulary)
     bool recheck_all = false;   // correction check looks at every photo again, not only changed ones
+    // Image analysis (CLIP): 0 missing ones, 1 all photos again, 2 quick model (ViT-B/32) for the missing ones, 3 skip
+    int clip_mode = 0;
+    // Tags from the stored analysis: 0 missing or outdated, 1 all, 2 photos with fewer than 2 confident tags
+    int tag_mode = 0;
 };
 
 // One planned file-system/metadata change, shown in the preview before anything is touched.

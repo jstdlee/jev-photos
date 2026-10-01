@@ -143,6 +143,13 @@ struct MonthInfo {
     int64_t bytes = 0;
 };
 
+struct ClipCounts {  // for the Analyze dialog: how much CLIP work each option means
+    int total = 0;        // photos (not duplicates)
+    int no_vec = 0;       // never analysed with this model
+    int stale = 0;        // analysed, tags made with an older tag list
+    int few = 0;          // analysed, fewer than 2 confident tags
+};
+
 struct DbStats {
     int total = 0, resolved = 0, review = 0, undated = 0, vision_done = 0, vision_failed = 0, organized = 0, dups = 0, located = 0;
     int similar = 0, tagged = 0;
@@ -207,6 +214,7 @@ public:
     bool correction_rejected(int64_t photo_id, const std::string& field, const std::string& current, const std::string& proposed);
     void save_tag_fix(int64_t id, const std::string& json);
     void set_fix_checked(int64_t id, const std::string& key);
+    ClipCounts clip_counts(const std::string& folders, const std::string& model_id, const std::string& vocab);
     std::string translation(const std::string& term);  // cached JSON list of equivalents, "" = not cached
     void save_translation(const std::string& term, const std::string& json);
     std::vector<TagRow> tag_rows(const std::string& folder, const std::string& model_id, const std::string& vocab);

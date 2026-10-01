@@ -98,6 +98,7 @@ struct Config {
     int scan_threads = 4;
     bool dry_run = false;
     bool preview_first = true;
+    bool analyze_ask = true;      // GUI: Analyze first asks how much image analysis and tagging to do
     bool verify_dupes = true;     // byte-compare exact duplicates before marking them
     bool similar_check = false;   // also find near duplicates (decodes every image once)
     int similar_threshold = 6;    // max dHash bit difference for "similar"  // GUI: organize stops at the preview; changes need "Apply"

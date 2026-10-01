@@ -730,10 +730,15 @@ void Pipeline::decide(const Config& c, const RunOptions& o) {
 
 // ---- stage 3a: tag (CLIP on the thumbnails; also the semantic search index)
 
-void Pipeline::tag(const Config& c, const RunOptions& o) {
+void Pipeline::tag(const Config& c_in, const RunOptions& o) {
+    Config c = c_in;
+    if (o.clip_mode == 2) c.clip_model = "b32";  // quick: the small model for this run
     ClipInfo info = clip_choose(c);
-    std::vector<int64_t> todo = scoped("(dup_of IS NULL OR dup_of=0) AND (clip_model IS NULL OR clip_model<>'" + info.id + "')", o);
+    std::vector<int64_t> todo;
+    if (o.clip_mode == 1) todo = scoped("(dup_of IS NULL OR dup_of=0)", o);  // every photo again
+    else if (o.clip_mode != 3) todo = scoped("(dup_of IS NULL OR dup_of=0) AND (clip_model IS NULL OR clip_model<>'" + info.id + "')", o);
     std::vector<int64_t> tagged = scoped("(dup_of IS NULL OR dup_of=0) AND clip_model='" + info.id + "'", o);
+    if (o.clip_mode == 1) tagged.clear();  // they are all re-encoded (and re-tagged) anyway
     ClipModel model;
     std::string err;
     if (!model.load(info, c.clip_device, c.clip_threads, !todo.empty(), true, err)) {
@@ -752,7 +757,14 @@ void Pipeline::tag(const Config& c, const RunOptions& o) {
     std::vector<int64_t> retag;
     for (int64_t id : tagged) {
         Photo p;
-        if (db_.load(id, p) && (o.retag_all || p.clip_vocab != idx.vocab_hash)) retag.push_back(id);
+        if (!db_.load(id, p)) continue;
+        bool again = o.retag_all || o.tag_mode == 1 || p.clip_vocab != idx.vocab_hash;
+        if (!again && o.tag_mode == 2) {  // few confident tags: worth another look with the current list
+            int sure = 0;
+            for (auto& [t, conf] : parse_tag_list(p.clip_tags)) sure += conf >= kTagWordMin;
+            again = sure < 2;
+        }
+        if (again) retag.push_back(id);
     }
     begin(ST_TAG, int(todo.size() + retag.size()));
     auto save_tags = [&](int64_t id, const Vec& v, bool with_vec) {

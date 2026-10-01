@@ -45,7 +45,7 @@ Settings → *File operation*:
 *Names*: `20190512_00001.jpg`, or **keep the original name** as a prefix. The prefix is the old name without its
 dates, times, serial numbers and copy markers: `IMG_20190512_123456.jpg` → `IMG_20190512_00001.jpg`,
 `Paris trip 2019-05-12 (3).jpg` → `Paris trip_20190512_00001.jpg`, `Screenshot 2024-01-02 at 10.11.12.png` →
-`Screenshot_20240102_00001.png`, `DSC01234.JPG` → `DSC_…`. Both choices sit at the top of the Review tab (and in
+`Screenshot_20240102_00001.png`, `DSC01234.JPG` → `DSC_…`. Both choices sit at the top of Actions → Organize files (and in
 Settings); changing one rebuilds the list, and **Apply all** does the renames/copies and the metadata together.
 
 ### Preview before anything changes
@@ -58,11 +58,11 @@ row shows the exact exiv2 commands (additions only). You can untick items or use
 Apply re-checks that the destination is still free and the source hasn't changed since the scan. Results appear per
 row.
 
-The Review tab is a **From → To** table with the total files, bytes and an estimated time (copying ~150 MB/s,
+Actions → Organize files is a **From → To** table with the total files, bytes and an estimated time (copying ~150 MB/s,
 metadata ~40 ms per file). *Move extra copies to Trash…* shows the same kind of table (group, file moving to the
 Trash, the copy that stays, size) with totals and a time estimate before anything moves.
 
-![Review tab: From → To table with totals and estimated time](docs/review.png)
+![Actions → Organize files: From → To table with totals and estimated time](docs/review.png)
 
 ### Duplicates, sizes and fast hashing
 
@@ -184,7 +184,7 @@ already has:
 4. Otherwise, by *Settings → Existing descriptions* (default: **Rules + LLM, jev cross-checks**). The LLM chooses
    keep / append / replace. jev answers two yes/no statements ("is this a placeholder?", "does ours add
    information?"). When they agree, the choice is applied. When they disagree, the photo is marked **you decide**
-   in Review (*N descriptions to decide*, buttons keep / append / replace), and it stays unchanged until you choose.
+   in Actions → Organize files (*N descriptions to decide*, buttons keep / append / replace), and it stays unchanged until you choose.
    Other settings: only fill empty fields; Rules + LLM; always ask.
 
 *Replace* always keeps the old text in `Xmp.jev.PreviousDescription`. Choices are remembered per (old text, new
@@ -196,7 +196,7 @@ it went to the user.
 ### Corrections (review before anything changes)
 
 Every Analyze ends with a **check** of what jev-photos generated itself. It produces specific proposals with a
-confidence of how sure it is that each change is right and worth making. They are listed in **Review →
+confidence of how sure it is that each change is right and worth making. They are listed in **Actions →
 Corrections**; proposals at 70 % or more are ticked, and you apply or reject them. Rejected proposals are not made
 again. The file's own metadata (prompt, camera, lens, original dates, descriptions others wrote) is only used as
 evidence and is never a target. Only generated data is: CLIP tags, and the names jev-photos gave.
@@ -220,10 +220,30 @@ and searchable. A long name (more than 4 words or 30 characters) is reduced by t
 *keep the original name*, those key words become the prefix: `a_beautiful_sunset_over_the_mountains_4k.jpg` →
 `sunset-mountains_20190512_00001.jpg`.
 
+### Tabs
+
+| Tab | |
+|---|---|
+| Overview | what was found, and what to do next |
+| Photos | browse and search; **★ Favorites** (only starred photos) and **Grid** (thumbnails) are view options |
+| Actions | everything that changes files or the catalog: **Organize files** · **Tags & metadata** · **Corrections** · **Duplicates**; a "What is what" line explains file name, tags, keywords, description and EXIF/XMP |
+| Settings | models, servers, naming, decision rules |
+
+The main action of each screen is in the accent colour; actions that change or remove original files (move, rename
+in place, write into originals, move to Trash, replace a description) are red. Every button and option has a tooltip.
+
+**Analyze** first asks how much image analysis to do, because it is the slow part (CLIP ViT-L/14 is about 0.35 s per
+photo with 8 threads). Image analysis: *only photos not analysed yet* (default), *all photos again*, *quick* (ViT-B/32,
+about 6× faster and less accurate, upgraded on a later normal run) or *skip*. Tags: *only missing or outdated*
+(default), *re-tag all* (seconds: from the stored analysis), or *photos with few tags*. Each choice shows its count
+and an estimated time, and the CPU threads can be set there. *Don't ask again* uses the defaults; Settings turns the
+question back on.
+
 ### Favorites
 
-Click the star in the Photos table (or press **f**, also in the viewer). The **★ Favorites** tab shows starred photos
-as a thumbnail grid (arrows, Enter to view, f to unstar, right-click). Tags have stars too, in the detail panes:
+Click the star in the Photos table (or press **f**, also in the viewer and the grid). **★ Favorites** in the Photos
+tab shows only starred photos; with **Grid** they are a thumbnail grid (arrows, Enter to view, f to unstar,
+right-click for Find similar). Tags have stars too, in the detail panes:
 starred tags become one-click filter chips under the search box and in Favorites. `is:fav` finds favorites in
 any search.
 
@@ -254,7 +274,7 @@ no tags, weak tags only, older tag list, edited by me, no date/keywords/descript
   `tags.txt` takes effect the same way.
 * **Edit tags**: type your own comma-separated tags for a photo. They replace the automatic ones in search and in
   the files, and *Back to automatic tags* undoes that.
-* **Fill in missing metadata…** builds the *Add metadata only* list in Review: every date, keyword, description
+* **Fill in missing metadata…** builds the *Add metadata only* list in Actions → Organize files: every date, keyword, description
   and place that would be added. The detail pane shows the exact change for the selected photo before you apply.
 * **Rewrite tags**: keywords jev-photos wrote on an earlier run are recorded in `Xmp.jev.Keywords`. When the tags
   improve, those keywords (and only those) are replaced. Keywords the file had on its own are never touched. For
@@ -276,7 +296,7 @@ says why it matched (`desc: lake | lake, mountain…`, `exif: Exif.Image.Model =
 ## How updates are decided
 
 jev-photos separates what a file **is** (its own metadata, never rewritten) from what jev-photos **made** (names,
-tags, keywords and descriptions it generated, which may be refreshed or corrected). Every change is shown in Review
+tags, keywords and descriptions it generated, which may be refreshed or corrected). Every change is shown in the Actions tab
 before it happens.
 
 ```mermaid
@@ -285,7 +305,7 @@ flowchart LR
     F --> M["Made by jev-photos, may be updated:<br/>date-based file name,<br/>CLIP tags, prompt and name keywords,<br/>keywords and description it wrote"]
     G -->|evidence| D{Decision}
     M -->|target| D
-    D --> R[Review: preview with confidence]
+    D --> R[Actions: preview with confidence]
     R -->|you apply| W[Write: only additions, or our own fields]
     R -->|you reject| X[Remembered, not proposed again]
 ```
@@ -308,7 +328,7 @@ flowchart TD
     L -->|no| B["IMG_20190512_00001.jpg"]
     L -->|yes| K["LLM picks 2-4 key words, decided once"]
     K --> B2["sunset-mountains_20190512_00001.jpg"]
-    A --> RV[Review: From and To list]
+    A --> RV[Actions: From and To list]
     B --> RV
     B2 --> RV
     RV -->|Apply all| FS["Copy, move or rename; never over an existing file"]
@@ -330,7 +350,7 @@ flowchart TD
     R1 --> CONF["Confidence: LLM certainty lowered when CLIP saw the tag clearly"]
     R2 --> CONF
     R3 --> CONF
-    CONF --> REV["Review, Corrections tab: 70% or more ticked"]
+    CONF --> REV["Actions, Corrections: 70% or more ticked"]
     REV -->|apply| FIX["tag_fix layer over CLIP tags (re-tagging keeps it)"]
     REV -->|reject| NO[Not proposed again]
     USER["Your own tags"] -->|replace automatic tags, never second-guessed| TAG
@@ -354,7 +374,7 @@ flowchart TD
     LLM --> JEV["jev: is it a placeholder? does ours add information?"]
     JEV --> AG{Do they agree?}
     AG -->|yes| ACT[Apply that action]
-    AG -->|no| YOU["You decide in Review; left unchanged until then"]
+    AG -->|no| YOU["You decide in Actions; left unchanged until then"]
 ```
 
 Settings → *Existing descriptions* can also be: only fill empty fields, LLM alone, or always ask. In PNGs the
@@ -385,24 +405,24 @@ scripts/install-desktop.sh        # icon, application-menu entry and a desktop s
 
 There is one thing to choose: the **Photo folder** (type it, pick it with *Browse…*, or reopen one from the ▾ recent
 list). Press **Analyze**. It scans, finds duplicates, works out dates and places, tags the pictures and plans the
-copies. The run ends in the **Review** tab, and a banner offers **Apply**. Nothing is copied before that. Organized copies go to `<photo folder>/jev-organized/2019/2019-05/20190512_00001.jpg`.
+copies. The run ends in the **Actions** tab, and a banner offers **Apply**. Nothing is copied before that. Organized copies go to `<photo folder>/jev-organized/2019/2019-05/20190512_00001.jpg`.
 That folder is skipped when the photo folder is scanned again, and Settings → Output can put the copies elsewhere.
 Your photos themselves are never changed.
 
 **Overview** (the home tab) lists what the analysis found and the next step for each part, with its button:
-analyze, check uncertain dates, duplicates, organize (Review / Apply), find photos. Duplicates are left out of the
+analyze, check uncertain dates, duplicates, organize (Actions / Apply), find photos. Duplicates are left out of the
 organized copies automatically. *Move extra copies to Trash…* first lists every file and the copy that stays, then
 moves them to the desktop Trash, so they can be restored. Without a Trash they go to `jev-duplicates/`. Nothing is
 ever deleted outright.
 
-**Viewing and keys:** double-click a row (Photos, Review, Duplicates) or press Enter to open the viewer.
+**Viewing and keys:** double-click a row (Photos, Actions) or press Enter to open the viewer.
 
 | Key | Lists | Viewer |
 |---|---|---|
 | ↓ / j, ↑ / k | next / previous row | next / previous photo |
-| → / l, ← / h | next / previous month (Photos), page (Review, Duplicates) | next / previous photo |
+| → / l, ← / h | next / previous month (Photos), page (Actions lists) | next / previous photo |
 | Enter | open viewer | |
-| Space | tick / untick (Review) | next photo |
+| Space | tick / untick (Actions) | next photo |
 | Esc / q | | close |
 
 *…* runs a single step. The status line shows progress; *Log* opens the log. The Photos, Duplicates and Preview
