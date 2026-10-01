@@ -2477,7 +2477,7 @@ static const Texture* grid_thumb(App& a, const PhotoRow& r) {
     std::lock_guard<std::mutex> l(g->mu);
     if (g->pending.count(r.id) || g->failed.count(r.id) || g->pending.size() >= 4) return nullptr;
     g->pending.insert(r.id);
-    ThumbKey key{r.src_path, r.size, 0};
+    ThumbKey key{r.src_path, r.size, r.mtime};  // the scanned mtime: a cached thumbnail still shows when the drive is away
     struct stat st{};
     if (stat(r.src_path.c_str(), &st) == 0) key.mtime = st.st_mtim.tv_sec;
     int side = thumb_side_for(r.src_path, a.cfg.thumb_side, a.cfg.vl_max_side);
@@ -4068,7 +4068,12 @@ static void draw_sidebar(App& a) {
         set_section(a, SEC_SAVE);
     side_heading(tr("Folders"));
     for (auto& f : std::vector<std::string>(a.cfg.folders)) {
-        if (side_item(a, ICON_FOLDER, util::basename(f), a.section == SEC_FOLDER && a.section_folder == f, -1, false, f.c_str())) set_section(a, SEC_FOLDER, f);
+        bool here = util::dir_exists(f);
+        std::string ftip = here ? f : f + "\n" + tr("Not found: the drive may not be connected. Photos from it show their saved thumbnails; connect it to open them.");
+        if (!here) ImGui::PushStyleColor(ImGuiCol_Text, g_warn);
+        if (side_item(a, here ? ICON_FOLDER : ICON_ALERT_TRIANGLE, util::basename(f), a.section == SEC_FOLDER && a.section_folder == f, -1, false, ftip.c_str()))
+            set_section(a, SEC_FOLDER, f);
+        if (!here) ImGui::PopStyleColor();
         if (ImGui::BeginPopupContextItem(("fold" + f).c_str())) {
             if (ImGui::MenuItem(tr("Open in file manager"))) run_detached({"xdg-open", f});
             if (ImGui::MenuItem(tr("Remove from the list"))) {
@@ -4449,6 +4454,17 @@ static void draw_library_header(App& a) {
     draw_fav_tag_chips(a);
     if (!a.search_error.empty()) ImGui::TextColored(g_err, "%s", a.search_error.c_str());
     else if (!a.search_note.empty()) ImGui::TextDisabled("%s", a.search_note.c_str());
+    // A folder that is not there (unplugged drive): say so, instead of leaving blank tiles unexplained.
+    static double checked = -10;
+    static std::vector<std::string> away;
+    if (glfwGetTime() - checked > 5) {
+        checked = glfwGetTime();
+        away.clear();
+        for (auto& f : a.cfg.folders)
+            if (!util::dir_exists(f) && (a.section != SEC_FOLDER || a.section_folder == f)) away.push_back(f);
+    }
+    for (auto& f : away)
+        ImGui::TextColored(g_warn, "%s %s: %s", ICON_ALERT_TRIANGLE, tr("Folder not found (drive not connected?)"), f.c_str());
 }
 
 // Inspector extras for an unsure date: confirm it, or use one of the other candidates.

@@ -887,7 +887,7 @@ std::vector<PhotoRow> Db::query(const std::string& search, bool review_only, con
     std::string sql = R"(SELECT id, date_value, date_prec, date_source, date_decider, location, scene, tags, dest_path, src_path,
                          vision_status, date_conf, needs_review, dup_of, COALESCE(similar_to,0), size, COALESCE(width,0),
                          COALESCE(height,0), COALESCE(clip_tags,''), COALESCE(clip_scene,''), COALESCE(user_tags,''), COALESCE(tag_fix,''),
-                         COALESCE(favorite,0), COALESCE(gen_tool,'')<>'' FROM photos WHERE 1)";
+                         COALESCE(favorite,0), COALESCE(gen_tool,'')<>'', COALESCE(mtime,0) FROM photos WHERE 1)";
     std::vector<std::string> binds;
     for (auto& raw : util::split(search, ' ')) {
         std::string t = util::trim(raw);
@@ -925,6 +925,7 @@ std::vector<PhotoRow> Db::query(const std::string& search, bool review_only, con
         tp.tag_fix = s.t(c++);
         r.favorite = s.i(c++) != 0;
         r.ai = s.i(c++) != 0;
+        r.mtime = s.i(c++);
         for (auto& t : effective_tags(tp)) r.tags += (r.tags.empty() ? "" : ", ") + t;
         if (r.scene.empty()) r.scene = clip_scene;
         out.push_back(std::move(r));

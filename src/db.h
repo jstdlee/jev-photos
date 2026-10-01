@@ -102,7 +102,7 @@ struct PhotoRow {  // what the GUI table shows
     std::string date_value, date_prec, date_source, decider, location, scene, tags, dest_path, src_path, vision_status;
     double date_conf = 0;
     bool needs_review = false;
-    int64_t dup_of = 0, similar_to = 0, size = 0;
+    int64_t dup_of = 0, similar_to = 0, size = 0, mtime = 0;  // mtime as scanned (finds cached thumbnails when the drive is away)
     int width = 0, height = 0;
     bool favorite = false, ai = false;   // ai: generation metadata found
     double score = 0;   // search relevance (0 when not searching)
