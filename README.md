@@ -25,9 +25,9 @@ Each stage is resumable. A manual date override in the UI re-files the organized
 
 ### Folders
 
-Add any number of photo folders (**+ Add…**, or **Folders** to remove or re-add recent ones). **Analyze scans them
-all together**: one duplicate check across all of them, one catalog. The folder selector chooses what the tabs show,
-one folder or **All folders**. Each folder's organized copies go to its own `jev-organized` (or all to one folder,
+Add any number of photo folders (sidebar → *Add folder…*; right-click a folder to open or remove it). **Analyze scans
+them all together**: one duplicate check across all of them, one catalog. *All photos* shows every folder; click a
+folder to see only its photos. Each folder's organized copies go to its own `jev-organized` (or all to one folder,
 when *Organized copies folder* is set). Removing a folder only takes it off the list. From the command line:
 `jev-photos --cli ~/Pictures/phone ~/Pictures/camera` scans both.
 
@@ -45,24 +45,23 @@ Settings → *File operation*:
 *Names*: `20190512_00001.jpg`, or **keep the original name** as a prefix. The prefix is the old name without its
 dates, times, serial numbers and copy markers: `IMG_20190512_123456.jpg` → `IMG_20190512_00001.jpg`,
 `Paris trip 2019-05-12 (3).jpg` → `Paris trip_20190512_00001.jpg`, `Screenshot 2024-01-02 at 10.11.12.png` →
-`Screenshot_20240102_00001.png`, `DSC01234.JPG` → `DSC_…`. Both choices sit at the top of Actions → Organization (and in
+`Screenshot_20240102_00001.png`, `DSC01234.JPG` → `DSC_…`. Both choices sit at the top of Organize (and in
 Settings); changing one rebuilds the list, and **Apply all** does the renames/copies and the metadata together.
 
 ### Preview before anything changes
 
-With **Preview before changes** on (the default), *Organize* never touches a file. It builds a plan, and the **Preview**
-tab lists every copy/move, re-file (rename after a date fix) and metadata-only update. Each row shows the exact new
+With **Preview before changes** on (the default), *Organize* never touches a file. It builds a plan, and *Organize* lists every copy/move, re-file (rename after a date fix) and metadata-only update. Each row shows the exact new
 name, the date and its confidence, how many metadata fields will be added and why an item is flagged. Selecting a
 row shows the exact exiv2 commands (additions only). You can untick items or use *Exclude needs-review*.
 *Refresh preview* renumbers without the excluded items, and **Apply** executes exactly that plan. Before each item,
 Apply re-checks that the destination is still free and the source hasn't changed since the scan. Results appear per
 row.
 
-Actions → Organization is a **From → To** table with the total files, bytes and an estimated time (copying ~150 MB/s,
+Organize is a **From → To** table with the total files, bytes and an estimated time (copying ~150 MB/s,
 metadata ~40 ms per file). *Move extra copies to Trash…* shows the same kind of table (group, file moving to the
 Trash, the copy that stays, size) with totals and a time estimate before anything moves.
 
-![Actions → Organization: From → To table with totals and estimated time](docs/review.png)
+![Organize: From → To table with totals and estimated time](docs/review.png)
 
 ### Duplicates, sizes and fast hashing
 
@@ -74,7 +73,7 @@ Trash, the copy that stays, size) with totals and a time estimate before anythin
 | byte-for-byte comparison with the kept copy | only real duplicate candidates (*Byte-verify*, default on) | proof before anything is marked |
 
 On this machine XXH3-128 hashed a 550 MB file at 16.7 GB/s versus 185 MB/s for SHA-256, and most files never
-need a full read at all. The **kept copy** is the one you pinned (radio button in the tab), else one already in the
+need a full read at all. The **kept copy** is the one you pinned (radio button in *Duplicates*), else one already in the
 organized folder, else the richest metadata, else a name/folder that doesn't look like a copy (`(1)`, ` copy`, `副本`,
 `backup/`, `备份/`), else the oldest file.
 
@@ -83,17 +82,17 @@ EXIF orientation so rotated copies match. Photos within the *max distance* (defa
 ratios are grouped, and the largest is the representative. This catches resized exports, re-compressed chat copies
 and burst shots. They are **only reported**, never skipped, and hashes are cached, so re-checks are instant.
 
-The Duplicates tab lists groups by reclaimable space, with size, pixels, date, hash and a preview, and *Copy report*
-copies it as CSV. The Photos tab shows each file's size, and the month sidebar shows per-month and total sizes.
+*Duplicates* lists groups by reclaimable space, with size, pixels, date, hash and a preview, and *Copy report*
+copies it as CSV. The list view shows each file's size.
 `--dupes` prints the groups, and `--stats` includes sizes.
 
-![Duplicates tab: exact groups with the kept copy, sizes, pixels and reclaimable space](docs/duplicates.png)
+![Duplicates: exact groups with the kept copy, sizes, pixels and reclaimable space](docs/duplicates.png)
 
 ### Search
 
 ![Search: "mountain lake" matched by tags and by meaning, with the CLIP tags of the selected photo](docs/search.png)
 
-The Photos tab has one search box over **file and folder names**, **EXIF/IPTC/XMP**, **descriptions** (CLIP tags,
+The top bar has one search box over **file and folder names**, **EXIF/IPTC/XMP**, **descriptions** (CLIP tags,
 scene, place, captions) and **CLIP embeddings**:
 
 | Mode | Example | |
@@ -166,7 +165,7 @@ and input images (edits). exiv2 does not read PNG text chunks, so before this no
   quality boilerplate dropped. Prose prompts are summarised by the LLM into up to 10 keywords, once per distinct
   prompt (a batch of renders usually shares one). They are searchable and written as keywords. The LLM may decline
   explicit prompts; those photos are retried on the next run, and their prompt text stays searchable.
-* **Shown** in the photo's detail and the Tags & EXIF tab (prompt with *Copy*, negative prompt, model, LoRAs, seed,
+* **Shown** in the photo's detail and Tags (prompt with *Copy*, negative prompt, model, LoRAs, seed,
   steps, CFG, sampler, size, source images); *AI-generated* filter, and the tool name in the file column.
 
 ### Descriptions
@@ -184,7 +183,7 @@ already has:
 4. Otherwise, by *Settings → Existing descriptions* (default: **Rules + LLM, jev cross-checks**). The LLM chooses
    keep / append / replace. jev answers two yes/no statements ("is this a placeholder?", "does ours add
    information?"). When they agree, the choice is applied. When they disagree, the photo is marked **you decide**
-   in Actions → Organization (*N descriptions to decide*, buttons keep / append / replace), and it stays unchanged until you choose.
+   in Organize (*N descriptions to decide*, buttons keep / append / replace), and it stays unchanged until you choose.
    Other settings: only fill empty fields; Rules + LLM; always ask.
 
 *Replace* always keeps the old text in `Xmp.jev.PreviousDescription`. Choices are remembered per (old text, new
@@ -196,8 +195,7 @@ it went to the user.
 ### Corrections (review before anything changes)
 
 Every Analyze ends with a **check** of what jev-photos generated itself. It produces specific proposals with a
-confidence of how sure it is that each change is right and worth making. They are listed in **Actions →
-Corrections**; proposals at 70 % or more are ticked, and you apply or reject them. Rejected proposals are not made
+confidence of how sure it is that each change is right and worth making. They are listed in **Tag suggestions**; proposals at 70 % or more are ticked, and you apply or reject them. Rejected proposals are not made
 again. The file's own metadata (prompt, camera, lens, original dates, descriptions others wrote) is only used as
 evidence and is never a target. Only generated data is: CLIP tags, and the names jev-photos gave.
 
@@ -220,16 +218,46 @@ and searchable. A long name (more than 4 words or 30 characters) is reduced by t
 *keep the original name*, those key words become the prefix: `a_beautiful_sunset_over_the_mountains_4k.jpg` →
 `sunset-mountains_20190512_00001.jpg`.
 
-### Tabs
+### The window
 
-| Tab | |
+One window: a **sidebar** on the left, the photos (or the list you are working on) in the middle, and an
+**inspector** on the right with the selected photo's date, place, tags, file info and why the app decided what it did.
+
+| Sidebar | |
 |---|---|
-| Overview | what was found, and what to do next |
-| Photos | browse and search; **★ Favorites** (only starred photos), **Grid** (thumbnails), and **Move to Trash…** for the selected photos (Ctrl/Shift+click selects several; Delete key; asks first, restorable) |
-| Actions | everything that changes files or the catalog, in this order: **Duplicates** (best done first) · **Organization** (files only: copy, move or rename into month folders, with the name style) · **Metadata** (each photo's tags, *Fill in missing tags*, the tag list editor, and *Write into files*: missing dates, keywords, descriptions and places) · **CLIP** (image analysis: missing / quick / re-analyse / re-tag, and *Smart update*) · **Corrections** |
-| Settings | models, servers, naming, decision rules |
+| **Library** | *All photos*, *Favorites*, *AI images* (pictures with generation data), *Years* (click a year for its months), *Places*, and each of your *Folders* (right-click to open or remove; *Add folder…*) |
+| **To review** | what needs you, with a count: *Duplicates* (best done first) · *Unsure dates* (*Accept all likely dates*, or confirm / pick another date in the inspector) · *Tag suggestions* · *Organize* (copy, move or rename into month folders) · *Save info to files* (missing dates, keywords, descriptions and places, written where the files are) |
+| **Tools** | *Tags* (each photo's tags, *Fill in missing tags*, the tag list editor) · *Image recognition* (CLIP: missing / quick / again / re-tag, and *Smart update*) · *Activity* (what ran, **Undo**, jev's decisions, the log) |
 
-The window has no system title bar: drag the top bar to move it, double-click to maximise, and use the grip in the
+The library is a grid of thumbnails with a heading per month (or a sortable list: the button next to the search).
+The **top bar** holds the search, *Analyze*, the activity indicator (progress and *Stop* while something runs), the
+**assistant** robot (green when image recognition, the LLM and jev are all up; hover for each), help and settings.
+
+**Search** as you type; suggestions (tags, places, years, months, favorites, AI images) become **filter chips** when
+picked, and Backspace in an empty field removes the last one. A sentence of four words or more plus Enter asks the
+assistant (LLM + jev). The sliders button holds the fields to search, a date range and regular expressions.
+
+**Themes:** Dark, Tokyo Night and Light (Settings → Appearance, or Ctrl+,). Each theme brings its own accent colour,
+which you can change.
+
+**Undo:** every change Organize or *Save info to files* makes is recorded, and files written in place are backed up
+first (`~/.local/share/jev-photos/undo/`). Right after applying, a banner offers **Undo** (Ctrl+Z); *Activity* lists the
+last 10 runs, each with Undo. Undo renames and moves files back, sends copies it made to the Trash, and restores the
+earlier version of files whose info was written. Anything that cannot be put back (something else took the name) is
+left alone and listed in the log.
+
+**First start:** add your photo folders, choose what the app may do (only browse and search; also make organized
+copies; or rename the originals), and *Start*. **Watching** (Settings → Folders, on by default): every 10 minutes,
+while nothing else runs, new or changed photos are picked up and analysed quietly; nothing in the files changes.
+
+| Key | |
+|---|---|
+| Ctrl+F | search |
+| Ctrl+I | show / hide the inspector |
+| Ctrl+, | settings |
+| Ctrl+Z | undo what was just applied |
+
+The window has no system title bar (Settings → Appearance can bring it back): drag the top bar to move it, double-click to maximise, and use the grip in the
 bottom-right corner to resize. Panes are separated by splitters you can drag. **?** (top right) opens help: what is
 what (file name, tags, CLIP, keywords, description, EXIF/XMP, AI prompt, corrections, jev, LLM), keys, the search
 syntax, credits and the project page.
@@ -244,14 +272,14 @@ with a note, while that server is down (Ask search, the LLM check in Analyze), a
 photo with 8 threads). Image analysis: *only photos not analysed yet* (default), *all photos again*, *quick* (ViT-B/32,
 about 6× faster and less accurate, upgraded on a later normal run) or *skip*. Tags: *only missing or outdated*
 (default), *re-tag all* (seconds: from the stored analysis), or *photos with few tags*. The check of generated tags
-against AI prompts uses the LLM on the GPU server, so it is off unless ticked there; *Corrections → Check again…*
+against AI prompts uses the LLM on the GPU server, so it is off unless ticked there; *Tag suggestions → Check again…*
 also asks first.
 
-**Edit tag list** (Metadata or CLIP): a paged, searchable table of the tags CLIP chooses from, with a category filter,
+**Edit tag list** (Tags or Image recognition): a paged, searchable table of the tags CLIP chooses from, with a category filter,
 add, edit (rename or move to another category) and delete. *Save and re-tag* writes `tags.txt` and recomputes every
 photo's tags from the stored analysis in seconds.
 
-**Smart update** (CLIP): lists the photos worth updating, each with why and who decided. Not analysed yet, or
+**Smart update** (Image recognition): lists the photos worth updating, each with why and who decided. Not analysed yet, or
 analysed with the quick model and weakly tagged: re-analyse (rules). Already well tagged by the quick model: a close
 call, which jev decides ("is re-analysing worth the time?"). Same model with weak or few tags: re-tag with the
 current list (re-analysing would give the same result). You tick and run.
@@ -262,10 +290,9 @@ falls back to local ranking.
 
 ### Favorites
 
-Click the star in the Photos table (or press **f**, also in the viewer and the grid). Favorites are a filter of
-the Photos tab, not a tab of their own. **★ Favorites** in the Photos
-tab shows only starred photos; with **Grid** they are a thumbnail grid (arrows, Enter to view, f to unstar,
-right-click for Find similar). Tags have stars too, in the detail panes:
+Click the star in the list, in the inspector, or press **f** (also in the viewer and the grid). *Favorites* in the
+sidebar shows only starred photos (arrows, Enter to view, f to unstar, right-click for Find similar). Tags have stars
+too, in the detail panes:
 starred tags become one-click filter chips under the search box and in Favorites. `is:fav` finds favorites in
 any search.
 
@@ -280,14 +307,14 @@ jev is asked only where the rules are unsure, and every answer is kept (table `d
 | Ask search | is this photo what the user wants (the LLM's 30–70 % close calls) | averaged with the LLM |
 | Existing descriptions | is it a placeholder, does ours add information | must agree with the LLM, else you decide |
 
-Overview → **How jev helped** counts the decisions per kind and how many **changed** the outcome; *Show decisions*
-lists each one: what the rules or the LLM said, what jev chose with its probabilities (hover), and the result. A
+*Activity* → **How jev helped** counts the decisions per kind and how many **changed** the outcome;
+the table below lists each one: what the rules or the LLM said, what jev chose with its probabilities (hover), and the result. A
 photo's detail pane lists the jev decisions about it. jev is not used for tags: given file names as context,
 Julia called ComfyUI renders "real photos taken with a camera" with 93 % confidence.
 
 ### Tags and EXIF
 
-The **Tags & EXIF** tab lists every photo with its tags (confidence, dimmed guesses, `*` = made with an older tag
+**Tags** (sidebar → Tools) lists every photo with its tags (confidence, dimmed guesses, `*` = made with an older tag
 list), the date and what the file itself carries (date, keywords, description, place). Filters:
 no tags, weak tags only, older tag list, edited by me, no date/keywords/description/place in the file.
 
@@ -318,7 +345,7 @@ says why it matched (`desc: lake | lake, mountain…`, `exif: Exif.Image.Model =
 ## How updates are decided
 
 jev-photos separates what a file **is** (its own metadata, never rewritten) from what jev-photos **made** (names,
-tags, keywords and descriptions it generated, which may be refreshed or corrected). Every change is shown in the Actions tab
+tags, keywords and descriptions it generated, which may be refreshed or corrected). Every change is shown in the To review lists
 before it happens.
 
 ```mermaid
@@ -327,7 +354,7 @@ flowchart LR
     F --> M["Made by jev-photos, may be updated:<br/>date-based file name,<br/>CLIP tags, prompt and name keywords,<br/>keywords and description it wrote"]
     G -->|evidence| D{Decision}
     M -->|target| D
-    D --> R[Actions: preview with confidence]
+    D --> R[To review: preview with confidence]
     R -->|you apply| W[Write: only additions, or our own fields]
     R -->|you reject| X[Remembered, not proposed again]
 ```
@@ -350,7 +377,7 @@ flowchart TD
     L -->|no| B["IMG_20190512_00001.jpg"]
     L -->|yes| K["LLM picks 2-4 key words, decided once"]
     K --> B2["sunset-mountains_20190512_00001.jpg"]
-    A --> RV[Actions: From and To list]
+    A --> RV[Organize: From and To list]
     B --> RV
     B2 --> RV
     RV -->|Apply all| FS["Copy, move or rename; never over an existing file"]
@@ -372,7 +399,7 @@ flowchart TD
     R1 --> CONF["Confidence: LLM certainty lowered when CLIP saw the tag clearly"]
     R2 --> CONF
     R3 --> CONF
-    CONF --> REV["Actions, Corrections: 70% or more ticked"]
+    CONF --> REV["Tag suggestions: 70% or more ticked"]
     REV -->|apply| FIX["tag_fix layer over CLIP tags (re-tagging keeps it)"]
     REV -->|reject| NO[Not proposed again]
     USER["Your own tags"] -->|replace automatic tags, never second-guessed| TAG
@@ -396,7 +423,7 @@ flowchart TD
     LLM --> JEV["jev: is it a placeholder? does ours add information?"]
     JEV --> AG{Do they agree?}
     AG -->|yes| ACT[Apply that action]
-    AG -->|no| YOU["You decide in Actions; left unchanged until then"]
+    AG -->|no| YOU["You decide in Save info to files; left unchanged until then"]
 ```
 
 Settings → *Existing descriptions* can also be: only fill empty fields, LLM alone, or always ask. In PNGs the
@@ -425,31 +452,31 @@ build/jev-photos ~/Pictures/phone # GUI, opened on that folder
 scripts/install-desktop.sh        # icon, application-menu entry and a desktop shortcut (--remove undoes it)
 ```
 
-There is one thing to choose: the **Photo folder** (type it, pick it with *Browse…*, or reopen one from the ▾ recent
-list). Press **Analyze**. It scans, finds duplicates, works out dates and places, tags the pictures and plans the
-copies. The run ends in the **Actions** tab, and a banner offers **Apply**. Nothing is copied before that. Organized copies go to `<photo folder>/jev-organized/2019/2019-05/20190512_00001.jpg`.
-That folder is skipped when the photo folder is scanned again, and Settings → Output can put the copies elsewhere.
-Your photos themselves are never changed.
+On first start, add your photo folders and choose what the app may do, then *Start*. Later, **Analyze** (top bar)
+scans, finds duplicates, works out dates and places, tags the pictures and plans the changes; the counts appear under
+**To review** in the sidebar. Nothing is copied or written until you press **Apply** in *Organize* or *Save info to
+files*, and every applied run can be undone. Organized copies go to
+`<photo folder>/jev-organized/2019/2019-05/20190512_00001.jpg`; that folder is skipped when the photo folder is
+scanned again, and Settings can put the copies elsewhere.
 
-**Overview** (the home tab) lists what the analysis found and the next step for each part, with its button:
-analyze, check uncertain dates, duplicates, organize (Actions / Apply), find photos. Duplicates are left out of the
-organized copies automatically. *Move extra copies to Trash…* first lists every file and the copy that stays, then
-moves them to the desktop Trash, so they can be restored. Without a Trash they go to `jev-duplicates/`. Nothing is
-ever deleted outright.
+Duplicates are left out of the organized copies automatically. *Move extra copies to Trash…* first lists every file
+and the copy that stays, then moves them to the desktop Trash, so they can be restored. Without a Trash they go to
+`jev-duplicates/`. Nothing is ever deleted outright.
 
-**Viewing and keys:** double-click a row (Photos, Actions) or press Enter to open the viewer.
+**Viewing and keys:** double-click a photo or press Enter to open the viewer.
 
-| Key | Lists | Viewer |
+| Key | Lists and grid | Viewer |
 |---|---|---|
-| ↓ / j, ↑ / k | next / previous row | next / previous photo |
-| → / l, ← / h | next / previous month (Photos), page (Actions lists) | next / previous photo |
+| ↓ / j, ↑ / k | next / previous row (grid: line) | next / previous photo |
+| → / l, ← / h | next / previous month (list), photo (grid), page (review lists) | next / previous photo |
 | Enter | open viewer | |
-| Space | tick / untick (Actions) | next photo |
+| Space | tick / untick (review lists) | next photo |
+| f | star / unstar | star / unstar |
+| Delete | move the selected photos to the Trash (asks first) | |
 | Esc / q | | close |
 
-*…* runs a single step. The status line shows progress; *Log* opens the log. The Photos, Duplicates and Preview
-tabs show only the chosen folder. Everything the app learns (dates, hashes, tags) is kept in one catalog,
-`~/.local/share/jev-photos/catalog.sqlite`, so switching folders or re-running is instant.
+Everything the app learns (dates, hashes, tags) is kept in one catalog, `~/.local/share/jev-photos/catalog.sqlite`,
+so switching folders or re-running is instant.
 
 Headless (same pipeline, terminal progress bar):
 

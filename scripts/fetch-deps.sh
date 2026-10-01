@@ -11,6 +11,7 @@ SQLITE_ZIP=2025/sqlite-amalgamation-3500400.zip      # 3.50.4
 JSON_VER=v3.12.0
 XXHASH_VER=v0.8.3
 ORT_VER=1.22.0
+TABLER_VER=3.24.0                                    # icon font (MIT)
 
 fetch() {  # dir url rev
     if [ -d "$tp/$1/.git" ]; then return; fi
@@ -50,3 +51,8 @@ if [ ! -f "$tp/onnxruntime/lib/libonnxruntime.so" ]; then
     rm -rf "$tmp"
 fi
 echo "third_party ready"
+
+mkdir -p "$tp/tabler"
+for f in fonts/tabler-icons.ttf tabler-icons.css; do
+    [ -f "$tp/tabler/$(basename $f)" ] || curl -fsSL -o "$tp/tabler/$(basename $f)" "https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@$TABLER_VER/dist/$f"
+done

@@ -209,6 +209,10 @@ void Pipeline::run(Config cfg, RunOptions opt) {
             opt.scope = canon;
             log_.add(0, "scope: " + util::replace_all(opt.scope, "\n", ", "));
         }
+        if (!opt.undo_run.empty()) {
+            undo(cfg, opt.undo_run);
+            opt.stages = 0;
+        }
         if ((opt.stages & ST_SCAN) && !stop_) scan(cfg, opt);
         if ((opt.stages & ST_DUPES) && !stop_) dedupe(cfg, opt);
         if ((opt.stages & ST_DECIDE) && !stop_) decide(cfg, opt);
@@ -1558,6 +1562,7 @@ void Pipeline::apply_item(const Config& c, PlanItem& it) {
             ok = util::copy_file_preserve(it.src, it.dest, err);
         }
         if (!ok) { it.result = err; return; }
+        journal(it.action, it, from, it.dest, p.dest_path);
         p.dest_path = it.dest;
         if (!parse_serial_name(util::stem(it.dest), c.name_sep, p.day_key, p.sn)) { p.day_key.clear(); p.sn = 0; }
         p.organized_at = util::now_iso();
@@ -1578,6 +1583,8 @@ void Pipeline::apply_item(const Config& c, PlanItem& it) {
         MetaTarget target = c.write_mode == WRITE_SIDECAR ? MetaTarget::Sidecar : MetaTarget::Embed;
         MetaMap existing = target == MetaTarget::Embed ? read_meta(file) : existing_meta(p, file, target);  // fresh, not the preview's
         MetaPlan plan = meta_plan_for(p, when, c.rewrite_tags, &existing, file, &c, it.desc_action);  // "decide" = left as it is
+        backup_before_write(c, p.id, file);
+        backup_before_write(c, p.id, sidecar_path(file));
         WriteResult w = write_meta(file, existing, plan, target, false);
         if (!w.ok && target == MetaTarget::Embed) {
             // Format exiv2 cannot write (e.g. some RAW/HEIC): fall back to a sidecar rather than giving up.
@@ -1626,7 +1633,9 @@ void Pipeline::organize(const Config& c, const RunOptions& o) {
             return;
         }
     }
-    // Execute the stored plan (what the preview showed), included items only, in order.
+    // Execute the stored plan (what the preview showed), included items only, in order. Every change is journaled
+    // under this run's id so it can be undone.
+    run_id_ = util::now_iso();
     std::vector<PlanItem> work = plan();
     int total = 0;
     for (auto& it : work) total += it.include && it.action != "duplicate";
@@ -1649,6 +1658,121 @@ void Pipeline::organize(const Config& c, const RunOptions& o) {
         plan_ = work;  // keep results visible in the preview table
     }
     log_.add(0, util::fmt("applied %d of %d planned changes", ok, total));
+    if (ok) last_applied_run = run_id_;
+    for (auto& old : db_.journal_prune(10)) { std::error_code ec; fs::remove_all(undo_dir(c, old), ec); }  // keep the last 10 runs undoable
+    run_id_.clear();
+}
+
+std::string undo_dir(const Config& c, const std::string& run) {
+    std::string r;
+    for (char ch : run) r += isalnum((unsigned char)ch) ? ch : '-';
+    return util::dirname(db_path(c)) + "/undo/" + r;
+}
+
+void Pipeline::journal(const std::string& kind, const PlanItem& it, const std::string& src, const std::string& dst, const std::string& prev_dest) {
+    if (run_id_.empty()) return;
+    JournalEntry e;
+    e.run = run_id_;
+    e.kind = kind;
+    e.photo_id = it.id;
+    e.src = src;
+    e.dst = dst;
+    e.prev_dest = prev_dest;
+    db_.journal_add(e);
+}
+
+// Before metadata is written into a file in place, keep a copy of it (or note that it did not exist yet).
+void Pipeline::backup_before_write(const Config& c, int64_t id, const std::string& file) {
+    if (run_id_.empty()) return;
+    JournalEntry e;
+    e.run = run_id_;
+    e.kind = "meta";
+    e.photo_id = id;
+    e.dst = file;
+    if (util::file_exists(file)) {
+        std::string dir = undo_dir(c, run_id_), err;
+        util::mkdirs(dir);
+        e.backup = dir + "/" + std::to_string(id) + "_" + util::basename(file);
+        for (int k = 2; util::file_exists(e.backup); k++) e.backup = dir + "/" + std::to_string(id) + "_" + std::to_string(k) + "_" + util::basename(file);
+        if (!util::copy_file_preserve(file, e.backup, err)) {
+            log_.add(1, "no undo backup of " + file + ": " + err);
+            return;
+        }
+    }
+    db_.journal_add(e);
+}
+
+// Put things back as they were before an applied run, newest change first. Files are only moved back when
+// nothing else took their place; an organized copy the run made goes to the Trash.
+void Pipeline::undo(const Config& c, const std::string& run) {
+    std::vector<JournalEntry> es = db_.journal_entries(run);
+    std::reverse(es.begin(), es.end());
+    {
+        std::lock_guard<std::mutex> l(plan_mu_);
+        plan_.clear();  // the list it was applied from no longer describes the files
+    }
+    begin(ST_ORGANIZE, int(es.size()));
+    int ok = 0, failed = 0;
+    for (auto& e : es) {
+        if (stop_) break;
+        progress.done++;
+        if (e.undone) continue;
+        progress.set_current(e.dst);
+        std::string err;
+        bool done = false;
+        if (e.kind == "meta") {
+            if (e.backup.empty()) {  // the write created this file (a sidecar): remove it again
+                done = !util::file_exists(e.dst) || unlink(e.dst.c_str()) == 0;
+            } else if (util::file_exists(e.backup)) {
+                std::string tmp = e.dst + ".jev-undo";  // copy beside it, then swap in (the copy never overwrites)
+                unlink(tmp.c_str());
+                done = util::copy_file_preserve(e.backup, tmp, err) && rename(tmp.c_str(), e.dst.c_str()) == 0;
+                if (!done) unlink(tmp.c_str());
+                if (done) {
+                    struct stat st{};
+                    Photo p;
+                    if (db_.load(e.photo_id, p) && p.src_path == e.dst && stat(e.dst.c_str(), &st) == 0)
+                        db_.refresh_file(p.id, st.st_size, st.st_mtim.tv_sec, util::quick_hash(e.dst, st.st_size), read_meta(e.dst).to_json());
+                }
+            } else {
+                err = "backup missing";
+            }
+        } else if (e.kind == "copy") {
+            done = !util::file_exists(e.dst) || util::run({"gio", "trash", "--", e.dst}, "", 30).rc == 0;
+            if (!done) err = "could not move the copy to the Trash";
+            else {
+                if (util::file_exists(sidecar_path(e.dst))) util::run({"gio", "trash", "--", sidecar_path(e.dst)}, "", 30);
+                db_.clear_dest(e.photo_id, e.prev_dest);
+            }
+        } else {  // move | rename | refile: rename back
+            if (util::file_exists(e.src)) err = "something else is at " + e.src + " now";
+            else if (!util::file_exists(e.dst)) err = "not found: " + e.dst;
+            else {
+                util::mkdirs(util::dirname(e.src));
+                done = rename(e.dst.c_str(), e.src.c_str()) == 0;
+                if (!done && errno == EXDEV) {
+                    done = util::copy_file_preserve(e.dst, e.src, err) && util::files_equal(e.dst, e.src);
+                    if (done) unlink(e.dst.c_str());
+                } else if (!done) {
+                    err = strerror(errno);
+                }
+                if (done && util::file_exists(sidecar_path(e.dst))) rename(sidecar_path(e.dst).c_str(), sidecar_path(e.src).c_str());
+                if (done) {
+                    if (e.kind != "refile") db_.move_src(e.photo_id, e.src);
+                    db_.clear_dest(e.photo_id, e.prev_dest);
+                }
+            }
+        }
+        if (done) {
+            db_.journal_mark_undone(e.id);
+            ok++;
+        } else {
+            failed++;
+            progress.errors++;
+            log_.add(2, "undo " + e.kind + " " + e.dst + ": " + err);
+        }
+    }
+    log_.add(failed ? 1 : 0, util::fmt("undo: %d changes put back, %d could not be", ok, failed));
 }
 
 std::string name_prefix(const std::string& stem) {

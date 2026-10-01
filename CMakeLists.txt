@@ -65,6 +65,9 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${ICON_PNG})
 
 add_executable(jev-photos src/main.cpp src/i18n.cpp)
 target_include_directories(jev-photos PRIVATE ${CMAKE_BINARY_DIR}/generated)
+# The icon font is linked in with .incbin (no generated source, no compile cost).
+target_compile_definitions(jev-photos PRIVATE ICON_TTF="${TP}/tabler/tabler-icons.ttf")
+set_property(SOURCE src/main.cpp APPEND PROPERTY OBJECT_DEPENDS ${TP}/tabler/tabler-icons.ttf)
 target_link_libraries(jev-photos PRIVATE jevcore imgui glfw)
 
 add_executable(jev-photos-tests tests/test_main.cpp)

@@ -104,7 +104,7 @@ struct PhotoRow {  // what the GUI table shows
     bool needs_review = false;
     int64_t dup_of = 0, similar_to = 0, size = 0;
     int width = 0, height = 0;
-    bool favorite = false;
+    bool favorite = false, ai = false;   // ai: generation metadata found
     double score = 0;   // search relevance (0 when not searching)
     std::string why;    // what matched
 };
@@ -158,6 +158,19 @@ struct ClipRow {  // what the CLIP tab's smart update looks at
     bool user_tags = false;
 };
 
+// One change to a file, kept so the run can be undone. kind: copy | move | rename | refile | meta.
+// meta: dst is the file written, backup its copy from before ("" = the file did not exist).
+struct JournalEntry {
+    int64_t id = 0, photo_id = 0;
+    std::string run, at, kind, src, dst, prev_dest, backup;
+    bool undone = false;
+};
+struct JournalRun {
+    std::string run, at, kinds;
+    int count = 0;
+    bool undone = false;
+};
+
 struct DbStats {
     int total = 0, resolved = 0, review = 0, undated = 0, vision_done = 0, vision_failed = 0, organized = 0, dups = 0, located = 0;
     int similar = 0, tagged = 0;
@@ -189,7 +202,15 @@ public:
     void save_location(int64_t id, const std::string& loc, const std::string& source, double conf);
     void save_vision(const Photo& p);
     void save_organize(const Photo& p);
-    void set_manual_date(int64_t id, const std::string& value_with_prec);  // "YYYY-MM-DD HH:MM:SS|second" or "" to clear
+    void set_manual_date(int64_t id, const std::string& value_with_prec);
+    // You confirmed (or picked) the date: it becomes certain right away, no new run needed.
+    void journal_add(const JournalEntry& e);
+    std::vector<JournalEntry> journal_entries(const std::string& run);
+    std::vector<JournalRun> journal_runs(int limit);
+    void journal_mark_undone(int64_t entry_id);
+    std::vector<std::string> journal_prune(int keep_runs);  // forgets older runs; returns them (to delete their backups)
+    void clear_dest(int64_t id, const std::string& dest);   // "" = not organized any more
+    void confirm_date(int64_t id, const std::string& value, const std::string& prec);  // "YYYY-MM-DD HH:MM:SS|second" or "" to clear
     int next_sn(const std::string& day_key, const std::string& out_root);  // serials are per output folder
     // duplicate scan
     std::vector<DupRow> dup_rows(bool with_meta = false);

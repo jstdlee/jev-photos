@@ -59,6 +59,7 @@ struct RunOptions {
     int tag_mode = 0;
     // The CLIP tab's smart update: exactly these photos are re-analysed / re-tagged (when either is set).
     std::vector<int64_t> reanalyse_ids, retag_ids;
+    std::string undo_run;       // undo this applied run (journal) instead of running stages
 };
 
 // One planned file-system/metadata change, shown in the preview before anything is touched.
@@ -109,6 +110,9 @@ private:
     std::vector<PlanItem> build_plan(const Config& c, const RunOptions& o);
     void decide_description(const Config& c, Photo& p, PlanItem& it);
     void apply_item(const Config& c, PlanItem& it);
+    void journal(const std::string& kind, const PlanItem& it, const std::string& src, const std::string& dst, const std::string& prev_dest);
+    void backup_before_write(const Config& c, int64_t id, const std::string& file);
+    void undo(const Config& c, const std::string& run);
     std::vector<int64_t> scoped(const std::string& where, const RunOptions& o);
     void begin(int stage, int total);
     template <class F> void parallel(int n, int threads, F fn);
@@ -120,7 +124,13 @@ private:
     bool jev_down_ = false;
     std::mutex plan_mu_;
     std::vector<PlanItem> plan_;
+    std::string run_id_;  // the apply being journaled
+public:
+    std::string last_applied_run;  // the run id of the last apply that changed something (for Undo)
 };
+
+// Where a run's backups of files written in place are kept.
+std::string undo_dir(const Config& c, const std::string& run);
 
 // The description jev-photos writes: the generation prompt (AI images), the caption, and "Shows: <tags>".
 std::string our_description(const Config& c, const Photo& p);

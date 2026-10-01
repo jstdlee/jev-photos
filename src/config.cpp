@@ -79,6 +79,11 @@ void load_config(Config& c, const std::string& path_in) {
             else if (k == "font_size") c.font_size = fclamp(v, 10, 32);
             else if (k == "accent") sscanf(v.c_str(), "%f,%f,%f", &c.accent[0], &c.accent[1], &c.accent[2]);
             else if (k == "renderer") c.renderer = iclamp(v, 0, 2);
+            else if (k == "theme") c.theme = iclamp(v, 0, THEME_COUNT - 1);
+            else if (k == "system_titlebar") c.system_titlebar = v == "1";
+            else if (k == "first_run_done") c.first_run_done = v == "1";
+            else if (k == "goal") c.goal = atoi(v.c_str());
+            else if (k == "watch_folders") c.watch_folders = v == "1";
             else if (k == "folder") c.folder = v;
             else if (k == "folder_item") { if (!v.empty()) add_folder(c, v); }
             else if (k == "view_all") c.view_all = v == "1";
@@ -160,6 +165,8 @@ void save_config(const Config& c, const std::string& path_in) {
     std::ostringstream f;
     f << "lang=" << c.lang << "\nfont_size=" << c.font_size << "\naccent=" << c.accent[0] << "," << c.accent[1] << ","
       << c.accent[2] << "\n";
+    f << "theme=" << c.theme << "\nsystem_titlebar=" << c.system_titlebar << "\n";
+    f << "first_run_done=" << c.first_run_done << "\ngoal=" << c.goal << "\nwatch_folders=" << c.watch_folders << "\n";
     f << "renderer=" << c.renderer << "\nfolder=" << c.folder << "\nview_all=" << c.view_all << "\n";
     for (auto& d : c.folders) f << "folder_item=" << d << "\n";
     for (auto& r : c.recent) f << "recent=" << r << "\n";

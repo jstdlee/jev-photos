@@ -52,6 +52,7 @@
 #include "search.h"
 #include "thumbs.h"
 #include "icon_png.h"
+#include "icons.h"
 #include "vision.h"
 
 using json = nlohmann::json;
@@ -105,6 +106,11 @@ static FontFace fc_match(const char* pattern) {
     return f;
 }
 
+// The Tabler icon font, linked into the binary.
+__asm__(".section .rodata\n.balign 16\n.global jev_icons_ttf\njev_icons_ttf:\n.incbin \"" ICON_TTF "\"\n"
+        ".global jev_icons_ttf_end\njev_icons_ttf_end:\n.previous\n");
+extern "C" const unsigned char jev_icons_ttf[], jev_icons_ttf_end[];
+
 static void build_fonts() {
     ImGuiIO& io = ImGui::GetIO();
     io.Fonts->Clear();
@@ -131,6 +137,12 @@ static void build_fonts() {
         io.Fonts->AddFontFromFileTTF(cjk.file.c_str(), 0.0f, &m);
         break;
     }
+    // Icons (private-use codepoints), merged into the same font and nudged down to sit on the text baseline.
+    ImFontConfig ic;
+    ic.MergeMode = true;
+    ic.FontDataOwnedByAtlas = false;
+    ic.GlyphOffset = ImVec2(0, 2);
+    io.Fonts->AddFontFromMemoryTTF((void*)jev_icons_ttf, int(jev_icons_ttf_end - jev_icons_ttf), 0.0f, &ic);
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +177,13 @@ struct Thumb {
 };
 
 enum Tab { TAB_PHOTOS, TAB_LOG, TAB_SETTINGS };
+// What the main area shows (the sidebar's items).
+enum Section {
+    SEC_ALL, SEC_FAV, SEC_MONTH, SEC_PLACE, SEC_AI, SEC_FOLDER,            // library
+    SEC_DUPES, SEC_DATES, SEC_SUGG, SEC_ORGANIZE, SEC_SAVE,                // to review
+    SEC_TAGS, SEC_RECOG, SEC_ACTIVITY                                      // tools
+};
+static bool library_section(int s) { return s <= SEC_FOLDER || s == SEC_DATES; }
 
 // One row of the duplicates table (group header or member).
 struct DupLine {
@@ -182,7 +201,8 @@ struct ViewRequest {
     int gen = 0;     // catalogue generation: the search index reloads when it changes
     Config cfg;      // CLIP settings for the query encoder
     bool tags = false;  // the Tags & EXIF tab is open: build its rows too
-    bool fav_only = false;
+    bool fav_only = false, ai_only = false;
+    std::string place;  // sidebar Places: only this place
 };
 struct ViewData {
     std::vector<PhotoRow> rows;
@@ -199,6 +219,8 @@ struct ViewData {
     DecisionStats decision_stats;
     std::vector<PhotoRow> favorites;
     std::vector<Correction> corrections;  // pending
+    std::map<std::string, int> places;
+    int ai_count = 0;
 };
 
 static ViewData build_view(Db& db, Searcher& se, const ViewRequest& r) {
@@ -229,12 +251,20 @@ static ViewData build_view(Db& db, Searcher& se, const ViewRequest& r) {
         v.rows = db.query("", r.review_only, r.month, 20000, r.folder);
     }
     if (r.fav_only) v.rows.erase(std::remove_if(v.rows.begin(), v.rows.end(), [](const PhotoRow& x) { return !x.favorite; }), v.rows.end());
+    if (r.ai_only) v.rows.erase(std::remove_if(v.rows.begin(), v.rows.end(), [](const PhotoRow& x) { return !x.ai; }), v.rows.end());
+    if (!r.place.empty())
+        v.rows.erase(std::remove_if(v.rows.begin(), v.rows.end(), [&](const PhotoRow& x) { return x.location != r.place; }), v.rows.end());
+
     v.months = db.months(r.folder);
     v.stats = db.stats(r.folder);
     v.decisions = db.decisions(r.folder, 300);
     v.corrections = db.corrections(r.folder, true);
-    for (auto& row : db.query("", false, "", 1000000, r.folder))
+    // One pass over every photo for the sidebar: favorites, places, AI images.
+    for (auto& row : db.query("", false, "", 1000000, r.folder)) {
+        if (!row.location.empty()) v.places[row.location]++;
+        v.ai_count += row.ai;
         if (row.favorite) v.favorites.push_back(std::move(row));
+    }
     v.decision_stats = db.decision_stats(r.folder);
     for (auto& d : db.dup_rows(false))  // this folder only
         if (r.folder.empty() || path_under(d.src_path, r.folder)) v.dup_rows.push_back(std::move(d));
@@ -439,7 +469,6 @@ struct App {
 
     // photos view + search
     char search[256] = "";
-    int search_mode = SM_SMART;
     bool in_name = true, in_exif = true, in_desc = true, in_prompt = true;
     std::string date_from, date_to;  // "YYYY-MM-DD" or ""
     bool searching = false;
@@ -534,6 +563,22 @@ struct App {
     std::vector<PhotoRow> favorites;
     std::string fav_tag_filter;
     bool fav_only = false;   // Photos: only starred photos
+    // layout
+    int section = SEC_ALL;
+    std::string section_folder, place;
+    bool sidebar_on = true, inspector_on = true, show_settings = false, ai_only = false;
+    float sidebar_w = 220, inspector_w = 340;
+    std::map<std::string, int> places;
+    int ai_count = 0;
+    // search: tokens (chips) + free text; Enter on a sentence asks the LLM
+    std::vector<std::pair<std::string, std::string>> tokens;  // label, query
+    bool ask_go = false, regex = false, sugg_open = false;
+    int sugg_sel = -1;
+    std::vector<std::string> sugg_tags;  // every tag seen in the catalog (for suggestions)
+    int sugg_tags_gen = -1;
+    std::string undo_run, undo_text;  // the last applied run (Undo banner)
+    bool focus_search = false;        // Ctrl+F: put the cursor in the search field
+    double undo_until = 0;
     std::set<int64_t> multi;  // Photos: selected photos (Ctrl/Shift+click); `selected` is the one in focus
     int64_t anchor = 0;
     bool photo_trash_confirm = false, trash_with_copies = false;
@@ -569,7 +614,7 @@ struct App {
     bool analyze_dlg = false;
     ClipCounts ana_counts, ana_counts_quick;
     int ana_clip = 0, ana_tags = 0;
-    bool photo_grid = false; // Photos: thumbnails instead of the table
+    bool photo_grid = true;  // the library: thumbnails (default) or the table
     std::vector<Correction> corrections;
     std::map<int64_t, bool> corr_sel;  // correction id -> ticked (default: confidence >= 70%)
     int64_t corr_focus = 0;
@@ -587,39 +632,101 @@ struct App {
     std::atomic<int> trash_done{0}, trash_failed{0};
 };
 
+static ImVec4 g_accent(0.30f, 0.78f, 0.47f, 1);
+// Theme colours for meaning (set by apply_style): danger, warning, a warning about originals, success, error, info.
+static ImVec4 kDanger(0.86f, 0.30f, 0.27f, 1);
+static ImVec4 g_warn(0.95f, 0.72f, 0.4f, 1), g_warn_red(1.0f, 0.62f, 0.55f, 1), g_ok(0.5f, 0.9f, 0.6f, 1), g_err(1, 0.5f, 0.4f, 1),
+    g_info(0.6f, 0.75f, 1, 1), g_star(1, 0.8f, 0.25f, 1), g_text_dim(0.55f, 0.57f, 0.62f, 1), g_sidebar(0.09f, 0.10f, 0.12f, 1);
+
+// Themes: Dark, Tokyo Night (the editor theme: #1a1b26 night, #7aa2f7 blue) and Light. The accent comes from the
+// settings (choosing a theme sets its own accent first).
+struct ThemeColors {
+    ImVec4 bg, sidebar, panel, frame, frame_hover, text, dim, border, popup, danger, warn, warn_red, ok, err, info, star;
+};
+static ThemeColors theme_colors(int t) {
+    auto rgb = [](int hex, float a = 1) { return ImVec4(((hex >> 16) & 255) / 255.0f, ((hex >> 8) & 255) / 255.0f, (hex & 255) / 255.0f, a); };
+    if (t == THEME_TOKYO)
+        return {rgb(0x1a1b26), rgb(0x16161e), rgb(0x1f2335), rgb(0x292e42), rgb(0x343a55), rgb(0xc0caf5), rgb(0x737aa2), rgb(0x292e42),
+                rgb(0x1f2335, 0.98f), rgb(0xf7768e), rgb(0xe0af68), rgb(0xff9e64), rgb(0x9ece6a), rgb(0xf7768e), rgb(0x7dcfff), rgb(0xe0af68)};
+    if (t == THEME_LIGHT)
+        return {rgb(0xf5f5f7), rgb(0xe9e9ec), rgb(0xffffff), ImVec4(0, 0, 0, 0.06f), ImVec4(0, 0, 0, 0.10f), rgb(0x1d1d1f), rgb(0x6e6e73),
+                ImVec4(0, 0, 0, 0.12f), rgb(0xffffff, 0.99f), rgb(0xd70015), rgb(0xa05a00), rgb(0xc93400), rgb(0x248a3d), rgb(0xd70015),
+                rgb(0x0058d0), rgb(0xb25000)};
+    return {ImVec4(0.07f, 0.08f, 0.10f, 1), ImVec4(0.09f, 0.10f, 0.12f, 1), ImVec4(0.11f, 0.12f, 0.15f, 1), ImVec4(1, 1, 1, 0.08f),
+            ImVec4(1, 1, 1, 0.14f), ImVec4(0.92f, 0.93f, 0.95f, 1), ImVec4(0.55f, 0.57f, 0.62f, 1), ImVec4(1, 1, 1, 0.08f),
+            ImVec4(0.08f, 0.09f, 0.11f, 0.98f), ImVec4(0.86f, 0.30f, 0.27f, 1), ImVec4(0.95f, 0.72f, 0.4f, 1), ImVec4(1.0f, 0.62f, 0.55f, 1),
+            ImVec4(0.5f, 0.9f, 0.6f, 1), ImVec4(1, 0.5f, 0.4f, 1), ImVec4(0.6f, 0.75f, 1, 1), ImVec4(1, 0.8f, 0.25f, 1)};
+}
+static void theme_default_accent(int t, float* acc) {
+    const float d[3][3] = {{0.30f, 0.78f, 0.47f}, {0.478f, 0.635f, 0.969f}, {0.0f, 0.44f, 0.89f}};
+    for (int k = 0; k < 3; k++) acc[k] = d[std::clamp(t, 0, 2)][k];
+}
+
 static void apply_style(const Config& c) {
     ImGuiStyle& st = ImGui::GetStyle();
-    ImGui::StyleColorsDark(&st);
-    st.WindowRounding = 0.0f;
-    st.FrameRounding = 5.0f;
-    st.PopupRounding = 6.0f;
-    st.GrabRounding = 4.0f;
-    st.ChildRounding = 6.0f;
-    st.TabRounding = 5.0f;
+    ThemeColors th = theme_colors(c.theme);
+    if (c.theme == THEME_LIGHT) ImGui::StyleColorsLight(&st);
+    else ImGui::StyleColorsDark(&st);
+    st.WindowRounding = 8.0f;
+    st.FrameRounding = 6.0f;
+    st.PopupRounding = 8.0f;
+    st.GrabRounding = 6.0f;
+    st.ChildRounding = 8.0f;
+    st.TabRounding = 6.0f;
+    st.ScrollbarRounding = 6.0f;
     st.WindowPadding = ImVec2(12, 10);
+    st.FramePadding = ImVec2(8, 5);
     st.ItemSpacing = ImVec2(8, 6);
     st.WindowBorderSize = 0;
+    st.ChildBorderSize = 1;
+    st.PopupBorderSize = 1;
+    st.ScrollbarSize = 12;
     ImVec4 acc(c.accent[0], c.accent[1], c.accent[2], 1);
-    st.Colors[ImGuiCol_WindowBg] = ImVec4(0.07f, 0.08f, 0.10f, 1.0f);
-    st.Colors[ImGuiCol_ChildBg] = ImVec4(1, 1, 1, 0.02f);
-    st.Colors[ImGuiCol_CheckMark] = acc;
-    st.Colors[ImGuiCol_SliderGrab] = acc;
-    st.Colors[ImGuiCol_SliderGrabActive] = acc;
-    st.Colors[ImGuiCol_PlotHistogram] = acc;
-    st.Colors[ImGuiCol_Button] = ImVec4(1, 1, 1, 0.08f);
-    st.Colors[ImGuiCol_ButtonHovered] = ImVec4(acc.x, acc.y, acc.z, 0.45f);
-    st.Colors[ImGuiCol_ButtonActive] = ImVec4(acc.x, acc.y, acc.z, 0.70f);
-    st.Colors[ImGuiCol_FrameBg] = ImVec4(1, 1, 1, 0.08f);
-    st.Colors[ImGuiCol_FrameBgHovered] = ImVec4(1, 1, 1, 0.14f);
-    st.Colors[ImGuiCol_FrameBgActive] = ImVec4(acc.x, acc.y, acc.z, 0.35f);
-    st.Colors[ImGuiCol_Header] = ImVec4(acc.x, acc.y, acc.z, 0.30f);
-    st.Colors[ImGuiCol_HeaderHovered] = ImVec4(acc.x, acc.y, acc.z, 0.45f);
-    st.Colors[ImGuiCol_HeaderActive] = ImVec4(acc.x, acc.y, acc.z, 0.60f);
-    st.Colors[ImGuiCol_Tab] = ImVec4(1, 1, 1, 0.06f);
-    st.Colors[ImGuiCol_TabHovered] = ImVec4(acc.x, acc.y, acc.z, 0.45f);
-    st.Colors[ImGuiCol_TabSelected] = ImVec4(acc.x, acc.y, acc.z, 0.35f);
-    st.Colors[ImGuiCol_TableHeaderBg] = ImVec4(1, 1, 1, 0.06f);
-    st.Colors[ImGuiCol_PopupBg] = ImVec4(0.08f, 0.09f, 0.11f, 0.98f);
+    auto A = [&](float a) { return ImVec4(acc.x, acc.y, acc.z, a); };
+    ImVec4* k = st.Colors;
+    k[ImGuiCol_WindowBg] = th.bg;
+    k[ImGuiCol_ChildBg] = ImVec4(0, 0, 0, 0);
+    k[ImGuiCol_PopupBg] = th.popup;
+    k[ImGuiCol_Text] = th.text;
+    k[ImGuiCol_TextDisabled] = th.dim;
+    k[ImGuiCol_Border] = th.border;
+    k[ImGuiCol_Separator] = th.border;
+    k[ImGuiCol_CheckMark] = acc;
+    k[ImGuiCol_SliderGrab] = acc;
+    k[ImGuiCol_SliderGrabActive] = acc;
+    k[ImGuiCol_PlotHistogram] = acc;
+    k[ImGuiCol_Button] = th.frame;
+    k[ImGuiCol_ButtonHovered] = th.frame_hover;
+    k[ImGuiCol_ButtonActive] = A(0.55f);
+    k[ImGuiCol_FrameBg] = th.frame;
+    k[ImGuiCol_FrameBgHovered] = th.frame_hover;
+    k[ImGuiCol_FrameBgActive] = A(0.30f);
+    k[ImGuiCol_Header] = A(0.28f);
+    k[ImGuiCol_HeaderHovered] = A(0.18f);
+    k[ImGuiCol_HeaderActive] = A(0.40f);
+    k[ImGuiCol_Tab] = th.frame;
+    k[ImGuiCol_TabHovered] = A(0.35f);
+    k[ImGuiCol_TabSelected] = A(0.30f);
+    k[ImGuiCol_TableHeaderBg] = th.frame;
+    k[ImGuiCol_TableRowBgAlt] = ImVec4(th.text.x, th.text.y, th.text.z, 0.025f);
+    k[ImGuiCol_TableBorderLight] = th.border;
+    k[ImGuiCol_TableBorderStrong] = th.border;
+    k[ImGuiCol_TitleBg] = th.sidebar;
+    k[ImGuiCol_TitleBgActive] = th.panel;
+    k[ImGuiCol_ScrollbarBg] = ImVec4(0, 0, 0, 0);
+    k[ImGuiCol_NavCursor] = acc;
+    k[ImGuiCol_TextSelectedBg] = A(0.35f);
+    k[ImGuiCol_ModalWindowDimBg] = ImVec4(0, 0, 0, c.theme == THEME_LIGHT ? 0.25f : 0.55f);
+    g_accent = acc;
+    kDanger = th.danger;
+    g_warn = th.warn;
+    g_warn_red = th.warn_red;
+    g_ok = th.ok;
+    g_err = th.err;
+    g_info = th.info;
+    g_star = th.star;
+    g_text_dim = th.dim;
+    g_sidebar = th.sidebar;
 }
 
 static std::string fmt_eta(double s) {
@@ -802,8 +909,7 @@ static void tip(const char* text) {
     }
 }
 static void tip(const std::string& text) { tip(text.c_str()); }
-static ImVec4 g_accent(0.30f, 0.78f, 0.47f, 1);
-static const ImVec4 kDanger(0.86f, 0.30f, 0.27f, 1);
+
 // Splitters: a thin bar between two panes that can be dragged. vsplit sits between a left and a right pane
 // (call it after the left one, then SameLine); hsplit between a top and a bottom pane. `size` is the size of the
 // pane the bar resizes; `grow_right` = the pane is on the right/bottom side (dragging right makes it smaller).
@@ -829,10 +935,12 @@ static void hsplit(const char* id, float& size, float min, float max, bool grow_
 }
 
 static bool styled_button(const char* label, const ImVec4& col, const ImVec2& size, const char* tip_text) {
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(col.x, col.y, col.z, 0.70f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(col.x, col.y, col.z, 0.88f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(col.x, col.y, col.z, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 1));
+    // Solid fill; the label is dark or light, whichever reads better on the colour.
+    float lum = 0.299f * col.x + 0.587f * col.y + 0.114f * col.z;
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(col.x, col.y, col.z, 0.88f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(col.x, col.y, col.z, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(col.x * 0.85f, col.y * 0.85f, col.z * 0.85f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, lum > 0.62f ? ImVec4(0.06f, 0.07f, 0.09f, 1) : ImVec4(1, 1, 1, 1));
     bool clicked = ImGui::Button(label, size);
     ImGui::PopStyleColor(4);
     if (tip_text) tip(tip_text);
@@ -860,7 +968,7 @@ static std::string rel_path(const Config& c, const std::string& p) {
 
 static void status_dot(int ok, const char* label, const std::string& detail) {
     // green = answered the last automatic test, yellow = down / not ready, gray = not tested yet (or disabled)
-    ImVec4 col = ok == 1 ? ImVec4(0.3f, 0.85f, 0.45f, 1) : ok == 0 ? ImVec4(0.98f, 0.80f, 0.20f, 1) : ImVec4(0.6f, 0.6f, 0.6f, 1);
+    ImVec4 col = ok == 1 ? g_ok : ok == 0 ? g_warn : g_text_dim;
     ImGui::BeginGroup();
     ImGui::TextColored(col, "\xE2\x97\x8F");
     ImGui::SameLine(0, 4);
@@ -874,7 +982,16 @@ static void status_dot(int ok, const char* label, const std::string& detail) {
 static void draw_log(App& a);
 static void draw_photo_grid(App& a);
 static void request_analyze(App& a);
+// The search as the searcher sees it: the chips' queries, then the typed text.
+static std::string compose_query(const App& a) {
+    std::string q;
+    for (auto& [label, query] : a.tokens) q += (q.empty() ? "" : " ") + query;
+    std::string typed = util::trim(a.search);
+    if (!typed.empty()) q += (q.empty() ? "" : " ") + typed;
+    return q;
+}
 static void select_photo(App& a, int idx);
+static void draw_date_actions(App& a, Photo& p);
 
 static std::string fmt_duration(double s) {
     if (s < 1) return "< 1 s";
@@ -906,235 +1023,6 @@ static int count_plan(const std::vector<PlanItem>& plan, bool review) {
 }
 
 // Top of the window: the folder, one main button, and a status line. Everything else lives in the tabs.
-static void draw_toolbar(App& a) {
-    bool busy = a.pipe->running();
-    ImVec4 acc(a.cfg.accent[0], a.cfg.accent[1], a.cfg.accent[2], 1);
-
-    // Folders: a list scanned together; the selector shows one folder or all of them.
-    ImGui::BeginDisabled(busy);
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted(tr(a.cfg.folders.size() > 1 ? "Photo folders" : "Photo folder"));
-    ImGui::SameLine();
-    // Room on the right: Add, Folders, Analyze, ... (~330 px) and the status dots, help and window buttons (~340 px).
-    ImGui::SetNextItemWidth(std::max(220.0f, ImGui::GetContentRegionAvail().x - 690 - (a.cfg.vl_enabled ? 55 : 0)));
-    std::string cur = a.cfg.folders.empty() ? std::string(tr("choose the folder with your photos"))
-                    : a.cfg.view_all ? util::fmt("%s (%zu)", tr("All folders"), a.cfg.folders.size()) : a.cfg.folder;
-    if (ImGui::BeginCombo("##folders", cur.c_str())) {
-        if (a.cfg.folders.size() > 1 && ImGui::Selectable(util::fmt("%s (%zu)", tr("All folders"), a.cfg.folders.size()).c_str(), a.cfg.view_all))
-            set_view_all(a, true);
-        for (auto& f : std::vector<std::string>(a.cfg.folders))
-            if (ImGui::Selectable(f.c_str(), !a.cfg.view_all && f == a.cfg.folder)) set_folder(a, f);
-        if (a.cfg.folders.empty()) ImGui::TextDisabled("%s", tr("No folders yet: press Add."));
-        ImGui::EndCombo();
-    }
-    tip(tr("The folder shown in the tabs: one of your photo folders, or all of them"));
-    if (ImGui::IsItemHovered() && a.cfg.folders.size() > 1)
-        ImGui::SetTooltip("%s", tr("Analyze scans every folder in the list. Here you choose what the tabs show: one folder or all."));
-    ImGui::SameLine();
-    if (ImGui::Button(tr("+ Add..."))) start_dir_dialog(a, 3);
-    tip(tr("Add a photo folder to the list"));
-    ImGui::SameLine();
-    if (ImGui::Button(util::fmt("%s (%zu)", tr("Folders"), a.cfg.folders.size()).c_str())) ImGui::OpenPopup("folders");
-    tip(tr("The folder list: open, remove, add by path, or re-add a recent one"));
-    if (ImGui::BeginPopup("folders")) {
-        ImGui::TextDisabled("%s", tr("Scanned together by Analyze. Removing a folder only takes it off the list: no file is touched."));
-        std::string remove;
-        if (ImGui::BeginTable("fl", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
-            for (auto& f : a.cfg.folders) {
-                ImGui::TableNextRow();
-                ImGui::PushID(f.c_str());
-                ImGui::TableNextColumn();
-                bool exists = util::dir_exists(f);
-                if (exists) ImGui::TextUnformatted(f.c_str());
-                else ImGui::TextColored(ImVec4(0.95f, 0.6f, 0.4f, 1), "%s  (%s)", f.c_str(), tr("not found"));
-                ImGui::TableNextColumn();
-                if (ImGui::SmallButton(tr("Open"))) run_detached({"xdg-open", f});
-                tip(tr("Open this folder in the file manager"));
-                ImGui::TableNextColumn();
-                if (ImGui::SmallButton(tr("Remove"))) remove = f;
-                tip(tr("Take this folder off the list. No file is touched; its photos stay in the catalog."));
-                ImGui::PopID();
-            }
-            ImGui::EndTable();
-        }
-        if (!remove.empty()) {
-            remove_folder(a.cfg, remove);
-            save_config(a.cfg, a.config_file);
-            a.month.clear();
-            a.selected = 0;
-            a.rows_dirty = a.dups_dirty = true;
-        }
-        ImGui::Separator();
-        ImGui::SetNextItemWidth(420);
-        bool go = ImGui::InputTextWithHint("##addpath", tr("type or paste a folder path"), a.folder_buf, sizeof a.folder_buf, ImGuiInputTextFlags_EnterReturnsTrue);
-        ImGui::SameLine();
-        if ((ImGui::Button(tr("Add")) || go) && a.folder_buf[0]) set_folder(a, a.folder_buf);
-        tip(tr("Add the typed folder to the list"));
-        ImGui::SameLine();
-        if (ImGui::Button(tr("Browse..."))) start_dir_dialog(a, 3);
-        tip(tr("Choose a folder with the file dialog"));
-        std::vector<std::string> again;
-        for (auto& r : a.cfg.recent)
-            if (std::find(a.cfg.folders.begin(), a.cfg.folders.end(), r) == a.cfg.folders.end()) again.push_back(r);
-        if (!again.empty()) {
-            ImGui::TextDisabled("%s", tr("Recent folders (click to add again)"));
-            for (auto& r : again)
-                if (ImGui::Selectable(r.c_str())) set_folder(a, r);
-        }
-        ImGui::EndPopup();
-    }
-    ImGui::EndDisabled();
-    ImGui::SameLine(0, 16);
-
-    // The one main action. While running it becomes Stop.
-    if (!busy) {
-        if (primary_button((std::string("   ") + tr("Analyze") + "   ").c_str(),
-                           tr("Scan the folders, find duplicates, work out dates and places, tag the pictures and plan the organized copies. Nothing is changed until you apply it in Actions.")))
-            request_analyze(a);
-    } else {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.35f, 0.3f, 0.65f));
-        if (ImGui::Button((std::string("    ") + tr("Stop") + "    ").c_str())) a.pipe->stop();
-        tip(tr("Stop the running step after the current photo; everything done so far is kept"));
-        ImGui::PopStyleColor();
-    }
-    ImGui::SameLine();
-    ImGui::BeginDisabled(busy);
-    if (ImGui::Button("...")) ImGui::OpenPopup("more");
-    tip(tr("Run a single step"));
-    if (ImGui::BeginPopup("more")) {
-        ImGui::TextDisabled("%s", tr("Run one step on this folder"));
-        if (ImGui::MenuItem(tr("Scan for new or changed files"))) start_run(a, ST_SCAN);
-        tip(tr("Read new and changed files only (quick)"));
-        if (ImGui::MenuItem(tr("Find duplicates"))) start_run(a, ST_DUPES);
-        tip(tr("Look for identical files in all folders"));
-        if (ImGui::MenuItem(tr("Work out dates and places"))) start_run(a, ST_DECIDE);
-        tip(tr("Decide the capture date and place of new or changed photos"));
-        if (ImGui::MenuItem(tr("Tag pictures (CLIP)"), nullptr, false, a.cfg.clip_enabled)) start_run(a, ST_TAG);
-        tip(tr("Analyse new pictures with CLIP and tag them (the CLIP tab has more choices)"));
-        if (ImGui::MenuItem(tr("Describe with the vision model"), nullptr, false, a.cfg.vl_enabled)) start_run(a, ST_VISION);
-        tip(tr("Write captions with the vision-language model (advanced)"));
-        if (ImGui::MenuItem(tr("Plan the organized copies"))) start_run(a, ST_ORGANIZE, true);
-        ImGui::Separator();
-        ImGui::Checkbox(tr("Re-decide all dates"), &a.opts.redecide_all);
-        tip(tr("Next run works out every date again, not only for new or changed photos"));
-        ImGui::Checkbox(tr("Retry failed vision"), &a.opts.retry_failed_vision);
-        tip(tr("Next run retries photos the vision model could not describe"));
-        ImGui::EndPopup();
-    }
-    ImGui::EndDisabled();
-
-    // Health of the helpers, right-aligned.
-    std::string jd, vd, cd, ld;
-    {
-        std::lock_guard<std::mutex> l(a.health_mu);
-        jd = a.jev_detail;
-        vd = a.vl_detail;
-        cd = a.clip_detail;
-        ld = a.llm_detail;
-    }
-    float right = ImGui::GetWindowContentRegionMax().x;
-    ImGui::SameLine(right - (a.cfg.vl_enabled ? 225 : 170) - 150);
-    g_prof.mark("tb:buttons");
-    status_dot(a.clip_ok, "CLIP", cd);
-    ImGui::SameLine(0, 12);
-    status_dot(a.llm_ok, "AI", a.cfg.llm_url + "  " + ld);
-    ImGui::SameLine(0, 12);
-    status_dot(a.jev_ok, "jev", a.cfg.jev_url + "  " + jd);
-    if (a.cfg.vl_enabled) {
-        ImGui::SameLine(0, 12);
-        status_dot(a.vl_ok, "VL", a.cfg.vl_url + "  " + vd);
-    }
-    g_prof.mark("tb:dots");
-    // Help, then the window buttons (the window has no system title bar).
-    ImGui::SameLine(0, 16);
-    if (ImGui::Button(" ? ")) a.show_help = !a.show_help;
-    tip(tr("Help: what is what, keys, search syntax, credits and the project page"));
-    ImGui::SameLine(0, 12);
-    if (ImGui::Button(" _ ")) glfwIconifyWindow(a.win);
-    tip(tr("Minimise"));
-    ImGui::SameLine(0, 2);
-    bool maxed = glfwGetWindowAttrib(a.win, GLFW_MAXIMIZED);
-    if (ImGui::Button(maxed ? " \xE2\x9D\x90 " : " \xE2\x96\xA1 ")) maxed ? glfwRestoreWindow(a.win) : glfwMaximizeWindow(a.win);
-    tip(maxed ? tr("Restore the window size") : tr("Maximise (or double-click the top bar)"));
-    ImGui::SameLine(0, 2);
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(kDanger.x, kDanger.y, kDanger.z, 0.9f));
-    if (ImGui::Button(" \xC3\x97 ")) glfwSetWindowShouldClose(a.win, GLFW_TRUE);
-    ImGui::PopStyleColor();
-    tip(tr("Close jev photos (a running step stops; everything done so far is kept)"));
-
-    // Status line: progress while running, otherwise the last summary; the log is one click away.
-    Progress& p = a.pipe->progress;
-    int st = p.stage, done = p.done, total = p.total;
-    float frac = total > 0 ? float(done) / float(total) : (busy ? 0.0f : 1.0f);
-    std::string label;
-    if (busy && st) {
-        static const int order[] = {ST_SCAN, ST_DUPES, ST_DECIDE, ST_TAG, ST_VISION, ST_ORGANIZE};
-        static const char* names[] = {"Scanning", "Finding duplicates", "Dates and places", "Tagging", "Describing", "Planning"};
-        int idx = 0, count = 0, which = 0;
-        for (int k = 0; k < 6; k++)
-            if (a.last_stages & order[k]) {
-                count++;
-                if (order[k] == st) { idx = count; which = k; }
-            }
-        const char* name = order[which] == ST_ORGANIZE && !a.last_run_planned ? "Copying" : names[which];
-        double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - p.stage_start).count();
-        double eta = done > 0 ? el / done * (total - done) : -1;
-        label = util::fmt("%s %d/%d  ·  %s  ·  %d / %d  ·  %s %s", tr("Step"), idx, std::max(count, 1), tr(name), done, total,
-                          fmt_eta(eta).c_str(), tr("remaining"));
-        if (p.errors) label += util::fmt("  ·  %d %s", p.errors.load(), tr("errors"));
-    } else {
-        std::lock_guard<std::mutex> l(p.mu);
-        label = p.summary.empty() ? (a.cfg.folders.empty() ? tr("Choose a photo folder, then press Analyze.") : tr("Ready. Press Analyze.")) : p.summary;
-    }
-    g_prof.mark("tb:label");
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 60);
-    ImGui::ProgressBar(frac, ImVec2(ImGui::GetContentRegionAvail().x - 60, 0), label.c_str());
-    ImGui::SameLine();
-    if (ImGui::Button(tr("Log"), ImVec2(52, 0))) a.show_log = !a.show_log;
-    tip(tr("Show what the last runs did, step by step"));
-    if (busy) ImGui::TextDisabled("%s", p.get_current().c_str());
-
-    // Next step banner: a plan is waiting for approval.
-    if (!busy && !a.plan.empty() && !a.on_overview) {
-        int n = count_plan(a.plan, false), nr = count_plan(a.plan, true);
-        if (n > 0) {
-            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(acc.x, acc.y, acc.z, 0.14f));
-            ImGui::BeginChild("banner", ImVec2(0, ImGui::GetFrameHeightWithSpacing() + 8), ImGuiChildFlags_None);
-            ImGui::SetCursorPos(ImVec2(10, 4));
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextColored(acc, "%s", tr("Ready to organize:"));
-            ImGui::SameLine();
-            // Short destination (full path on hover), buttons right after the text so nothing overlaps.
-            std::string out = output_dir(a.cfg), shown = out;
-            if (util::starts_with(out, a.cfg.folder + "/")) shown = util::basename(a.cfg.folder) + "/" + out.substr(a.cfg.folder.size() + 1);
-            ImGui::Text("%d %s  →  %s", n, tr(a.plan_op == OP_MOVE ? "photos to move" : a.plan_op == OP_RENAME ? "photos to rename"
-                                               : a.plan_op == OP_METADATA ? "photos to add metadata to" : "photos to copy"),
-                        a.plan_op == OP_RENAME || a.plan_op == OP_METADATA ? tr("their own folders") : shown.c_str());
-            tip(out.c_str());
-            if (nr) {
-                ImGui::SameLine();
-                ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.4f, 1), "·  %d %s", nr, tr("with uncertain dates"));
-            }
-            ImGui::SameLine(0, 24);
-            if (ImGui::Button(tr("Open in Actions"), ImVec2(140, 0))) a.show_plan_tab = true;
-            tip(tr("See the list of planned changes, one per row, before applying it"));
-            ImGui::SameLine();
-            if (apply_button(a.cfg, util::fmt("%s (%d)", tr("Apply"), n).c_str(), ImVec2(120, 0), a.plan_op)) apply_plan(a);
-            ImGui::EndChild();
-            ImGui::PopStyleColor();
-        }
-    }
-
-    // Log window
-    if (a.show_log) {
-        ImGuiViewport* vp = ImGui::GetMainViewport();
-        ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x * 0.7f, vp->WorkSize.y * 0.55f), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.15f, vp->WorkPos.y + vp->WorkSize.y * 0.25f), ImGuiCond_FirstUseEver);
-        if (ImGui::Begin(tr("Log"), &a.show_log)) draw_log(a);
-        ImGui::End();
-    }
-}
-
 static void request_thumb(App& a, const Photo& p) {
     if (a.thumb_id == p.id) return;
     a.thumb_id = p.id;
@@ -1252,7 +1140,7 @@ static void draw_fav_tag_chips(App& a) {
         if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(a.cfg.accent[0], a.cfg.accent[1], a.cfg.accent[2], 0.6f));
         if (ImGui::SmallButton(t.c_str())) {
             snprintf(a.search, sizeof a.search, "%s", on ? "" : q.c_str());
-            if (a.search_mode == SM_ASK || a.search_mode == SM_SEMANTIC || a.search_mode == SM_REGEX) a.search_mode = SM_SMART;
+            a.ask_go = a.regex = false;
             a.rows_dirty = true;
         }
         tip(tr("Show only photos with this tag (click again to clear); right-click to unstar"));
@@ -1276,7 +1164,7 @@ static void tag_star(App& a, const std::string& tag) {
     auto& f = a.cfg.fav_tags;
     bool on = std::find(f.begin(), f.end(), tag) != f.end();
     ImGui::PushID(tag.c_str());
-    ImGui::PushStyleColor(ImGuiCol_Text, on ? ImVec4(1, 0.8f, 0.25f, 1) : ImVec4(0.55f, 0.55f, 0.6f, 1));
+    ImGui::PushStyleColor(ImGuiCol_Text, on ? g_star : g_text_dim);
     if (ImGui::SmallButton(on ? "\xE2\x98\x85" : "\xE2\x98\x86")) {
         if (on) f.erase(std::remove(f.begin(), f.end(), tag), f.end());
         else f.push_back(tag);
@@ -1410,215 +1298,6 @@ static void trash_files(App& a, const std::vector<std::pair<int64_t, std::vector
 }
 
 // Home: what the analysis found and the next step for each part, with its button.
-static void draw_overview(App& a) {
-    a.on_overview = true;
-    ImVec4 acc(a.cfg.accent[0], a.cfg.accent[1], a.cfg.accent[2], 1);
-    bool busy = a.pipe->running();
-    if (a.cfg.folders.empty()) {
-        ImGui::Dummy(ImVec2(0, 40));
-        ImGui::TextUnformatted(tr("Choose a folder of photos to begin."));
-        ImGui::TextDisabled("%s", tr("Nothing in it is changed: organized copies are made in a jev-organized folder inside it, after you approve a preview."));
-        if (ImGui::Button(tr("Browse..."), ImVec2(200, 36))) start_dir_dialog(a, 3);
-        tip(tr("Choose a folder with the file dialog"));
-        return;
-    }
-    const DbStats& st = a.stats;
-    int pending = count_plan(a.plan, false);
-    int n_dup = 0;
-    int64_t dup_bytes = 0;
-    for (auto& r : a.dup_rows)
-        if (r.dup_of) { n_dup++; dup_bytes += r.size; }
-    int n_similar = 0;
-    for (auto& r : a.dup_rows) n_similar += r.similar_to != 0;
-    bool analyzed = st.total > 0;
-
-    auto card = [&](int n, const char* title, bool done, auto body) {
-        ImGui::PushID(n);
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1, 1, 1, 0.035f));
-        ImGui::BeginChild("card", ImVec2(0, 0), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY);
-        ImGui::TextColored(done ? ImVec4(0.45f, 0.9f, 0.55f, 1) : acc, "%s %d", done ? "\xE2\x9C\x93" : "\xE2\x97\x8B", n);
-        ImGui::SameLine();
-        ImGui::TextUnformatted(title);
-        ImGui::Indent(28);
-        body();
-        ImGui::Unindent(28);
-        ImGui::EndChild();
-        ImGui::PopStyleColor();
-        ImGui::PopID();
-    };
-    ImGui::BeginChild("overview");
-    card(1, tr("Analyze the folder"), analyzed, [&] {
-        if (!analyzed) {
-            ImGui::TextWrapped("%s", tr("Scans every photo, finds duplicates, works out dates and places, tags what is in each picture and plans the organized copies. Nothing is changed."));
-        } else {
-            ImGui::Text("%d %s · %s · %d %s", st.total, tr("photos"), util::human_size(st.total_bytes).c_str(), st.tagged, tr("tagged"));
-            ImGui::TextDisabled("%s", tr("Run it again after adding photos: only new or changed files are read."));
-            if (!a.corrections.empty()) {
-                ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.35f, 1), "%zu %s", a.corrections.size(),
-                                   tr("corrections proposed for generated tags or names (with how sure each one is)"));
-                ImGui::SameLine();
-                if (ImGui::SmallButton(tr("Review corrections"))) a.start_tab = "corrections";
-                tip(tr("Open Actions > Corrections"));
-            }
-        }
-        ImGui::BeginDisabled(busy);
-        if (ImGui::Button(analyzed ? tr("Analyze again") : tr("Analyze"), ImVec2(160, 0))) request_analyze(a);
-        tip(tr("Scan for new or changed photos and update dates, tags and the lists to review; asks how much image analysis to do"));
-        ImGui::EndDisabled();
-    });
-    if (!analyzed) { ImGui::EndChild(); return; }
-    card(2, tr("Check uncertain dates"), st.review == 0 && st.undated == 0, [&] {
-        ImGui::Text("%d %s  ·  %d %s  ·  %d %s", st.resolved - st.review - st.undated, tr("dated with confidence"), st.review, tr("uncertain"),
-                    st.undated, tr("undated"));
-        ImGui::TextDisabled("%s", tr("Uncertain photos are still filed under the best guess. Open one to see the evidence, or type the right date in its panel."));
-        if (st.review + st.undated > 0 && ImGui::Button(tr("Show uncertain dates"), ImVec2(200, 0))) {
-            a.review_only = true;
-            a.search[0] = 0;
-            a.rows_dirty = true;
-            a.start_tab = "photos";
-        }
-        tip(tr("Show only photos whose date is a guess, to check or correct them"));
-    });
-    card(3, tr("Duplicates"), n_dup == 0, [&] {
-        if (!n_dup) ImGui::TextUnformatted(tr("No exact duplicates."));
-        else {
-            ImGui::Text("%d %s (%s)", n_dup, tr("extra copies of photos you already have"), util::human_size(dup_bytes).c_str());
-            ImGui::TextDisabled("%s", tr("They are left out of the organized copies automatically. Your folder keeps them until you remove them here."));
-        }
-        if (n_similar) ImGui::TextDisabled("%d %s", n_similar, tr("similar photos (resized copies or bursts) are listed for review only."));
-        if (ImGui::Button(tr("Show duplicates"), ImVec2(160, 0))) a.start_tab = "dupes";
-        tip(tr("Open Actions > Duplicates"));
-        if (n_dup) {
-            ImGui::SameLine();
-            ImGui::BeginDisabled(busy || a.trash_busy);
-            if (danger_button(tr("Move extra copies to Trash..."), tr("Shows exactly which files would move to the Trash (and which copy stays) before anything moves."), ImVec2(240, 0)))
-                a.trash_confirm = true;
-            ImGui::EndDisabled();
-        }
-        if (a.trash_busy) {
-            ImGui::SameLine();
-            ImGui::TextDisabled("%d / %d", a.trash_done.load(), n_dup);
-        }
-    });
-    card(4, tr("Organize"), pending == 0 && st.organized > 0, [&] {
-        std::string out = output_dir(a.cfg);
-        if (pending) {
-            int nn = 0;
-            int64_t bb = 0;
-            double ss = estimate_plan(a.plan, a.cfg, nn, bb);
-            ImGui::Text("%d %s → %s  ·  %s  ·  %s %s", pending,
-                        tr(a.plan_op == OP_MOVE ? "photos to move" : a.plan_op == OP_RENAME ? "photos to rename"
-                           : a.plan_op == OP_METADATA ? "photos to add metadata to" : "photos to copy"),
-                        a.plan_op == OP_RENAME || a.plan_op == OP_METADATA ? tr("their own folders") : out.c_str(), util::human_size(bb).c_str(), tr("about"), fmt_duration(ss).c_str());
-            ImGui::TextDisabled("%s", tr("Named by date (20190512_00001.jpg) in one folder per month. Check the list, untick anything you do not want, then apply."));
-            if (ImGui::Button(tr("Review the list"), ImVec2(160, 0))) a.show_plan_tab = true;
-            tip(tr("Open Actions > Organize files: every copy, rename and metadata addition, one per row"));
-            ImGui::SameLine();
-            ImGui::BeginDisabled(busy);
-            if (apply_button(a.cfg, util::fmt("%s (%d)", tr("Apply"), pending).c_str(), ImVec2(160, 0), a.plan_op)) apply_plan(a);
-            ImGui::EndDisabled();
-        } else if (st.organized) {
-            ImGui::Text("%d %s %s", st.organized, tr("photos organized in"), out.c_str());
-            if (ImGui::Button(tr("Open organized folder"), ImVec2(200, 0))) run_detached({"xdg-open", out});
-            tip(tr("Open the folder with the organized copies"));
-        } else {
-            ImGui::TextDisabled("%s", tr("No plan yet."));
-            ImGui::BeginDisabled(busy);
-            if (ImGui::Button(tr("Plan the organized copies"), ImVec2(220, 0))) start_run(a, ST_ORGANIZE, true);
-            tip(tr("Build the list of copies and names to review (nothing changes yet)"));
-            ImGui::EndDisabled();
-        }
-    });
-    card(5, tr("Find photos"), false, [&] {
-        ImGui::TextDisabled("%s", tr("Describe what is in the picture (\"kids on a beach\"), or search names, places, tags, years and camera details."));
-        static char q[256] = "";
-        ImGui::SetNextItemWidth(420);
-        bool go = ImGui::InputTextWithHint("##homesearch", tr("Search photos"), q, sizeof q, ImGuiInputTextFlags_EnterReturnsTrue);
-        tip(tr("Words, a description of the picture, or the query language (hover the Photos search box for the syntax)"));
-        ImGui::SameLine();
-        if (ImGui::Button(tr("Search")) || go) {
-            snprintf(a.search, sizeof a.search, "%s", q);
-            a.review_only = false;
-            a.rows_dirty = true;
-            a.start_tab = "photos";
-        }
-        tip(tr("Search the photos for these words"));
-    });
-    card(6, tr("How jev helped"), false, [&] {
-        const DecisionStats& ds = a.decision_stats;
-        ImGui::TextDisabled("%s", tr("jev settles close calls: dates when the evidence disagrees, folder names that may be places, search results the LLM is unsure about, and it cross-checks the LLM on existing descriptions (a disagreement goes to you)."));
-        if (!ds.total) {
-            ImGui::TextUnformatted(tr("No jev decisions yet for this folder (every date and place was clear from the rules)."));
-        } else {
-            auto kind = [&](const char* k, const char* label) {
-                auto it = ds.by_kind.find(k);
-                int asked = it == ds.by_kind.end() ? 0 : it->second.first, ch = it == ds.by_kind.end() ? 0 : it->second.second;
-                return util::fmt("%s %d (%d %s)", label, asked, ch, tr("changed"));
-            };
-            ImGui::Text("%d %s  ·  %s  ·  %s  ·  %s  ·  %s", ds.total, tr("decisions"), kind("date", tr("dates")).c_str(), kind("place", tr("places")).c_str(),
-                        kind("search", tr("search")).c_str(), kind("description", tr("descriptions")).c_str());
-        }
-        if (ImGui::Button(a.show_decisions ? tr("Hide decisions") : tr("Show decisions"), ImVec2(160, 0))) a.show_decisions = !a.show_decisions;
-        tip(a.show_decisions ? tr("Hide the list of jev decisions") : tr("Every question jev answered: what the rules or the LLM said, what jev chose, and the result"));
-        std::string jd;
-        {
-            std::lock_guard<std::mutex> l(a.health_mu);
-            jd = a.jev_detail;
-        }
-        ImGui::SameLine();
-        ImGui::TextDisabled("jev %s  ·  %s", a.jev_ok == 1 ? tr("up") : tr("down"), a.cfg.jev_url.c_str());
-        if (a.show_decisions && !a.decisions.empty()) {
-            ImGuiTableFlags tf = ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV |
-                                 ImGuiTableFlags_SizingFixedFit;
-            if (ImGui::BeginTable("decisions", 6, tf, ImVec2(0, 320))) {
-                ImGui::TableSetupScrollFreeze(0, 1);
-                ImGui::TableSetupColumn(tr("Kind"), 0, 60);
-                ImGui::TableSetupColumn(tr("About"), 0, 300);
-                ImGui::TableSetupColumn(tr("Rules / LLM said"), 0, 190);
-                ImGui::TableSetupColumn(tr("jev chose"), 0, 260);
-                ImGui::TableSetupColumn(tr("Result"), 0, 150);
-                ImGui::TableSetupColumn(tr("When"), 0, 140);
-                ImGui::TableHeadersRow();
-                for (auto& d : a.decisions) {
-                    ImGui::TableNextRow();
-                    ImGui::TableNextColumn();
-                    ImGui::TextUnformatted(tr(d.kind.c_str()));
-                    ImGui::TableNextColumn();
-                    std::string about = d.kind == "search" ? "\"" + d.subject + "\"  " + d.question
-                                                           : rel_path(a.cfg, d.subject);
-                    ImGui::PushID(int(d.id));
-                    ImGui::Selectable(about.c_str(), false, ImGuiSelectableFlags_SpanAllColumns);
-                    if (ImGui::IsItemHovered()) {  // the question and every option with jev's probability
-                        ImGui::BeginTooltip();
-                        ImGui::TextUnformatted(d.question.c_str());
-                        json o = json::parse(d.options.empty() ? "[]" : d.options, nullptr, false);
-                        if (o.is_array())
-                            for (auto& x : o)
-                                if (x.is_array() && x.size() >= 2)
-                                    ImGui::Text("%3.0f%%  %s", x[1].get<double>() * 100, x[0].get<std::string>().substr(0, 140).c_str());
-                        ImGui::EndTooltip();
-                    }
-                    if (d.photo_id && ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) open_viewer(a, {d.photo_id}, 0);
-                    ImGui::PopID();
-                    ImGui::TableNextColumn();
-                    ImGui::TextUnformatted(d.rules_pick.c_str());
-                    ImGui::TableNextColumn();
-                    ImGui::TextUnformatted(d.jev_pick.substr(0, 80).c_str());
-                    ImGui::TableNextColumn();
-                    if (d.changed) ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.4f, 1), "%s (%s)", d.final_pick.c_str(), tr("changed"));
-                    else ImGui::TextUnformatted(d.final_pick.c_str());
-                    ImGui::TableNextColumn();
-                    ImGui::TextDisabled("%s", d.at.substr(0, 16).c_str());
-                }
-                ImGui::EndTable();
-            }
-        }
-    });
-    ImGui::EndChild();
-
-}
-
-// Duplicate removal preview (the dry run): a table of exactly what moves, what stays, totals and time.
 static void draw_trash_modal(App& a) {
     if (a.trash_confirm) {
         ImGui::OpenPopup("###trash");
@@ -1643,7 +1322,7 @@ static void draw_trash_modal(App& a) {
                 tr("files"), util::human_size(bytes).c_str(), tr("about"), fmt_duration(n * 0.05).c_str());
     ImGui::TextWrapped("%s", gio ? tr("They go to the desktop Trash, so they can be restored. The kept copy of every group stays where it is. Each file was confirmed identical byte by byte.")
                                  : tr("No desktop Trash is available: they are moved into jev-duplicates inside the folder instead. Nothing is deleted."));
-    if (!a.cfg.verify_dupes) ImGui::TextColored(ImVec4(1, 0.6f, 0.4f, 1), "%s", tr("Byte-verify is off: turn it on and check duplicates again first."));
+    if (!a.cfg.verify_dupes) ImGui::TextColored(g_err, "%s", tr("Byte-verify is off: turn it on and check duplicates again first."));
     auto rel = [&](const std::string& p) { return rel_path(a.cfg, p); };
     if (ImGui::BeginTable("trashlist", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_Resizable,
                           ImVec2(0, ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() - 8))) {
@@ -1662,10 +1341,10 @@ static void draw_trash_modal(App& a) {
             ImGui::TableNextColumn();
             ImGui::Text("%d", group_no[r->dup_of]);
             ImGui::TableNextColumn();
-            ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.4f, 1), "%s", rel(r->src_path).c_str());
+            ImGui::TextColored(g_warn, "%s", rel(r->src_path).c_str());
             ImGui::TableNextColumn();
             auto k = by.find(r->dup_of);
-            ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.6f, 1), "%s", k != by.end() ? rel(k->second->src_path).c_str() : "?");
+            ImGui::TextColored(g_ok, "%s", k != by.end() ? rel(k->second->src_path).c_str() : "?");
             ImGui::TableNextColumn();
             ImGui::TextUnformatted(util::human_size(r->size).c_str());
         }
@@ -1753,13 +1432,12 @@ static void draw_detail(App& a) {
         ImGui::Dummy(ImVec2(avail, 60));
     }
     copy_text(a, p.src_path);
-    static const ImVec4 green(0.55f, 0.85f, 0.6f, 1);
-    if (!p.dest_path.empty()) copy_text(a, p.dest_path, "-> " + p.dest_path, &green);
+    if (!p.dest_path.empty()) copy_text(a, p.dest_path, "-> " + p.dest_path, &g_ok);
     std::string open_target = p.dest_path.empty() ? p.src_path : p.dest_path;
     ImGui::TextDisabled("%s  ·  %d x %d  ·  #%lld", util::human_size(p.size).c_str(), p.width, p.height, (long long)p.id);
-    if (p.dup_of) ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.3f, 1), "%s #%lld", tr("duplicate of"), (long long)p.dup_of);
-    if (p.similar_to) ImGui::TextColored(ImVec4(0.7f, 0.75f, 1, 1), "%s #%lld (dHash %d)", tr("similar to"), (long long)p.similar_to, p.similar_dist);
-    ImGui::PushStyleColor(ImGuiCol_Text, p.favorite ? ImVec4(1, 0.8f, 0.25f, 1) : ImGui::GetStyleColorVec4(ImGuiCol_Text));
+    if (p.dup_of) ImGui::TextColored(g_warn, "%s #%lld", tr("duplicate of"), (long long)p.dup_of);
+    if (p.similar_to) ImGui::TextColored(g_info, "%s #%lld (dHash %d)", tr("similar to"), (long long)p.similar_to, p.similar_dist);
+    ImGui::PushStyleColor(ImGuiCol_Text, p.favorite ? g_star : ImGui::GetStyleColorVec4(ImGuiCol_Text));
     if (ImGui::SmallButton(p.favorite ? "\xE2\x98\x85 Favorite" : "\xE2\x98\x86 Favorite")) set_favorite(a, p.id, !p.favorite);
     ImGui::PopStyleColor();
     tip(tr("f also stars the selected photo"));
@@ -1767,10 +1445,9 @@ static void draw_detail(App& a) {
     if (ImGui::SmallButton(tr("Find similar"))) {  // CLIP image-to-image: like:#id in the search box
     tip(tr("Photos that look like this one (CLIP); also like:#id in the search box"));
         snprintf(a.search, sizeof a.search, "like:#%lld", (long long)p.id);
-        if (a.search_mode != SM_SMART && a.search_mode != SM_KEYWORD) a.search_mode = SM_SMART;
-        a.month.clear();
+        a.ask_go = a.regex = false;
         a.rows_dirty = true;
-        a.start_tab = "photos";
+        if (!library_section(a.section)) a.start_tab = "photos";
     }
     tip(tr("Photos that look like this one (CLIP); also: like:#id or like:<file name> in the search box"));
     ImGui::SameLine();
@@ -1786,13 +1463,14 @@ static void draw_detail(App& a) {
     ImGui::Text("%s: %s  ·  %s: %.2f  ·  %s: %s", tr("Precision"), p.date_prec.c_str(), tr("Conf"), p.date_conf, tr("Decider"),
                 p.date_decider.c_str());
     copy_text(a, p.date_source, std::string(tr("Source")) + ": " + p.date_source);
+    draw_date_actions(a, p);  // unsure: confirm it, or pick another candidate
     if (ev.is_object() && ev.contains("jev")) ImGui::TextDisabled("%s", ev["jev"].get<std::string>().c_str());
     // jev's part in this photo: its date question, its folder's place question, searches that judged it.
     for (auto& d : a.decisions) {
         bool mine = (d.kind == "date" && d.photo_id == p.id) || (d.kind == "place" && d.subject == util::dirname(p.src_path)) ||
                     (d.kind == "search" && d.photo_id == p.id);
         if (!mine) continue;
-        ImVec4 col = d.changed ? ImVec4(0.95f, 0.72f, 0.4f, 1) : ImVec4(0.6f, 0.75f, 1, 1);
+        ImVec4 col = d.changed ? g_warn : g_info;
         std::string what = d.kind == "search" ? util::fmt("%s \"%s\"", tr("search"), d.subject.c_str()) : tr(d.kind.c_str());
         ImGui::TextColored(col, "jev · %s: %s %s, jev %s -> %s%s", what.c_str(), d.kind == "search" ? "" : tr("rules"), d.rules_pick.c_str(),
                            d.jev_pick.substr(0, 60).c_str(), d.final_pick.c_str(), d.changed ? util::fmt(" (%s)", tr("changed")).c_str() : "");
@@ -1812,7 +1490,7 @@ static void draw_detail(App& a) {
                 ImGui::TableNextRow();
                 bool winner = !alts.empty() && alts[0] == i;
                 bool rejected = c.value("weight", 0.0) <= 0;
-                ImVec4 col = winner ? ImVec4(0.45f, 0.95f, 0.55f, 1) : rejected ? ImVec4(0.55f, 0.55f, 0.55f, 1) : ImVec4(0.9f, 0.9f, 0.9f, 1);
+                ImVec4 col = winner ? g_ok : rejected ? g_text_dim : ImGui::GetStyleColorVec4(ImGuiCol_Text);
                 ImGui::TableNextColumn();
                 ImGui::TextColored(col, "%s%s", winner ? "\xE2\x96\xB6 " : "", c.value("src", "").c_str());
                 ImGui::TableNextColumn();
@@ -1820,7 +1498,7 @@ static void draw_detail(App& a) {
                 tip(c.value("raw", "").c_str());
                 if (c.contains("notes"))
                     for (auto& n : c["notes"]) {
-                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.72f, 0.4f, 1));
+                        ImGui::PushStyleColor(ImGuiCol_Text, g_warn);
                         ImGui::TextWrapped("%s", n.get<std::string>().c_str());
                         ImGui::PopStyleColor();
                     }
@@ -1897,7 +1575,7 @@ static void draw_detail(App& a) {
     ImGui::TextDisabled("%s: %s %s", tr("Metadata"), p.meta_state.c_str(), p.write_error.c_str());
     if (ImGui::CollapsingHeader(tr("Original metadata (read-only)"))) {
         MetaMap m = MetaMap::from_json(p.meta_json);
-        if (!m.error.empty()) ImGui::TextColored(ImVec4(0.95f, 0.5f, 0.4f, 1), "%s", m.error.c_str());
+        if (!m.error.empty()) ImGui::TextColored(g_warn_red, "%s", m.error.c_str());
         for (auto& [k, vs] : m.kv)
             for (auto& v : vs) ImGui::TextWrapped("%s = %s", k.c_str(), v.c_str());
     }
@@ -1959,183 +1637,17 @@ static bool date_picker(const char* id, std::string& value, const char* empty_la
     return changed;
 }
 
-static void draw_photos(App& a) {
-    double now = glfwGetTime();
-    if (a.cfg.folders.empty()) {
-        ImGui::Dummy(ImVec2(0, 60));
-        float w = ImGui::GetContentRegionAvail().x;
-        const char* msg = tr("Choose a folder of photos to begin.");
-        ImGui::SetCursorPosX((w - ImGui::CalcTextSize(msg).x) / 2);
-        ImGui::TextUnformatted(msg);
-        const char* sub = tr("Nothing in it is changed: organized copies are made in a jev-organized folder inside it, after you approve a preview.");
-        ImGui::SetCursorPosX(std::max(0.0f, (w - ImGui::CalcTextSize(sub).x) / 2));
-        ImGui::TextDisabled("%s", sub);
-        ImGui::Dummy(ImVec2(0, 10));
-        ImGui::SetCursorPosX((w - 200) / 2);
-        if (ImGui::Button(tr("Browse..."), ImVec2(200, 36))) start_dir_dialog(a, 3);
-        tip(tr("Choose a folder with the file dialog"));
-        return;
-    }
-    (void)now;
-    if (a.stats.total == 0 && !a.pipe->running()) {
-        if (a.view.loading()) {
-            ImGui::TextDisabled("%s", tr("Loading..."));
-            return;
-        }
-        ImGui::TextWrapped("%s", tr("No photos from this folder yet. Press Analyze."));
-        return;
-    }
-    // Month sidebar
-    ImGui::BeginChild("months", ImVec2(a.months_w, 0), ImGuiChildFlags_Borders);
-    if (ImGui::Selectable(util::fmt("%s (%d)", tr("All months"), a.stats.total).c_str(), a.month.empty())) { a.month.clear(); a.rows_dirty = true; }
-    ImGui::TextDisabled("%s", util::human_size(a.stats.total_bytes).c_str());
-    if (a.stats.dups) ImGui::TextDisabled("%d %s · %s", a.stats.dups, tr("duplicates"), util::human_size(a.stats.dup_bytes).c_str());
-    std::string year;
-    for (auto& mi : a.months) {
-        const std::string& m = mi.month;
-        int n = mi.count;
-        if (m != "undated" && m.substr(0, 4) != year) {
-            year = m.substr(0, 4);
-            ImGui::SeparatorText(year.c_str());
-        }
-        std::string label = (m == "undated" ? std::string(tr("undated")) : m) + util::fmt(" (%d)", n);
-        if (ImGui::Selectable(label.c_str(), a.month == m)) { a.month = m; a.rows_dirty = true; }
-        ImGui::SameLine(std::max(118.0f, a.months_w - 72));
-        ImGui::TextDisabled("%s", util::human_size(mi.bytes).c_str());
-    }
-    ImGui::EndChild();
-    vsplit("##split_months", a.months_w, 140, 420, false);
-
-    ImGui::BeginGroup();
-    // Search bar: one box, a mode, and filters tucked into a popup.
-    ImGui::SetNextItemWidth(std::max(200.0f, ImGui::GetContentRegionAvail().x * 0.45f));
-    // Ask asks the LLM, so it runs on Enter; the other modes search as you type.
-    if (ImGui::InputTextWithHint("##search", a.search_mode == SM_ASK ? tr("Ask: \"my dog at the beach last summer\" (Enter)")
-                                                                   : tr("Search: beach (sunset | sea) -night, tag:dog, is:fav, \"New York\", 海边"),
-                                 a.search, sizeof a.search, a.search_mode == SM_ASK ? ImGuiInputTextFlags_EnterReturnsTrue : 0)) {
-        a.rows_dirty = true;
-        a.search_edit_at = glfwGetTime();  // other-language equivalents are looked up once typing pauses
-        a.search_translate = false;
-    }
-    if (ImGui::IsItemHovered() && a.search_mode != SM_ASK)
-        ImGui::SetTooltip("%s", tr("beach sunset      both\nbeach | sea, beach OR sea      either\n-night, NOT night, !night      without\n(beach | sea) -night      grouping\n\"new york\"      phrase\n~webiste      close spellings too\ntag:dog  name:IMG  desc:..  prompt:..  exif:..  place:paris      one field\ncamera:canon  model:sdxl  lora:ink      camera / generator\ndate:2019  date:2019-05..2019-08  date:>2020  year:2018..2020\nsize:>2mb  w:>3000  h:<1000  mp:>12  ext:png  ext:raw\nis:fav  is:ai  is:untagged  is:uncertain  is:portrait  is:landscape\nhas:gps  has:prompt  has:place  has:desc  has:keywords\nlike:#123  like:IMG_0042      looks like that photo\nWords in Chinese, Japanese or Korean also find English tags (and the other way round)."));
-    ImGui::SameLine();
-    const char* modes[] = {tr("Smart"), tr("Words"), tr("Meaning"), tr("Regex"), tr("Ask (AI)")};
-    const char* mode_tips[] = {tr("Words and meaning together, with the query language: (beach | sea) -night tag:dog is:fav date:2019 like:#12"),
-                               tr("Every word must appear (\"quoted phrase\", -exclude); no picture analysis"),
-                               tr("What the picture really shows (CLIP), e.g. kids on a beach at sunset"),
-                               tr("A regular expression over names, tags, prompts and metadata"),
-                               tr("A sentence such as \"my dog at the beach last summer\"; the LLM understands it and jev settles close calls. Press Enter.")};
-    bool llm_down = a.llm_ok == 0 || !a.cfg.llm_enabled;
-    ImGui::SetNextItemWidth(110);
-    if (ImGui::BeginCombo("##mode", modes[a.search_mode])) {
-        for (int m = 0; m < SM_COUNT; m++) {
-            bool off = m == SM_ASK && llm_down;  // needs the LLM
-            if (ImGui::Selectable(off ? util::fmt("%s (%s)", modes[m], tr("down")).c_str() : modes[m], a.search_mode == m, off ? ImGuiSelectableFlags_Disabled : 0)) {
-                a.search_mode = m;
-                a.rows_dirty = true;
-            }
-            tip(off ? tr("The LLM is down (Settings > Ask search), so Ask is not available. Smart search works without it.") : mode_tips[m]);
-        }
-        ImGui::EndCombo();
-    }
-    tip(mode_tips[a.search_mode]);
-    if (a.search_mode == SM_ASK && llm_down) { a.search_mode = SM_SMART; a.rows_dirty = true; }
-    ImGui::SameLine();
-    int nfilters = (!a.in_name || !a.in_exif || !a.in_desc || !a.in_prompt) + (!a.date_from.empty() || !a.date_to.empty()) + a.review_only;
-    if (ImGui::Button(nfilters ? util::fmt("%s (%d)", tr("Filters"), nfilters).c_str() : tr("Filters"))) ImGui::OpenPopup("filters");
-    tip(tr("Choose the fields to search, a date range, and other filters"));
-    if (ImGui::BeginPopup("filters")) {
-        ImGui::TextDisabled("%s", tr("Look for words in"));
-        if (ImGui::Checkbox(tr("File and folder names"), &a.in_name)) a.rows_dirty = true;
-        tip(tr("Search in file and folder names"));
-        if (ImGui::Checkbox(tr("Descriptions and tags"), &a.in_desc)) a.rows_dirty = true;
-        tip(tr("Search in tags, scene, place and descriptions"));
-        if (ImGui::Checkbox(tr("EXIF / metadata"), &a.in_exif)) a.rows_dirty = true;
-        tip(tr("Search in the camera's and the file's own metadata"));
-        if (ImGui::Checkbox(tr("AI generation prompts"), &a.in_prompt)) a.rows_dirty = true;
-        tip(tr("Search in the prompts AI images were generated from (and their model and LoRA names)"));
-        ImGui::Separator();
-        ImGui::TextDisabled("%s", tr("Taken between"));
-        if (date_picker("from", a.date_from, tr("any start"))) a.rows_dirty = true;
-        ImGui::SameLine();
-        ImGui::TextUnformatted(tr("and"));
-        ImGui::SameLine();
-        if (date_picker("to", a.date_to, tr("any end"))) a.rows_dirty = true;
-        if (!a.date_from.empty() && !a.date_to.empty() && a.date_from > a.date_to) std::swap(a.date_from, a.date_to);
-        int this_year = atoi(util::now_iso().substr(0, 4).c_str());
-        if (ImGui::SmallButton(tr("This year"))) { a.date_from = util::fmt("%d-01-01", this_year); a.date_to = util::fmt("%d-12-31", this_year); a.rows_dirty = true; }
-        tip(tr("Photos taken this year"));
-        ImGui::SameLine();
-        if (ImGui::SmallButton(tr("Last year"))) { a.date_from = util::fmt("%d-01-01", this_year - 1); a.date_to = util::fmt("%d-12-31", this_year - 1); a.rows_dirty = true; }
-        ImGui::Separator();
-        if (ImGui::Checkbox(tr("Only photos with uncertain dates"), &a.review_only)) a.rows_dirty = true;
-        tip(tr("Only photos whose date is a guess"));
-        if (ImGui::Button(tr("Clear filters"))) {
-            a.in_name = a.in_exif = a.in_desc = a.in_prompt = true;
-            a.date_from.clear();
-            a.date_to.clear();
-            a.review_only = false;
-            a.rows_dirty = true;
-        }
-        tip(tr("Search all fields, any date"));
-        ImGui::EndPopup();
-    }
-    if (a.search[0] || nfilters) {
-        ImGui::SameLine();
-        if (ImGui::Button("x")) {
-            a.search[0] = 0;
-            a.in_name = a.in_exif = a.in_desc = a.in_prompt = true;
-            a.date_from.clear();
-            a.date_to.clear();
-            a.review_only = false;
-            a.rows_dirty = true;
-        }
-        tip(tr("Clear the search and all filters"));
-    }
-    // Favorites are a filter of the photos; the grid is another way to look at them.
-    ImGui::SameLine(0, 14);
-    {
-        bool on = a.fav_only;
-        if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1, 0.75f, 0.2f, 0.55f));
-        if (ImGui::Button(util::fmt("\xE2\x98\x85 %s", tr("Favorites")).c_str())) { a.fav_only = !a.fav_only; a.rows_dirty = true; }
-        if (on) ImGui::PopStyleColor();
-        tip(tr("Show only starred photos. Star a photo with f, or with the star in the list."));
-        ImGui::SameLine();
-        if (ImGui::Button(a.photo_grid ? tr("List") : tr("Grid"))) a.photo_grid = !a.photo_grid;
-        tip(tr("Switch between the table and a grid of thumbnails (the same photos and keys)"));
-        if (a.selected && a.multi.empty()) a.multi = {a.selected};
-        ImGui::SameLine(0, 14);
-        ImGui::BeginDisabled(a.multi.empty() || a.trash_busy || a.pipe->running());
-        if (danger_button(util::fmt("%s (%zu)", tr("Move to Trash..."), a.multi.size()).c_str(),
-                          tr("Move the selected photos to the Trash (restorable); asks first. Select several with Ctrl+click or Shift+click; the Delete key does the same.")))
-            a.photo_trash_confirm = true;
-        ImGui::EndDisabled();
-        if (!a.multi.empty() && !ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Delete) && !a.viewer.open) a.photo_trash_confirm = true;
-    }
-    ImGui::SameLine();
-    if (a.view.loading()) ImGui::TextDisabled("%s", tr("searching..."));
-    else if (a.searching) ImGui::TextDisabled("%zu %s", a.rows.size(), tr("matches"));
-    else ImGui::TextDisabled("%zu / %d", a.rows.size(), a.stats.total);
-    draw_fav_tag_chips(a);
-    if (!a.search_error.empty()) ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "%s", a.search_error.c_str());
-    else if (!a.search_note.empty()) ImGui::TextDisabled("%s", a.search_note.c_str());
-
-    if (a.photo_detail_w <= 0) a.photo_detail_w = std::max(360.0f, ImGui::GetContentRegionAvail().x * 0.36f);
-    float avail_x = ImGui::GetContentRegionAvail().x;
-    a.photo_detail_w = std::clamp(a.photo_detail_w, 260.0f, std::max(260.0f, avail_x - 300));
-    ImGui::BeginChild("table", ImVec2(avail_x - a.photo_detail_w - 8, 0));
+// The photos as a sortable list (the library's other view is the grid).
+static void draw_photo_table(App& a) {
     ImGuiTableFlags tf = ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable |
                          ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingFixedFit;
     bool srch = a.searching;
-    if (a.photo_grid) draw_photo_grid(a);
-    else
     tf |= ImGuiTableFlags_Sortable;
     // Separate table ids: browsing sorts by date by default, a search by relevance.
     if (ImGui::BeginTable(srch ? "photos_s" : "photos", 6, tf)) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("\xE2\x98\x85", ImGuiTableColumnFlags_PreferSortDescending, 22);
-        ImGui::TableSetupColumn(tr("Date"), srch ? 0 : ImGuiTableColumnFlags_DefaultSort, 130);
+        ImGui::TableSetupColumn(tr("Date"), srch ? 0 : ImGuiTableColumnFlags_DefaultSort, 150);
         ImGui::TableSetupColumn(srch ? tr("Why it matched") : tr("Tags"),
                                 srch ? ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_PreferSortDescending : 0, srch ? 360 : 300);
         ImGui::TableSetupColumn(tr("Place"), 0, 90);
@@ -2179,7 +1691,12 @@ static void draw_photos(App& a) {
             for (auto& mi : a.months) ms.push_back(mi.month);
             int mi = int(std::find(ms.begin(), ms.end(), a.month) - ms.begin());
             mi = std::clamp(mi + (nk == NK_RIGHT ? 1 : -1), 0, int(ms.size()) - 1);
-            if (ms[size_t(mi)] != a.month) { a.month = ms[size_t(mi)]; a.rows_dirty = true; a.selected = 0; }
+            if (ms[size_t(mi)] != a.month) {
+                a.section = ms[size_t(mi)].empty() ? SEC_ALL : SEC_MONTH;
+                a.month = ms[size_t(mi)];
+                a.rows_dirty = true;
+                a.selected = 0;
+            }
         } else if ((nk == NK_ENTER || nk == NK_SPACE) && sel_idx >= 0) {
             std::vector<int64_t> ids;
             for (auto& r : a.rows) ids.push_back(r.id);
@@ -2197,14 +1714,14 @@ static void draw_photos(App& a) {
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();
                 ImGui::PushID(int(r.id));
-                ImGui::PushStyleColor(ImGuiCol_Text, r.favorite ? ImVec4(1, 0.8f, 0.25f, 1) : ImVec4(0.4f, 0.4f, 0.45f, 1));
+                ImGui::PushStyleColor(ImGuiCol_Text, r.favorite ? g_star : g_text_dim);
                 if (ImGui::SmallButton(r.favorite ? "\xE2\x98\x85" : "\xE2\x98\x86")) set_favorite(a, r.id, !r.favorite);
                 tip(tr("Star or unstar this photo (f)"));
                 ImGui::PopStyleColor();
                 ImGui::TableNextColumn();
                 std::string d = r.date_value.empty() ? tr("undated") : util::parse_db_datetime(r.date_value + "|" + r.date_prec).pretty();
                 // Uncertain dates are shown in amber; details in the side panel.
-                ImGui::PushStyleColor(ImGuiCol_Text, r.needs_review ? ImVec4(0.95f, 0.72f, 0.4f, 1) : ImGui::GetStyleColorVec4(ImGuiCol_Text));
+                ImGui::PushStyleColor(ImGuiCol_Text, r.needs_review ? g_warn : ImGui::GetStyleColorVec4(ImGuiCol_Text));
                 if (ImGui::Selectable(d.c_str(), a.selected == r.id || a.multi.count(r.id), ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick)) {
                     select_photo(a, i);
                     if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
@@ -2233,12 +1750,6 @@ static void draw_photos(App& a) {
             }
         ImGui::EndTable();
     }
-    ImGui::EndChild();
-    vsplit("##split_detail", a.photo_detail_w, 260, 2000, true);
-    ImGui::BeginChild("detail", ImVec2(0, 0), ImGuiChildFlags_Borders);
-    draw_detail(a);
-    ImGui::EndChild();
-    ImGui::EndGroup();
 }
 
 // Example of the chosen naming for the Review header and the Tags & EXIF tab.
@@ -2266,7 +1777,7 @@ static void draw_plan_controls(App& a, bool meta_view) {
         for (int i = 0; i < 3; i++) {
             if (i) ImGui::SameLine();
             bool changes_originals = i == OP_MOVE || i == OP_RENAME;  // the warning colour
-            if (changes_originals) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.62f, 0.55f, 1));
+            if (changes_originals) ImGui::PushStyleColor(ImGuiCol_Text, g_warn_red);
             if (ImGui::RadioButton(ops[i], c.file_op == i)) { c.file_op = i; changed = true; }
             if (changes_originals) ImGui::PopStyleColor();
             tip(tips[i]);
@@ -2374,12 +1885,12 @@ static void draw_plan(App& a, bool meta_view) {
                         tr("duplicates skipped"), n_rev, tr("need review"));
     if (n_ok || n_err) {
         ImGui::SameLine();
-        ImGui::TextColored(n_err ? ImVec4(1, 0.5f, 0.4f, 1) : ImVec4(0.5f, 0.9f, 0.6f, 1), "  ·  %d %s, %d %s", n_ok, tr("applied"), n_err, tr("failed"));
+        ImGui::TextColored(n_err ? g_err : g_ok, "  ·  %d %s, %d %s", n_ok, tr("applied"), n_err, tr("failed"));
     }
     if (a.plan_op == OP_METADATA)
         ImGui::TextDisabled("%s", tr("Nothing is moved or renamed. Missing fields are added to each photo where it is now (its organized copy if it has one)."));
     else if (a.plan_op != OP_COPY)
-        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.4f, 1), "%s", tr("Your original files will be renamed/moved (no copies are kept)."));
+        ImGui::TextColored(g_warn, "%s", tr("Your original files will be renamed/moved (no copies are kept)."));
     else
         ImGui::TextDisabled("%s %s", tr("Organized copies go to"),
                             a.cfg.output.empty() && a.cfg.folders.size() > 1 ? tr("a jev-organized folder inside each photo folder") : output_dir(a.cfg).c_str());
@@ -2409,7 +1920,7 @@ static void draw_plan(App& a, bool meta_view) {
     tip(tr("Show only rows whose date is a guess"));
     if (n_decide) {
         ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.72f, 0.4f, 1));
+        ImGui::PushStyleColor(ImGuiCol_Text, g_warn);
         ImGui::Checkbox(util::fmt("%d %s", n_decide, tr("descriptions to decide")).c_str(), &a.plan_decide_only);
         ImGui::PopStyleColor();
         tip(tr("These photos already have a description. The LLM and jev did not agree on keeping, appending or replacing it, so you choose (until then it is left as it is)."));
@@ -2487,9 +1998,9 @@ static void draw_plan(App& a, bool meta_view) {
                 tip(tr("Include this row when applying (Space)"));
                 ImGui::EndDisabled();
                 ImGui::TableNextColumn();
-                ImVec4 ac = dup ? ImVec4(0.55f, 0.55f, 0.55f, 1) : it.action == "refile" ? ImVec4(0.95f, 0.75f, 0.35f, 1)
-                          : it.action == "move" ? ImVec4(0.95f, 0.55f, 0.45f, 1) : it.action == "metadata" ? ImVec4(0.6f, 0.75f, 1, 1)
-                                                                                                             : ImVec4(0.55f, 0.9f, 0.6f, 1);
+                ImVec4 ac = dup ? g_text_dim : it.action == "refile" ? g_warn
+                          : it.action == "move" ? g_warn_red : it.action == "metadata" ? g_info
+                                                                                                             : g_ok;
                 if (ImGui::Selectable("##row", a.plan_sel == i,
                                       ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap | ImGuiSelectableFlags_AllowDoubleClick)) {
                     a.plan_sel = i;
@@ -2505,16 +2016,16 @@ static void draw_plan(App& a, bool meta_view) {
                 else if (!it.include) ImGui::TextDisabled("%s", tr("excluded"));
                 else ImGui::TextUnformatted(rel(it.dest).c_str());
                 ImGui::TableNextColumn();
-                ImGui::TextColored(it.needs_review ? ImVec4(0.95f, 0.72f, 0.4f, 1) : ImGui::GetStyleColorVec4(ImGuiCol_Text), "%s", it.date.c_str());
+                ImGui::TextColored(it.needs_review ? g_warn : ImGui::GetStyleColorVec4(ImGuiCol_Text), "%s", it.date.c_str());
                 ImGui::TableNextColumn();
                 ImGui::TextUnformatted(util::human_size(it.size).c_str());
                 ImGui::TableNextColumn();
                 if (!it.meta_cmds.empty()) ImGui::Text("+%d%s", it.meta_added, it.meta_removed.empty() ? "" : util::fmt(" -%zu", it.meta_removed.size()).c_str());
-                if (it.desc_action == "decide") { ImGui::SameLine(); ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.4f, 1), "%s", tr("desc?")); }
+                if (it.desc_action == "decide") { ImGui::SameLine(); ImGui::TextColored(g_warn, "%s", tr("desc?")); }
                 else if (it.desc_action == "append" || it.desc_action == "replace") { ImGui::SameLine(); ImGui::TextDisabled("%s", tr(("desc " + it.desc_action).c_str())); }
                 ImGui::TableNextColumn();
-                if (it.result == "ok") ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.6f, 1), "%s", tr("applied"));
-                else if (!it.result.empty()) ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "%s", it.result.c_str());
+                if (it.result == "ok") ImGui::TextColored(g_ok, "%s", tr("applied"));
+                else if (!it.result.empty()) ImGui::TextColored(g_err, "%s", it.result.c_str());
                 else if (!dup) ImGui::TextDisabled("%s", it.note.c_str());
                 ImGui::PopID();
             }
@@ -2525,8 +2036,8 @@ static void draw_plan(App& a, bool meta_view) {
     if (a.plan_sel >= 0 && a.plan_sel < int(a.plan.size())) {
         const PlanItem& it = a.plan[size_t(a.plan_sel)];
         ImGui::Text("%s  %s", tr(it.action.c_str()), it.src.c_str());
-        if (!it.old_dest.empty()) ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.35f, 1), "%s -> %s", it.old_dest.c_str(), it.dest.c_str());
-        else if (it.action != "duplicate") ImGui::TextColored(ImVec4(0.55f, 0.9f, 0.6f, 1), "-> %s", it.dest.c_str());
+        if (!it.old_dest.empty()) ImGui::TextColored(g_warn, "%s -> %s", it.old_dest.c_str(), it.dest.c_str());
+        else if (it.action != "duplicate") ImGui::TextColored(g_ok, "-> %s", it.dest.c_str());
         if (!it.desc_new.empty() && it.desc_action != "add" && !it.desc_action.empty()) {
             // An existing description: what it says, what ours says, who decided, and your override.
             ImGui::SeparatorText(tr("Description"));
@@ -2536,7 +2047,7 @@ static void draw_plan(App& a, bool meta_view) {
             ImGui::TextDisabled("%s", tr("Ours:"));
             ImGui::SameLine();
             ImGui::TextWrapped("%s", it.desc_new.c_str());
-            ImGui::TextColored(it.desc_action == "decide" ? ImVec4(0.95f, 0.72f, 0.4f, 1) : ImVec4(0.6f, 0.75f, 1, 1), "%s: %s  (%s)  %s",
+            ImGui::TextColored(it.desc_action == "decide" ? g_warn : g_info, "%s: %s  (%s)  %s",
                                tr("Decision"), tr(it.desc_action == "decide" ? "you decide" : it.desc_action.c_str()), it.desc_by.c_str(), it.desc_why.c_str());
             ImGui::BeginDisabled(busy || it.desc_action == "update" || it.desc_by == "same");
             for (const char* act : {"keep", "append", "replace"}) {
@@ -2544,7 +2055,7 @@ static void draw_plan(App& a, bool meta_view) {
                 bool on = it.desc_action == act;
                 bool repl = std::string(act) == "replace";
                 if (on) ImGui::PushStyleColor(ImGuiCol_Button, repl ? ImVec4(kDanger.x, kDanger.y, kDanger.z, 0.75f) : ImVec4(a.cfg.accent[0], a.cfg.accent[1], a.cfg.accent[2], 0.6f));
-                if (repl) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.62f, 0.55f, 1));
+                if (repl) ImGui::PushStyleColor(ImGuiCol_Text, g_warn_red);
                 bool clicked = ImGui::SmallButton(tr(act));
                 if (repl) ImGui::PopStyleColor();
                 tip(std::string(act) == "keep" ? tr("Leave the file's description as it is")
@@ -2565,10 +2076,10 @@ static void draw_plan(App& a, bool meta_view) {
                                 tr("existing values are never changed; Xmp.jev.* is provenance"));
             for (auto& c : it.meta_cmds) {
                 bool ours = util::starts_with(c, "set Xmp.jev.");
-                ImGui::TextColored(ours ? ImVec4(0.6f, 0.6f, 0.65f, 1) : ImVec4(0.75f, 0.9f, 1, 1), "%s", c.c_str());
+                ImGui::TextColored(ours ? g_text_dim : g_info, "%s", c.c_str());
             }
             for (auto& k : it.meta_removed)
-                ImGui::TextColored(ImVec4(0.95f, 0.6f, 0.5f, 1), "- %s  (%s)", k.c_str(), tr("keyword jev-photos wrote earlier, replaced by the current tags"));
+                ImGui::TextColored(g_warn_red, "- %s  (%s)", k.c_str(), tr("keyword jev-photos wrote earlier, replaced by the current tags"));
             if (it.meta_cmds.empty()) ImGui::TextDisabled("%s", tr("nothing to add"));
         }
     } else {
@@ -2748,10 +2259,10 @@ static void draw_tags(App& a) {
                 for (size_t q = 0; q < r.prompt_tags.size() && q < 8; q++) {
                     if (!first) { ImGui::SameLine(0, 0); ImGui::TextDisabled(", "); ImGui::SameLine(0, 0); }
                     first = false;
-                    ImGui::TextColored(ImVec4(0.55f, 0.8f, 0.95f, 1), "%s", r.prompt_tags[q].c_str());
+                    ImGui::TextColored(g_info, "%s", r.prompt_tags[q].c_str());
                 }
                 if (r.tags.empty() && r.prompt_tags.empty()) ImGui::TextDisabled("%s", r.tagged ? tr("(nothing clear)") : tr("(not tagged)"));
-                if (r.stale && !r.user_edited) { ImGui::SameLine(); ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.4f, 1), "*"); }
+                if (r.stale && !r.user_edited) { ImGui::SameLine(); ImGui::TextColored(g_warn, "*"); }
                 ImGui::TableNextColumn();
                 if (r.user_edited) ImGui::TextDisabled("%s", tr("mine"));
                 else if (!r.tags.empty()) ImGui::Text("%.0f%%", r.best * 100);
@@ -2760,7 +2271,7 @@ static void draw_tags(App& a) {
                 ImGui::TableNextColumn();
                 auto flag = [](bool on, const char* label) {
                     ImGui::SameLine(0, 6);
-                    if (on) ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.6f, 1), "%s", label);
+                    if (on) ImGui::TextColored(g_ok, "%s", label);
                     else ImGui::TextDisabled("%s", label);
                 };
                 ImGui::Dummy(ImVec2(0, 0));
@@ -2768,7 +2279,7 @@ static void draw_tags(App& a) {
                 flag(r.keywords, tr("keywords"));
                 flag(r.description, tr("desc"));
                 flag(r.place, tr("place"));
-                if (!r.gen_tool.empty()) { ImGui::SameLine(0, 6); ImGui::TextColored(ImVec4(0.55f, 0.8f, 0.95f, 1), "%s", r.gen_tool.c_str()); }
+                if (!r.gen_tool.empty()) { ImGui::SameLine(0, 6); ImGui::TextColored(g_info, "%s", r.gen_tool.c_str()); }
                 ImGui::TableNextColumn();
                 ImGui::TextUnformatted(r.location.c_str());
             }
@@ -2907,7 +2418,7 @@ static void draw_tags(App& a) {
                         ImGui::TextColored(ImVec4(0.6f, 0.85f, 1, 1), "+ %s", cmd.substr(4).c_str());
                         shown_n++;
                     }
-                    for (auto& k : w.removed) ImGui::TextColored(ImVec4(0.95f, 0.6f, 0.5f, 1), "- Xmp.dc.subject %s", k.c_str());
+                    for (auto& k : w.removed) ImGui::TextColored(g_warn_red, "- Xmp.dc.subject %s", k.c_str());
                     if (!shown_n && w.removed.empty()) ImGui::TextDisabled("%s", tr("nothing: the file already has it all"));
                 }
             }
@@ -3061,57 +2572,123 @@ static void draw_photo_grid(App& a) {
         else if ((nk == NK_ENTER || nk == NK_SPACE) && sel >= 0) open_viewer(a, ids(), sel);
         else if (nk == NK_FAV && sel >= 0) set_favorite(a, rows[size_t(sel)].id, !rows[size_t(sel)].favorite);
     }
-    ImGuiListClipper clip;
-    int nrows = (int(rows.size()) + cols - 1) / cols;
-    clip.Begin(nrows, cell + ImGui::GetTextLineHeightWithSpacing());
-    if (a.scroll_sel && sel >= 0) clip.IncludeItemByIndex(sel / cols);
-    while (clip.Step())
-        for (int row = clip.DisplayStart; row < clip.DisplayEnd; row++) {
-            for (int c = 0; c < cols; c++) {
-                int i = row * cols + c;
-                if (i >= int(rows.size())) break;
-                const PhotoRow& r = rows[size_t(i)];
-                if (c) ImGui::SameLine();
-                ImGui::BeginGroup();
-                ImGui::PushID(int(r.id));
-                ImVec2 p0 = ImGui::GetCursorScreenPos();
-                if (ImGui::Selectable("##cell", a.selected == r.id || a.multi.count(r.id), ImGuiSelectableFlags_AllowDoubleClick, ImVec2(cell - 8, img))) {
-                    select_photo(a, i);
-                    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) open_viewer(a, ids(), i);
-                }
-                if (ImGui::BeginPopupContextItem()) {
-                    if (ImGui::MenuItem(r.favorite ? tr("Remove from favorites") : tr("Add to favorites"))) set_favorite(a, r.id, !r.favorite);
-                    tip(tr("Star or unstar this photo (f)"));
-                    if (ImGui::MenuItem(tr("Find similar"))) {
-                        snprintf(a.search, sizeof a.search, "like:#%lld", (long long)r.id);
-                        a.rows_dirty = true;
-                    }
-                    tip(tr("Photos that look like this one (CLIP); also like:#id in the search box"));
-                    if (ImGui::MenuItem(tr("Open folder"))) run_detached({"xdg-open", util::dirname(r.dest_path.empty() ? r.src_path : r.dest_path)});
-                    tip(tr("Open the folder that holds this photo"));
-                    if (ImGui::MenuItem(tr("Move to Trash..."))) {
-                        if (!a.multi.count(r.id)) a.multi = {r.id};
-                        a.photo_trash_confirm = true;
-                    }
-                    tip(tr("Move this photo (or the selected ones) to the Trash; asks first"));
-                    ImGui::EndPopup();
-                }
-                if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) ImGui::SetTooltip("%s\n%s", rel_path(a.cfg, r.src_path).c_str(), r.tags.c_str());
-                if (a.scroll_sel && a.selected == r.id) { ImGui::SetScrollHereY(0.5f); a.scroll_sel = false; }
-                if (const Texture* t = grid_thumb(a, r); t && t->tex) {
-                    float s2 = std::min(img / t->w, img / t->h);
-                    ImVec2 sz(t->w * s2, t->h * s2);
-                    ImVec2 q0(p0.x + (cell - 8 - sz.x) / 2, p0.y + (img - sz.y) / 2);
-                    ImGui::GetWindowDrawList()->AddImage(ImTextureRef((ImTextureID)(intptr_t)t->tex), q0, ImVec2(q0.x + sz.x, q0.y + sz.y));
-                }
-                if (r.favorite) ImGui::GetWindowDrawList()->AddText(ImVec2(p0.x + 4, p0.y + 2), IM_COL32(255, 205, 64, 255), "\xE2\x98\x85");
-                std::string name = util::basename(r.dest_path.empty() ? r.src_path : r.dest_path);
-                if (name.size() > 22) name = name.substr(0, 20) + "…";
-                ImGui::TextDisabled("%s", name.c_str());
-                ImGui::PopID();
-                ImGui::EndGroup();
+    // Lines: a month heading whenever the month changes (only while the photos are in date order), then rows of cells.
+    struct GLine { int start = 0, n = 0; std::string head; float y = 0, h = 0; };
+    std::vector<GLine> lines;
+    auto month_of = [](const PhotoRow& r) { return r.date_value.size() >= 7 ? r.date_value.substr(0, 7) : std::string(); };
+    bool by_date = !a.searching && a.section != SEC_MONTH;
+    if (by_date) {  // monotonic months (either direction), undated anywhere
+        int dir = 0;
+        std::string prev;
+        for (auto& r : rows) {
+            std::string m = month_of(r);
+            if (m.empty()) continue;
+            if (!prev.empty() && m != prev) {
+                int d = m > prev ? 1 : -1;
+                if (dir && d != dir) { by_date = false; break; }
+                dir = d;
             }
+            prev = m;
         }
+    }
+    const float row_h = img + ImGui::GetStyle().ItemSpacing.y * 2 + ImGui::GetTextLineHeight() + 4;
+    const float head_h = ImGui::GetTextLineHeight() * 1.5f + 14;
+    float y = 0;
+    int sel_line = -1;
+    for (int i = 0; i < int(rows.size());) {
+        std::string m = by_date ? month_of(rows[size_t(i)]) : "";
+        if (by_date && (i == 0 || m != month_of(rows[size_t(i - 1)]))) {
+            GLine h;
+            static const char* mnames[] = {"January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"};
+            int mo = m.size() == 7 ? atoi(m.substr(5).c_str()) : 0;
+            h.head = m.empty() ? std::string(tr("Undated")) : mo >= 1 && mo <= 12 ? util::fmt("%s %s", tr(mnames[mo - 1]), m.substr(0, 4).c_str()) : m;
+            int cnt = 0;
+            for (int k = i; k < int(rows.size()) && month_of(rows[size_t(k)]) == m; k++) cnt++;
+            h.head += util::fmt("  ·  %d", cnt);
+            h.y = y;
+            h.h = head_h;
+            y += head_h;
+            lines.push_back(h);
+        }
+        int n = 0;
+        while (n < cols && i + n < int(rows.size()) && (!by_date || month_of(rows[size_t(i + n)]) == m)) n++;
+        GLine l;
+        l.start = i;
+        l.n = n;
+        l.y = y;
+        l.h = row_h;
+        if (sel >= i && sel < i + n) sel_line = int(lines.size());
+        lines.push_back(l);
+        y += row_h;
+        i += n;
+    }
+    float y0 = ImGui::GetCursorPosY(), x0 = ImGui::GetCursorPosX();
+    float top = ImGui::GetScrollY() - y0, bottom = top + ImGui::GetWindowHeight();
+    if (a.scroll_sel && sel_line >= 0) {
+        const GLine& l = lines[size_t(sel_line)];
+        if (l.y < top || l.y + l.h > bottom) ImGui::SetScrollY(y0 + l.y - (bottom - top - l.h) / 2);
+        a.scroll_sel = false;
+    }
+    // Only the lines in view are drawn (binary search for the first one).
+    int first = int(std::lower_bound(lines.begin(), lines.end(), top, [](const GLine& l, float t) { return l.y + l.h < t; }) - lines.begin());
+    for (int li = first; li < int(lines.size()) && lines[size_t(li)].y < bottom; li++) {
+        const GLine& l = lines[size_t(li)];
+        if (!l.head.empty()) {
+            ImGui::SetCursorPos(ImVec2(x0 + 2, y0 + l.y + 8));
+            ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 1.15f);
+            ImGui::TextUnformatted(l.head.c_str());
+            ImGui::PopFont();
+            continue;
+        }
+        for (int c = 0; c < l.n; c++) {
+            int i = l.start + c;
+            const PhotoRow& r = rows[size_t(i)];
+            ImGui::SetCursorPos(ImVec2(x0 + c * cell, y0 + l.y));
+            ImGui::BeginGroup();
+            ImGui::PushID(int(r.id));
+            ImVec2 p0 = ImGui::GetCursorScreenPos();
+            if (ImGui::Selectable("##cell", a.selected == r.id || a.multi.count(r.id), ImGuiSelectableFlags_AllowDoubleClick, ImVec2(cell - 8, img))) {
+                select_photo(a, i);
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) open_viewer(a, ids(), i);
+            }
+            if (ImGui::BeginPopupContextItem()) {
+                if (ImGui::MenuItem(r.favorite ? tr("Remove from favorites") : tr("Add to favorites"))) set_favorite(a, r.id, !r.favorite);
+                tip(tr("Star or unstar this photo (f)"));
+                if (ImGui::MenuItem(tr("Find similar"))) {
+                    a.tokens.clear();
+                    snprintf(a.search, sizeof a.search, "like:#%lld", (long long)r.id);
+                    a.rows_dirty = true;
+                }
+                tip(tr("Photos that look like this one (CLIP); also like:#id in the search box"));
+                if (ImGui::MenuItem(tr("Open folder"))) run_detached({"xdg-open", util::dirname(r.dest_path.empty() ? r.src_path : r.dest_path)});
+                tip(tr("Open the folder that holds this photo"));
+                if (ImGui::MenuItem(tr("Move to Trash..."))) {
+                    if (!a.multi.count(r.id)) a.multi = {r.id};
+                    a.photo_trash_confirm = true;
+                }
+                tip(tr("Move this photo (or the selected ones) to the Trash; asks first"));
+                ImGui::EndPopup();
+            }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) ImGui::SetTooltip("%s\n%s", rel_path(a.cfg, r.src_path).c_str(), r.tags.c_str());
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            if (const Texture* t = grid_thumb(a, r); t && t->tex) {
+                float s2 = std::min(img / t->w, img / t->h);
+                ImVec2 sz(t->w * s2, t->h * s2);
+                ImVec2 q0(p0.x + (cell - 8 - sz.x) / 2, p0.y + (img - sz.y) / 2);
+                dl->AddImageRounded(ImTextureRef((ImTextureID)(intptr_t)t->tex), q0, ImVec2(q0.x + sz.x, q0.y + sz.y), ImVec2(0, 0), ImVec2(1, 1),
+                                    IM_COL32_WHITE, 4.0f);
+            }
+            if (r.favorite) dl->AddText(ImVec2(p0.x + 6, p0.y + 4), ImGui::GetColorU32(g_star), ICON_STAR);
+            if (r.needs_review) dl->AddText(ImVec2(p0.x + cell - 30, p0.y + 4), ImGui::GetColorU32(g_warn), ICON_CALENDAR_QUESTION);
+            std::string name = util::basename(r.dest_path.empty() ? r.src_path : r.dest_path);
+            if (name.size() > 22) name = name.substr(0, 20) + "…";
+            ImGui::TextDisabled("%s", name.c_str());
+            ImGui::PopID();
+            ImGui::EndGroup();
+        }
+    }
+    ImGui::SetCursorPos(ImVec2(x0, y0 + y));
+    ImGui::Dummy(ImVec2(1, 1));
 }
 
 // Corrections: specific fixes of what jev-photos generated (tags, names it gave), with how sure we are. Tick and apply;
@@ -3222,9 +2799,9 @@ static void draw_corrections(App& a) {
                 }
                 tip(c.path.c_str());
                 ImGui::TableNextColumn();
-                if (c.field == "name") ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.35f, 1), "%s -> %s", c.current.c_str(), c.proposed.c_str());
-                else if (c.action == "remove") ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.5f, 1), "- %s %s", tr("tag"), c.current.c_str());
-                else ImGui::TextColored(ImVec4(0.55f, 0.9f, 0.6f, 1), "+ %s %s", tr("tag"), c.proposed.c_str());
+                if (c.field == "name") ImGui::TextColored(g_warn, "%s -> %s", c.current.c_str(), c.proposed.c_str());
+                else if (c.action == "remove") ImGui::TextColored(g_warn_red, "- %s %s", tr("tag"), c.current.c_str());
+                else ImGui::TextColored(g_ok, "+ %s %s", tr("tag"), c.proposed.c_str());
                 ImGui::TableNextColumn();
                 ImGui::TextUnformatted(c.reason.c_str());
                 tip(c.reason.c_str());
@@ -3342,7 +2919,7 @@ static void draw_dupes(App& a) {
                 const DupLine& l = a.dup_lines[size_t(i)];
                 ImGui::TableNextRow();
                 if (l.group < 0) {
-                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(ImVec4(1, 1, 1, 0.06f)));
+                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(ImVec4(g_accent.x, g_accent.y, g_accent.z, 0.10f)));
                     ImVec4 acc(a.cfg.accent[0], a.cfg.accent[1], a.cfg.accent[2], 1);
                     ImGui::TableSetColumnIndex(1);
                     ImGui::TextColored(acc, "%s %lld", tr("Group"), (long long)l.id);
@@ -3373,9 +2950,9 @@ static void draw_dupes(App& a) {
                 }
                 ImGui::TableNextColumn();
                 bool in_lib = !r.dest_path.empty();
-                if (l.keeper) ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.6f, 1), "%s%s", l.similar ? tr("largest") : tr("kept"), in_lib ? " · lib" : "");
-                else if (l.similar) ImGui::TextColored(ImVec4(0.7f, 0.75f, 1, 1), "%s %d", tr("distance"), r.similar_dist);
-                else ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.4f, 1), "%s", tr("duplicate"));
+                if (l.keeper) ImGui::TextColored(g_ok, "%s%s", l.similar ? tr("largest") : tr("kept"), in_lib ? " · lib" : "");
+                else if (l.similar) ImGui::TextColored(g_info, "%s %d", tr("distance"), r.similar_dist);
+                else ImGui::TextColored(g_warn, "%s", tr("duplicate"));
                 ImGui::TableNextColumn();
                 ImGui::TextUnformatted(util::human_size(r.size).c_str());
                 ImGui::TableNextColumn();
@@ -3434,7 +3011,7 @@ static void draw_log(App& a) {
     while (clip.Step())
         for (int i = clip.DisplayStart; i < clip.DisplayEnd; i++) {
             const LogLine& l = lines[size_t(i)];
-            ImVec4 c = l.level == 2 ? ImVec4(1, 0.45f, 0.4f, 1) : l.level == 1 ? ImVec4(0.95f, 0.8f, 0.4f, 1) : ImVec4(0.85f, 0.85f, 0.85f, 1);
+            ImVec4 c = l.level == 2 ? g_err : l.level == 1 ? g_warn : ImGui::GetStyleColorVec4(ImGuiCol_Text);
             ImGui::TextColored(c, "%s  %s", l.time.c_str(), l.text.c_str());
         }
     static size_t last = 0;
@@ -3450,6 +3027,40 @@ static void draw_settings(App& a) {
     Config& c = a.cfg;
     bool busy = a.pipe->running();
     ImGui::BeginChild("settings");
+    if (ImGui::CollapsingHeader(tr("Appearance"), ImGuiTreeNodeFlags_DefaultOpen)) {
+    const char* themes[] = {tr("Dark"), tr("Tokyo Night"), tr("Light")};
+    ImGui::SetNextItemWidth(160);
+    if (ImGui::Combo(tr("Theme"), &c.theme, themes, 3)) {
+        theme_default_accent(c.theme, c.accent);  // each theme brings its own accent; change it below if you like
+        apply_style(c);
+        save_config(c, a.config_file);
+    }
+    tip(tr("Dark, Tokyo Night (deep blue with soft neon colours) or Light"));
+    int lang = get_lang();
+    ImGui::SetNextItemWidth(160);
+    if (ImGui::Combo(tr("Language"), &lang, kLangNames, L_COUNT)) {
+        set_lang(Lang(lang));
+        c.lang = kLangCodes[lang];
+    }
+    tip(tr("Interface language"));
+    ImGui::SetNextItemWidth(160);
+    ImGui::SliderFloat(tr("Font size"), &c.font_size, 12, 26, "%.0f");
+    tip(tr("Interface text size"));
+    if (ImGui::ColorEdit3(tr("Accent"), c.accent, ImGuiColorEditFlags_NoInputs)) apply_style(c);
+    tip(tr("The colour of the main buttons and highlights"));
+    if (ImGui::Checkbox(tr("Use the system title bar"), &c.system_titlebar)) save_config(c, a.config_file);
+    tip(tr("Show the desktop's own title bar instead of the app's top bar with its window buttons (applies after restart)"));
+    const char* rend[] = {tr("Auto (GPU, software if the driver crashes)"), tr("GPU only"), tr("Software")};
+    ImGui::SetNextItemWidth(320);
+    ImGui::Combo(tr("Renderer"), &c.renderer, rend, 3);
+    tip(tr("Graphics: GPU, or software rendering when the GPU driver cannot open a window"));
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s (%s)", a.gl_renderer.c_str(), tr("applies after restart"));
+    }
+    if (ImGui::CollapsingHeader(tr("Folders"), ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ImGui::Checkbox(tr("Watch the folders for new photos"), &c.watch_folders)) save_config(c, a.config_file);
+    tip(tr("Every 10 minutes, while nothing else runs, look for new or changed photos and analyse them quietly (dates, duplicates, recognition). Nothing in your files changes."));
+    }
     ImGui::BeginDisabled(busy);
 
     if (ImGui::CollapsingHeader(tr("Organized copies"), ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -3472,8 +3083,8 @@ static void draw_settings(App& a) {
     ImGui::Combo(tr("File operation"), &c.file_op, ops, OP_COUNT);
     tip(tr("What Organize does with each photo"));
     if (c.file_op == OP_COPY) ImGui::TextDisabled("%s", tr("Your photos stay as they are; renamed copies go into month folders."));
-    else if (c.file_op == OP_MOVE) ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.4f, 1), "%s", tr("Your photos are moved into the month folders and renamed; no second copy uses disk space."));
-    else if (c.file_op == OP_RENAME) ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.4f, 1), "%s", tr("Your photos keep their folders and only get date names (20190512_00001.jpg)."));
+    else if (c.file_op == OP_MOVE) ImGui::TextColored(g_warn, "%s", tr("Your photos are moved into the month folders and renamed; no second copy uses disk space."));
+    else if (c.file_op == OP_RENAME) ImGui::TextColored(g_warn, "%s", tr("Your photos keep their folders and only get date names (20190512_00001.jpg)."));
     else ImGui::TextDisabled("%s", tr("Missing dates, tags, descriptions and places are added to the files where they are."));
     const char* ns[] = {tr("Date and serial (20190512_00001)"), tr("Original name, then date and serial (IMG_20190512_00001)")};
     ImGui::SetNextItemWidth(420);
@@ -3661,25 +3272,6 @@ static void draw_settings(App& a) {
     }
     ImGui::EndDisabled();
 
-    if (ImGui::CollapsingHeader(tr("Appearance"))) {
-    int lang = get_lang();
-    ImGui::SetNextItemWidth(160);
-    if (ImGui::Combo(tr("Language"), &lang, kLangNames, L_COUNT)) {
-        set_lang(Lang(lang));
-        c.lang = kLangCodes[lang];
-    }
-    tip(tr("Interface language"));
-    ImGui::SetNextItemWidth(160);
-    ImGui::SliderFloat(tr("Font size"), &c.font_size, 12, 26, "%.0f");
-    tip(tr("Interface text size"));
-    if (ImGui::ColorEdit3(tr("Accent"), c.accent, ImGuiColorEditFlags_NoInputs)) apply_style(c);
-    const char* rend[] = {tr("Auto (GPU, software if the driver crashes)"), tr("GPU only"), tr("Software")};
-    ImGui::SetNextItemWidth(320);
-    ImGui::Combo(tr("Renderer"), &c.renderer, rend, 3);
-    tip(tr("Graphics: GPU, or software rendering when the GPU driver cannot open a window"));
-    ImGui::SameLine();
-    ImGui::TextDisabled("%s (%s)", a.gl_renderer.c_str(), tr("applies after restart"));
-    }
     ImGui::Spacing();
     ImGui::BeginDisabled(busy);
     if (primary_button(tr("Save settings"), tr("Keep these settings (they are also used by the command line)"), ImVec2(160, 0))) {
@@ -3807,7 +3399,7 @@ static void window_chrome(App& a, float bar_bottom) {
     ImVec2 g0(vs.x - 18, vs.y - 18);
     bool on_grip = io.MousePos.x >= g0.x && io.MousePos.y >= g0.y && free_spot;
     ImDrawList* fg = ImGui::GetForegroundDrawList();
-    ImU32 gc = on_grip || sizing ? IM_COL32(200, 200, 200, 220) : IM_COL32(140, 140, 150, 140);
+    ImU32 gc = ImGui::GetColorU32(on_grip || sizing ? ImGuiCol_Text : ImGuiCol_TextDisabled);
     for (int k = 0; k < 3; k++) fg->AddLine(ImVec2(vs.x - 4 - 5 * k, vs.y - 2), ImVec2(vs.x - 2, vs.y - 4 - 5 * k), gc, 1.5f);
     if (on_grip || sizing) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNWSE);
     if (ImGui::IsMouseClicked(0)) {
@@ -3838,15 +3430,19 @@ static void draw_help(App& a) {
         if (ImGui::BeginTabItem(tr("What is what"))) {
             struct C { const char* name; const char* text; };
             const C cs[] = {
-                {"Photo folders", "The folders you add. Analyze scans them all together; the selector shows one or all."},
-                {"File name", "The name on disk. Actions > Organization gives photos date names (20190512_00001.jpg), optionally keeping the original name in front."},
+                {"Sidebar", "Library: everything, favorites, years, places, AI images, one folder. To review: what needs you, with counts. Tools: tags, image recognition, activity."},
+                {"Photo folders", "The folders you add (sidebar > Folders). Analyze scans them all together; click one to see only its photos."},
+                {"File name", "The name on disk. Organize gives photos date names (20190512_00001.jpg), optionally keeping the original name in front."},
                 {"Tags", "Words for what the picture shows: proposed by CLIP with a confidence, or your own. Searchable."},
-                {"CLIP", "The image analysis that reads each picture once (slow) and keeps the result, so tags and meaning search are fast afterwards."},
+                {"Image recognition", "CLIP: the image analysis that reads each picture once (slow) and keeps the result, so tags and meaning search are fast afterwards."},
                 {"Keywords", "Tags written into the file (XMP dc:subject) so other apps see them. Only added; the file's own keywords stay."},
                 {"Description", "A sentence written into the file (XMP dc:description): the AI prompt for generated images, plus \"Shows: tags\". An existing description is only changed as you decide."},
                 {"EXIF / XMP", "The metadata inside the file. Camera, lens, dates, GPS and AI prompts are the file's own and are never changed."},
                 {"AI prompt", "What an AI image was generated from (ComfyUI, A1111, Civitai downloads...). Read-only; searchable."},
-                {"Corrections", "Fixes of generated tags and names, proposed with a confidence and applied only when you tick them."},
+                {"Tag suggestions", "Fixes of generated tags and names, proposed with a confidence and applied only when you tick them."},
+                {"Save info to files", "Writes missing dates, keywords, descriptions and places into the files where they are, after you review the list."},
+                {"Undo", "Every applied change is recorded: Activity lists the last 10 runs, each with Undo (Ctrl+Z right after applying)."},
+                {"Assistant", "The robot in the top bar: green when image recognition, the language model and jev are all up. Features that need a helper that is down are greyed out."},
                 {"jev", "The decision model that settles close calls: dates, places, search results, and cross-checks of the LLM."},
                 {"LLM", "The language model (local server) that reads prompts, picks keywords and judges search results."},
                 {"Red buttons", "They change or remove your original files (move, rename, write into them, move to Trash, replace a description)."},
@@ -3869,7 +3465,8 @@ static void draw_help(App& a) {
             const char* keys[][2] = {{"j / k, Down / Up", "next / previous row or photo"}, {"h / l, Left / Right", "previous / next month, page, or grid column"},
                                      {"Enter, Space", "open the viewer / next photo"}, {"f", "star / unstar the photo"},
                                      {"Delete", "move the selected photos to the Trash (asks first)"}, {"Ctrl+click, Shift+click", "select several photos"},
-                                     {"Esc, q", "close the viewer or a dialog"}, {"Right-click", "copy a label, or more actions on a photo"}};
+                                     {"Esc, q", "close the viewer or a dialog"}, {"Ctrl+F", "search"}, {"Ctrl+I", "show / hide the inspector"},
+                                     {"Ctrl+,", "settings"}, {"Ctrl+Z", "undo what was just applied"}, {"Backspace", "in an empty search: remove the last filter chip"}, {"Right-click", "copy a label, or more actions on a photo"}};
             for (auto& k : keys) { ImGui::TextColored(g_accent, "%-26s", k[0]); ImGui::SameLine(220); ImGui::TextUnformatted(tr(k[1])); }
             ImGui::EndTabItem();
         }
@@ -3879,6 +3476,7 @@ static void draw_help(App& a) {
             ImGui::TextWrapped("%s", tr("date:2019 date:2019-05..2019-08 date:>2020 year:2018..2020 · size:>2mb w:>3000 mp:>12 ext:raw"));
             ImGui::TextWrapped("%s", tr("is:fav is:ai is:untagged is:uncertain is:portrait · has:gps has:prompt has:desc · like:#123 (looks like)"));
             ImGui::TextWrapped("%s", tr("Chinese, Japanese and Korean words also find English tags, and the other way round."));
+            ImGui::TextWrapped("%s", tr("Pick a suggestion while typing to add it as a filter chip. A sentence (four words or more) + Enter asks the assistant."));
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem(tr("About"))) {
@@ -3888,7 +3486,7 @@ static void draw_help(App& a) {
             tip(tr("Open the project page in the browser"));
             ImGui::SeparatorText(tr("Credits"));
             const char* credits[] = {"Dear ImGui (Omar Cornut) · GLFW · OpenGL", "SQLite with FTS5 · nlohmann/json · xxHash · stb_image",
-                                     "ONNX Runtime · CLIP (OpenAI), ONNX exports by Xenova", "exiv2 (metadata) · ffmpeg (video frames)",
+                                     "ONNX Runtime · CLIP (OpenAI), ONNX exports by Xenova", "Tabler Icons (MIT) · Tokyo Night colours (enkia, MIT)", "exiv2 (metadata) · ffmpeg (video frames)",
                                      "jev / Julia decision API · Qwen3 language model (local)", "Built with Claude Code"};
             for (auto* c : credits) ImGui::BulletText("%s", c);
             ImGui::SeparatorText(tr("License"));
@@ -3966,7 +3564,7 @@ static void draw_tag_editor(App& a) {
             }
             tip(tr("Rename this tag or move it to another category (below)"));
             ImGui::SameLine();
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.55f, 0.5f, 1));
+            ImGui::PushStyleColor(ImGuiCol_Text, g_warn_red);
             if (ImGui::SmallButton(tr("Delete"))) remove = i;
             ImGui::PopStyleColor();
             tip(tr("Remove this tag from the list. Photos lose it when they are re-tagged (your own tags are not affected)."));
@@ -4272,7 +3870,7 @@ static void draw_corr_confirm(App& a) {
     for (auto& r : a.tag_rows) ai += !r.gen_tool.empty();
     bool llm = a.llm_ok == 1;
     ImGui::TextWrapped("%s", util::fmt(tr("Re-checks the generated tags and names of %d photos. The rules are instant; AI images (%d known) are also read by the LLM, which runs on the GPU server (about 1-3 s each)."), n, ai).c_str());
-    if (!llm) ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.4f, 1), "%s", tr("The LLM is down: only the rules are checked."));
+    if (!llm) ImGui::TextColored(g_warn, "%s", tr("The LLM is down: only the rules are checked."));
     if (primary_button(tr("Check now"), tr("Start the check; the proposals appear in Corrections"), ImVec2(140, 0))) {
         RunOptions o = a.opts;
         o.stages = ST_FIX;
@@ -4291,22 +3889,783 @@ static void draw_corr_confirm(App& a) {
 }
 
 // One line that says what each kind of data is and where it is handled.
-static void draw_concepts(App& a) {
+// ===========================================================================
+// Main window: sidebar | content | inspector, with one top bar.
+
+static const char* section_title(const App& a) {
+    switch (a.section) {
+        case SEC_ALL: return tr("All photos");
+        case SEC_FAV: return tr("Favorites");
+        case SEC_MONTH: return a.month == "undated" ? tr("Undated") : a.month.c_str();
+        case SEC_PLACE: return a.place.c_str();
+        case SEC_AI: return tr("AI images");
+        case SEC_FOLDER: return a.section_folder.c_str();
+        case SEC_DUPES: return tr("Duplicates");
+        case SEC_DATES: return tr("Unsure dates");
+        case SEC_SUGG: return tr("Tag suggestions");
+        case SEC_ORGANIZE: return tr("Organize");
+        case SEC_SAVE: return tr("Save info to files");
+        case SEC_TAGS: return tr("Tags");
+        case SEC_RECOG: return tr("Image recognition");
+        case SEC_ACTIVITY: return tr("Activity");
+    }
+    return "";
+}
+
+static void set_section(App& a, int sec, const std::string& arg = "") {
+    a.section = sec;
+    a.fav_only = sec == SEC_FAV;
+    a.ai_only = sec == SEC_AI;
+    a.month = sec == SEC_MONTH ? arg : "";
+    a.place = sec == SEC_PLACE ? arg : "";
+    a.section_folder = sec == SEC_FOLDER ? arg : "";
+    a.review_only = false;
+    a.selected = 0;
+    a.multi.clear();
+    a.rows_dirty = a.dups_dirty = true;
+    if (sec == SEC_TAGS) a.on_tags = true;
+}
+
+// One sidebar row: icon, label, optional count on the right; returns true when clicked.
+static bool side_item(App& a, const char* icon, const std::string& label, bool selected, int count = -1, bool count_accent = false, const char* tip_text = nullptr) {
     (void)a;
-    struct C { const char* name; const char* tip; };
-    const C cs[] = {
-        {"File name", "The name on disk. Organize files gives it a date name (20190512_00001.jpg), optionally keeping the original name in front."},
-        {"Tags", "Words for what the picture shows. CLIP (image analysis) proposes them with a confidence; your own tags replace them. Searchable."},
-        {"Keywords", "Tags written into the file (XMP dc:subject), so other apps see them. Only added; the file's own keywords stay."},
-        {"Description", "A sentence written into the file (XMP dc:description): the AI prompt for generated images, plus \"Shows: tags\". An existing description is only changed as you decide."},
-        {"EXIF / XMP", "The metadata inside the file. Camera, lens, dates, GPS and AI prompts are the file's own and are never changed."},
-        {"Corrections", "Fixes of generated tags and names, proposed with a confidence, applied only when you tick them."},
+    ImGui::PushID(label.c_str());
+    bool clicked = ImGui::Selectable("##side", selected, 0, ImVec2(0, ImGui::GetTextLineHeight() + 6));
+    if (tip_text) tip(tip_text);
+    ImVec2 p0 = ImGui::GetItemRectMin(), p1 = ImGui::GetItemRectMax();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    float y = p0.y + 3;
+    ImU32 col = ImGui::GetColorU32(ImGuiCol_Text), dim = ImGui::GetColorU32(ImGuiCol_TextDisabled);
+    dl->AddText(ImVec2(p0.x + 6, y), selected ? ImGui::GetColorU32(g_accent) : dim, icon);
+    std::string shown = label;
+    float maxw = p1.x - p0.x - 70;
+    while (shown.size() > 4 && ImGui::CalcTextSize(shown.c_str()).x > maxw) shown = shown.substr(0, shown.size() - 4) + "…";
+    dl->AddText(ImVec2(p0.x + 30, y), col, shown.c_str());
+    if (count >= 0) {
+        std::string n = count >= 10000 ? util::fmt("%.0fk", count / 1000.0) : std::to_string(count);
+        ImVec2 ts = ImGui::CalcTextSize(n.c_str());
+        dl->AddText(ImVec2(p1.x - ts.x - 6, y), count_accent && count > 0 ? ImGui::GetColorU32(g_accent) : dim, n.c_str());
+    }
+    ImGui::PopID();
+    return clicked;
+}
+
+static void side_heading(const char* t) {
+    ImGui::Dummy(ImVec2(0, 4));
+    ImGui::TextDisabled("%s", t);
+}
+
+static void draw_sidebar(App& a) {
+    const DbStats& st = a.stats;
+    side_heading(tr("Library"));
+    if (side_item(a, ICON_PHOTO, tr("All photos"), a.section == SEC_ALL, st.total, false, tr("Every photo in your folders"))) set_section(a, SEC_ALL);
+    if (side_item(a, ICON_STAR, tr("Favorites"), a.section == SEC_FAV, int(a.favorites.size()), false, tr("Photos you starred (f)"))) set_section(a, SEC_FAV);
+    if (a.ai_count && side_item(a, ICON_SPARKLES, tr("AI images"), a.section == SEC_AI, a.ai_count, false, tr("Pictures with generation data (prompt, model) in the file")))
+        set_section(a, SEC_AI);
+    // Years, then their months
+    static std::string open_year;
+    std::map<std::string, std::pair<int, std::vector<const MonthInfo*>>> years;
+    for (auto& mi : a.months) {
+        std::string y = mi.month == "undated" ? std::string(tr("Undated")) : mi.month.substr(0, 4);
+        years[y].first += mi.count;
+        years[y].second.push_back(&mi);
+    }
+    if (!years.empty()) side_heading(tr("Years"));
+    for (auto it = years.rbegin(); it != years.rend(); ++it) {
+        const std::string& y = it->first;
+        bool open = open_year == y;
+        bool sel_year = a.section == SEC_MONTH && (a.month == y || util::starts_with(a.month, y + "-") || (y == tr("Undated") && a.month == "undated"));
+        if (side_item(a, open ? ICON_CHEVRON_DOWN : ICON_CHEVRON_RIGHT, y, sel_year && !open, it->second.first)) {
+            open_year = open ? "" : y;
+            if (it->second.second.size() == 1 || y == tr("Undated")) set_section(a, SEC_MONTH, it->second.second[0]->month);
+        }
+        if (open_year == y)
+            for (auto* mi : it->second.second) {
+                ImGui::Indent(14);
+                std::string label = mi->month == "undated" ? std::string(tr("Undated")) : mi->month;
+                if (side_item(a, ICON_CALENDAR, label, a.section == SEC_MONTH && a.month == mi->month, mi->count)) set_section(a, SEC_MONTH, mi->month);
+                ImGui::Unindent(14);
+            }
+    }
+    if (!a.places.empty()) {
+        side_heading(tr("Places"));
+        std::vector<std::pair<std::string, int>> pl(a.places.begin(), a.places.end());
+        std::sort(pl.begin(), pl.end(), [](auto& x, auto& y) { return x.second > y.second; });
+        for (size_t i = 0; i < pl.size() && i < 8; i++)
+            if (side_item(a, ICON_MAP_PIN, pl[i].first, a.section == SEC_PLACE && a.place == pl[i].first, pl[i].second)) set_section(a, SEC_PLACE, pl[i].first);
+    }
+    // What needs you
+    int nd = 0;
+    for (auto& r : a.dup_rows) nd += r.dup_of != 0;
+    int pending = count_plan(a.plan, false);
+    side_heading(tr("To review"));
+    if (side_item(a, ICON_COPY, tr("Duplicates"), a.section == SEC_DUPES, nd, true, tr("Identical copies: keep one, move the others to the Trash"))) set_section(a, SEC_DUPES);
+    if (side_item(a, ICON_CALENDAR_QUESTION, tr("Unsure dates"), a.section == SEC_DATES, st.review + st.undated, true,
+                  tr("Photos whose date is a guess: confirm it or pick another")))
+        set_section(a, SEC_DATES);
+    if (side_item(a, ICON_TAGS, tr("Tag suggestions"), a.section == SEC_SUGG, int(a.corrections.size()), true,
+                  tr("Fixes of tags the app generated, with how sure it is")))
+        set_section(a, SEC_SUGG);
+    if (side_item(a, ICON_FOLDERS, tr("Organize"), a.section == SEC_ORGANIZE, a.plan_op != OP_METADATA ? pending : -1, true,
+                  tr("Copy, move or rename photos into month folders with date names")))
+        set_section(a, SEC_ORGANIZE);
+    if (side_item(a, ICON_FILE_EXPORT, tr("Save info to files"), a.section == SEC_SAVE, a.plan_op == OP_METADATA ? pending : -1, true,
+                  tr("Write missing dates, keywords, descriptions and places into the files")))
+        set_section(a, SEC_SAVE);
+    side_heading(tr("Folders"));
+    for (auto& f : std::vector<std::string>(a.cfg.folders)) {
+        if (side_item(a, ICON_FOLDER, util::basename(f), a.section == SEC_FOLDER && a.section_folder == f, -1, false, f.c_str())) set_section(a, SEC_FOLDER, f);
+        if (ImGui::BeginPopupContextItem(("fold" + f).c_str())) {
+            if (ImGui::MenuItem(tr("Open in file manager"))) run_detached({"xdg-open", f});
+            if (ImGui::MenuItem(tr("Remove from the list"))) {
+                remove_folder(a.cfg, f);
+                save_config(a.cfg, a.config_file);
+                set_section(a, SEC_ALL);
+            }
+            tip(tr("No file is touched; its photos stay in the catalog"));
+            ImGui::EndPopup();
+        }
+    }
+    if (side_item(a, ICON_FOLDER_PLUS, tr("Add folder..."), false, -1, false, tr("Add a folder of photos; Analyze scans all your folders together"))) start_dir_dialog(a, 3);
+    side_heading(tr("Tools"));
+    if (side_item(a, ICON_TAG, tr("Tags"), a.section == SEC_TAGS, -1, false, tr("Each photo's tags, your own tags, and the tag list"))) set_section(a, SEC_TAGS);
+    if (side_item(a, ICON_EYE, tr("Image recognition"), a.section == SEC_RECOG, -1, false, tr("Analyse pictures: new ones, again, or a quick pass")))
+        set_section(a, SEC_RECOG);
+    if (side_item(a, ICON_HISTORY, tr("Activity"), a.section == SEC_ACTIVITY, -1, false, tr("What ran, what changed (with Undo), and the decisions jev made")))
+        set_section(a, SEC_ACTIVITY);
+}
+
+// ---- search field: chips + text, suggestions while typing
+
+struct Suggestion {
+    const char* icon;
+    std::string label, query, kind;
+};
+
+static std::vector<Suggestion> suggestions(App& a, const std::string& typed_in) {
+    std::vector<Suggestion> out;
+    std::string t = util::lower(util::trim(typed_in));
+    if (t.empty()) return out;
+    if (a.sugg_tags_gen != a.view_gen) {  // tags seen in the catalog, plus the tag list
+        std::set<std::string> all;
+        for (auto& r : a.rows)
+            for (auto& x : util::split(r.tags, ','))
+                if (!util::trim(x).empty()) all.insert(util::lower(util::trim(x)));
+        static std::vector<TagDef> vocab = load_tag_vocabulary();
+        for (auto& v : vocab) all.insert(util::lower(v.tag));
+        a.sugg_tags.assign(all.begin(), all.end());
+        a.sugg_tags_gen = a.view_gen;
+    }
+    auto quoted = [](const std::string& v) { return v.find(' ') != std::string::npos ? "\"" + v + "\"" : v; };
+    for (auto& tg : a.sugg_tags)
+        if (out.size() < 5 && tg.find(t) != std::string::npos) out.push_back({ICON_TAG, tg, "tag:" + quoted(tg), tr("Tag")});
+    for (auto& [p, n] : a.places)
+        if (out.size() < 7 && util::lower(p).find(t) != std::string::npos) out.push_back({ICON_MAP_PIN, p, "place:" + quoted(util::lower(p)), tr("Place")});
+    std::set<std::string> years;
+    for (auto& mi : a.months)
+        if (mi.month != "undated") years.insert(mi.month.substr(0, 4));
+    for (auto& y : years)
+        if (out.size() < 8 && util::starts_with(y, t)) out.push_back({ICON_CALENDAR, y, "date:" + y, tr("Year")});
+    for (auto& mi : a.months)
+        if (out.size() < 8 && t.size() >= 5 && util::starts_with(mi.month, t)) out.push_back({ICON_CALENDAR, mi.month, "date:" + mi.month, tr("Month")});
+    if (std::string("favorites").find(t) == 0 || std::string("starred").find(t) == 0) out.push_back({ICON_STAR, tr("Favorites"), "is:fav", tr("Filter")});
+    if (t == "ai" || std::string("generated").find(t) == 0) out.push_back({ICON_SPARKLES, tr("AI images"), "is:ai", tr("Filter")});
+    return out;
+}
+
+static bool sentence_like(const std::string& s) {
+    int words = 0;
+    bool in = false;
+    for (unsigned char ch : s) {
+        bool sp = isspace(ch);
+        if (!sp && !in) words++;
+        in = !sp;
+        if (ch == ':' || ch == '(' || ch == '|' || ch == '"') return false;  // query syntax
+    }
+    return words >= 4;
+}
+
+static void draw_search(App& a, float width) {
+    ImGuiStyle& st = ImGui::GetStyle();
+    float h = ImGui::GetFrameHeight();
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImGui::GetWindowDrawList()->AddRectFilled(p0, ImVec2(p0.x + width, p0.y + h), ImGui::GetColorU32(ImGuiCol_FrameBg), st.FrameRounding);
+    ImGui::BeginGroup();
+    ImGui::SetCursorScreenPos(ImVec2(p0.x + 8, p0.y + st.FramePadding.y));
+    ImGui::TextDisabled(ICON_SEARCH);
+    ImGui::SameLine(0, 6);
+    // chips
+    int remove = -1;
+    for (size_t i = 0; i < a.tokens.size(); i++) {
+        ImGui::SetCursorScreenPos(ImVec2(ImGui::GetCursorScreenPos().x, p0.y + 2));
+        ImGui::PushID(int(i));
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(g_accent.x, g_accent.y, g_accent.z, 0.28f));
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6, st.FramePadding.y - 2));
+        if (ImGui::Button((a.tokens[i].first + "  " ICON_X).c_str())) remove = int(i);
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
+        tip(tr("Remove this filter"));
+        ImGui::PopID();
+        ImGui::SameLine(0, 4);
+    }
+    if (remove >= 0) {
+        a.tokens.erase(a.tokens.begin() + remove);
+        a.rows_dirty = true;
+    }
+    float x = ImGui::GetCursorScreenPos().x;
+    ImGui::SetCursorScreenPos(ImVec2(x, p0.y));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0, 0, 0, 0));
+    ImGui::SetNextItemWidth(std::max(60.0f, p0.x + width - x - 34));
+    if (a.focus_search) {
+        ImGui::SetKeyboardFocusHere();
+        a.focus_search = false;
+    }
+    const char* hint = a.tokens.empty() ? tr("Search photos, or ask: my dog at the beach last summer") : "";
+    bool changed = ImGui::InputTextWithHint("##q", hint, a.search, sizeof a.search);
+    bool active = ImGui::IsItemActive();
+    bool focused = ImGui::IsItemFocused() || active;
+    ImVec2 in_min = ImGui::GetItemRectMin(), in_max = ImGui::GetItemRectMax();
+    ImGui::PopStyleColor(3);
+    tip(tr("Words, a description of the picture, or a sentence (press Enter to ask). Pick a suggestion to add it as a filter.\nPower syntax: beach | sea, -night, tag:dog, date:2019, size:>2mb, like:#12, ~typo (see ? > Search)."));
+    if (changed) {
+        a.rows_dirty = true;
+        a.ask_go = false;
+        a.search_edit_at = glfwGetTime();
+        a.search_translate = false;
+        a.sugg_sel = -1;
+    }
+    // clear button
+    if (a.search[0] || !a.tokens.empty()) {
+        ImGui::SetCursorScreenPos(ImVec2(p0.x + width - 26, p0.y + st.FramePadding.y));
+        ImGui::PushStyleColor(ImGuiCol_Text, g_text_dim);
+        if (ImGui::SmallButton(ICON_X "##clr")) {
+            a.search[0] = 0;
+            a.tokens.clear();
+            a.ask_go = false;
+            a.rows_dirty = true;
+        }
+        ImGui::PopStyleColor();
+        tip(tr("Clear the search"));
+    }
+    ImGui::EndGroup();
+    // keys: Enter = ask (a sentence) or take the highlighted suggestion; Backspace on empty removes the last chip
+    std::vector<Suggestion> sg = focused ? suggestions(a, a.search) : std::vector<Suggestion>{};
+    if (focused) {
+        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow) && !sg.empty()) a.sugg_sel = std::min(int(sg.size()) - 1, a.sugg_sel + 1);
+        if (ImGui::IsKeyPressed(ImGuiKey_UpArrow) && !sg.empty()) a.sugg_sel = std::max(-1, a.sugg_sel - 1);
+        if (ImGui::IsKeyPressed(ImGuiKey_Backspace) && !a.search[0] && !a.tokens.empty()) { a.tokens.pop_back(); a.rows_dirty = true; }
+    }
+    auto take = [&](const Suggestion& g) {
+        a.tokens.push_back({std::string(g.icon) + " " + g.label, g.query});
+        a.search[0] = 0;
+        a.sugg_sel = -1;
+        a.rows_dirty = true;
     };
-    ImGui::TextDisabled("%s", tr("What is what:"));
-    for (auto& c : cs) {
-        ImGui::SameLine(0, 14);
-        ImGui::TextColored(ImVec4(g_accent.x, g_accent.y, g_accent.z, 0.95f), "%s", tr(c.name));
-        tip(tr(c.tip));
+    if (ImGui::IsItemDeactivated() || (focused && (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)))) {
+        if (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) {
+            if (a.sugg_sel >= 0 && a.sugg_sel < int(sg.size())) take(sg[size_t(a.sugg_sel)]);
+            else if (sentence_like(a.search) && a.llm_ok == 1 && a.cfg.llm_enabled) { a.ask_go = true; a.rows_dirty = true; }
+            ImGui::SetKeyboardFocusHere(-1);
+        }
+    }
+    // suggestion list under the field
+    static bool hovered_last = false;
+    if ((focused || hovered_last) && !sg.empty()) {
+        ImGui::SetNextWindowPos(ImVec2(in_min.x, in_max.y + 4));
+        ImGui::SetNextWindowSize(ImVec2(std::max(260.0f, width * 0.6f), 0));
+        ImGui::Begin("##suggest", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
+                                              ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_Tooltip);
+        for (size_t i = 0; i < sg.size(); i++) {
+            ImGui::PushID(int(i));
+            if (ImGui::Selectable(util::fmt("%s  %s", sg[i].icon, sg[i].label.c_str()).c_str(), int(i) == a.sugg_sel)) take(sg[i]);
+            ImGui::SameLine(ImGui::GetWindowWidth() - 70);
+            ImGui::TextDisabled("%s", sg[i].kind.c_str());
+            ImGui::PopID();
+        }
+        if (sentence_like(a.search) && a.llm_ok == 1) ImGui::TextDisabled("%s", tr("Enter: ask the assistant"));
+        hovered_last = ImGui::IsWindowHovered();
+        ImGui::End();
+    } else {
+        hovered_last = false;
+    }
+    if (a.ask_go) {
+        ImGui::SetCursorScreenPos(ImVec2(p0.x, p0.y + h + 2));
+    }
+}
+
+// ---- top bar
+
+static void draw_activity_button(App& a) {
+    bool busy = a.pipe->running();
+    Progress& p = a.pipe->progress;
+    if (busy) {
+        int done = p.done, total = p.total;
+        float frac = total > 0 ? float(done) / float(total) : 0.0f;
+        static const int order[] = {ST_SCAN, ST_DUPES, ST_DECIDE, ST_TAG, ST_VISION, ST_FIX, ST_ORGANIZE};
+        static const char* names[] = {"Scanning", "Duplicates", "Dates and places", "Recognising", "Describing", "Checking tags", "Organizing"};
+        const char* name = "Working";
+        for (int k = 0; k < 7; k++)
+            if (p.stage == order[k]) name = names[k];
+        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, g_accent);
+        ImGui::ProgressBar(frac, ImVec2(170, 0), util::fmt("%s %d/%d", tr(name), done, total).c_str());
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemClicked()) ImGui::OpenPopup("activity");
+        tip(tr("Click for details, or to stop"));
+    } else {
+        if (ImGui::Button(ICON_ACTIVITY)) ImGui::OpenPopup("activity");
+        tip(tr("Activity: the last run, and Undo"));
+    }
+    if (ImGui::BeginPopup("activity")) {
+        std::string summary;
+        {
+            std::lock_guard<std::mutex> l(p.mu);
+            summary = p.summary;
+        }
+        if (busy) {
+            ImGui::Text("%s", p.get_current().c_str());
+            if (danger_button(tr("Stop"), tr("Stop after the current photo; everything done so far is kept"))) a.pipe->stop();
+        } else {
+            ImGui::TextWrapped("%s", summary.empty() ? tr("Nothing has run yet.") : summary.c_str());
+        }
+        ImGui::Separator();
+        for (auto& l : a.log.tail(8)) ImGui::TextDisabled("%s %s", l.time.c_str(), l.text.substr(0, 110).c_str());
+        if (ImGui::Button(tr("Open Activity"))) { set_section(a, SEC_ACTIVITY); ImGui::CloseCurrentPopup(); }
+        tip(tr("The full log, what changed (with Undo), and the decisions jev made"));
+        ImGui::EndPopup();
+    }
+}
+
+static void draw_topbar(App& a) {
+    bool busy = a.pipe->running();
+    float full = ImGui::GetContentRegionAvail().x;
+    ImGui::AlignTextToFramePadding();
+    if (ImGui::Button(ICON_MENU_2)) a.sidebar_on = !a.sidebar_on;
+    tip(tr("Show or hide the sidebar"));
+    ImGui::SameLine(0, 10);
+    ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 1.25f);
+    std::string title = section_title(a);
+    if (title.size() > 28) title = "…" + title.substr(title.size() - 26);
+    ImGui::TextUnformatted(title.c_str());
+    ImGui::PopFont();
+    ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 12, full * 0.22f));
+    float right_w = 430 + (a.cfg.system_titlebar ? 0 : 96);
+    float sw = std::max(240.0f, full - ImGui::GetCursorPosX() - right_w);
+    draw_search(a, sw);
+    ImGui::SameLine(0, 6);
+    if (ImGui::Button(ICON_ADJUSTMENTS_HORIZONTAL)) ImGui::OpenPopup("filters");
+    tip(tr("Search options: which fields, a date range, regular expressions"));
+    if (ImGui::BeginPopup("filters")) {
+        ImGui::TextDisabled("%s", tr("Look for words in"));
+        if (ImGui::Checkbox(tr("File and folder names"), &a.in_name)) a.rows_dirty = true;
+        if (ImGui::Checkbox(tr("Descriptions and tags"), &a.in_desc)) a.rows_dirty = true;
+        if (ImGui::Checkbox(tr("Info inside files (EXIF / XMP)"), &a.in_exif)) a.rows_dirty = true;
+        if (ImGui::Checkbox(tr("AI generation prompts"), &a.in_prompt)) a.rows_dirty = true;
+        ImGui::Separator();
+        ImGui::TextDisabled("%s", tr("Taken between"));
+        if (date_picker("from", a.date_from, tr("any start"))) a.rows_dirty = true;
+        ImGui::SameLine();
+        ImGui::TextUnformatted(tr("and"));
+        ImGui::SameLine();
+        if (date_picker("to", a.date_to, tr("any end"))) a.rows_dirty = true;
+        if (!a.date_from.empty() && !a.date_to.empty() && a.date_from > a.date_to) std::swap(a.date_from, a.date_to);
+        ImGui::Separator();
+        if (ImGui::Checkbox(tr("Match as a regular expression"), &a.regex)) a.rows_dirty = true;
+        tip(tr("For experts: the search text is an ECMAScript regular expression over names, tags, prompts and metadata"));
+        if (ImGui::Button(tr("Reset"))) {
+            a.in_name = a.in_exif = a.in_desc = a.in_prompt = true;
+            a.date_from.clear();
+            a.date_to.clear();
+            a.regex = false;
+            a.rows_dirty = true;
+        }
+        tip(tr("Search everything, any date"));
+        ImGui::EndPopup();
+    }
+    ImGui::SameLine(0, 6);
+    if (ImGui::Button(a.photo_grid ? ICON_LIST : ICON_LAYOUT_GRID)) a.photo_grid = !a.photo_grid;
+    tip(a.photo_grid ? tr("Show as a list") : tr("Show as a grid of thumbnails"));
+    ImGui::SameLine(0, 2);
+    bool insp = a.inspector_on;
+    if (insp) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(g_accent.x, g_accent.y, g_accent.z, 0.30f));
+    if (ImGui::Button(ICON_INFO_CIRCLE)) a.inspector_on = !a.inspector_on;
+    if (insp) ImGui::PopStyleColor();
+    tip(tr("Show or hide the inspector: date, place, tags and file info of the selected photo (Ctrl+I)"));
+    ImGui::SameLine(0, 10);
+    draw_activity_button(a);
+    ImGui::SameLine(0, 10);
+    ImGui::BeginDisabled(busy);
+    if (primary_button(tr("Analyze"), tr("Scan your folders for new or changed photos and update dates, tags and the lists to review. Nothing in your files changes.")))
+        request_analyze(a);
+    ImGui::EndDisabled();
+    ImGui::SameLine(0, 10);
+    // the assistant: one dot for CLIP, the LLM and jev together
+    int clip = a.clip_ok, llm = a.cfg.llm_enabled ? a.llm_ok.load() : 1, jev = a.cfg.jev_enabled ? a.jev_ok.load() : 1;
+    bool all_up = clip == 1 && llm == 1 && jev == 1, any_down = clip == 0 || llm == 0 || jev == 0;
+    ImGui::TextColored(all_up ? g_ok : any_down ? g_warn : g_text_dim, ICON_ROBOT);
+    {
+        std::string cd, ld, jd;
+        {
+            std::lock_guard<std::mutex> l(a.health_mu);
+            cd = a.clip_detail;
+            ld = a.llm_detail;
+            jd = a.jev_detail;
+        }
+        auto state = [](int v) { return v == 1 ? tr("ready") : v == 0 ? tr("down") : tr("checking"); };
+        tip(util::fmt("%s\n%s: %s (%s)\n%s: %s (%s)\n%s: %s (%s)", all_up ? tr("Assistant ready") : tr("Some helpers are down; the rest keeps working."),
+                      tr("Image recognition"), state(clip), cd.c_str(), tr("Language model"), state(llm), ld.c_str(), tr("jev decisions"), state(jev), jd.c_str()));
+    }
+    if (ImGui::IsItemClicked()) a.show_settings = true;
+    ImGui::SameLine(0, 8);
+    if (ImGui::Button(ICON_HELP)) a.show_help = !a.show_help;
+    tip(tr("Help: what is what, keys, search syntax, credits"));
+    ImGui::SameLine(0, 2);
+    if (ImGui::Button(ICON_SETTINGS)) a.show_settings = !a.show_settings;
+    tip(tr("Settings (Ctrl+,)"));
+    if (!a.cfg.system_titlebar) {
+        ImGui::SameLine(0, 12);
+        if (ImGui::Button(ICON_MINUS)) glfwIconifyWindow(a.win);
+        tip(tr("Minimise"));
+        ImGui::SameLine(0, 2);
+        bool maxed = glfwGetWindowAttrib(a.win, GLFW_MAXIMIZED);
+        if (ImGui::Button(maxed ? ICON_WINDOW_MINIMIZE : ICON_SQUARE)) maxed ? glfwRestoreWindow(a.win) : glfwMaximizeWindow(a.win);
+        tip(maxed ? tr("Restore the window size") : tr("Maximise (or double-click the top bar)"));
+        ImGui::SameLine(0, 2);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(kDanger.x, kDanger.y, kDanger.z, 0.9f));
+        if (ImGui::Button(ICON_X "##close")) glfwSetWindowShouldClose(a.win, GLFW_TRUE);
+        ImGui::PopStyleColor();
+        tip(tr("Close jev photos (a running step stops; everything done so far is kept)"));
+    }
+}
+
+// ---- the library: a header with what is shown, then the grid or the list
+
+static void draw_library_header(App& a) {
+    std::string count;
+    if (a.view.loading()) count = tr("searching...");
+    else if (a.searching) count = util::fmt("%zu %s", a.rows.size(), tr("matches"));
+    else count = util::fmt("%zu %s", a.rows.size(), tr("photos"));
+    ImGui::TextDisabled("%s", count.c_str());
+    if (a.ask_go) {
+        ImGui::SameLine();
+        ImGui::TextColored(g_accent, "%s %s", ICON_ROBOT, tr("asked the assistant"));
+    }
+    if (a.section == SEC_DATES) {
+        int likely = 0;
+        for (auto& r : a.rows) likely += !r.date_value.empty() && r.date_conf >= 0.4;
+        ImGui::SameLine(0, 20);
+        ImGui::BeginDisabled(likely == 0);
+        if (primary_button(util::fmt("%s (%d)", tr("Accept all likely dates"), likely).c_str(),
+                           tr("Confirm the best guess for every photo here whose evidence is reasonably strong (40% or more). The rest stay for you to check one by one."))) {
+            std::vector<std::tuple<int64_t, std::string, std::string>> todo;
+            for (auto& r : a.rows)
+                if (!r.date_value.empty() && r.date_conf >= 0.4) todo.push_back({r.id, r.date_value, r.date_prec});
+            a.view.write([todo](Db& db) {
+                for (auto& [id, v, p] : todo) db.confirm_date(id, v, p);
+            });
+            a.rows_dirty = true;
+            a.catalog_gen++;
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", tr("Select a photo to see why, and to pick another date in the inspector."));
+    }
+    if (!a.multi.empty() && a.multi.size() > 1) {
+        ImGui::SameLine(0, 20);
+        ImGui::Text("%zu %s", a.multi.size(), tr("selected"));
+    }
+    if (!a.multi.empty()) {
+        ImGui::SameLine(0, 10);
+        ImGui::BeginDisabled(a.trash_busy || a.pipe->running());
+        if (danger_button(util::fmt("%s %s", ICON_TRASH, tr("Move to Trash...")).c_str(),
+                          tr("Move the selected photos to the Trash (restorable); asks first. Ctrl/Shift+click selects several; Delete does the same.")))
+            a.photo_trash_confirm = true;
+        ImGui::EndDisabled();
+    }
+    if (!a.multi.empty() && !ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Delete) && !a.viewer.open) a.photo_trash_confirm = true;
+    draw_fav_tag_chips(a);
+    if (!a.search_error.empty()) ImGui::TextColored(g_err, "%s", a.search_error.c_str());
+    else if (!a.search_note.empty()) ImGui::TextDisabled("%s", a.search_note.c_str());
+}
+
+// Inspector extras for an unsure date: confirm it, or use one of the other candidates.
+static void draw_date_actions(App& a, Photo& p) {
+    if (!p.needs_review && !p.date_value.empty()) return;
+    ImGui::Spacing();
+    ImGui::TextColored(g_warn, "%s %s", ICON_CALENDAR_QUESTION, tr("This date is a guess"));
+    if (!p.date_value.empty() && primary_button(tr("The date is right"), tr("Confirm this date; it is then treated as certain"))) {
+        int64_t id = p.id;
+        std::string v = p.date_value, pr = p.date_prec;
+        a.view.write([id, v, pr](Db& db) { db.confirm_date(id, v, pr); });
+        p.needs_review = false;
+        a.rows_dirty = true;
+        a.catalog_gen++;
+    }
+    json ev = json::parse(p.date_evidence.empty() ? "{}" : p.date_evidence, nullptr, false);
+    if (!ev.is_object() || !ev.contains("candidates")) return;
+    std::set<std::string> seen{p.date_value.substr(0, 16)};
+    bool any = false;
+    for (auto& c : ev["candidates"]) {
+        std::string when = c.value("when", "");
+        if (when.empty() || c.value("weight", 0.0) <= 0) continue;
+        util::Civil cv = util::parse_exif_datetime(when);
+        if (!cv.valid() || !seen.insert(cv.str().substr(0, 16)).second) continue;
+        if (!any) { ImGui::TextDisabled("%s", tr("Or use another date found for it:")); any = true; }
+        ImGui::PushID(when.c_str());
+        if (ImGui::SmallButton(util::fmt("%s  (%s)", when.c_str(), c.value("src", "").c_str()).c_str())) {
+            int64_t id = p.id;
+            std::string v = cv.str(), pr = util::precision_name(cv.prec);
+            a.view.write([id, v, pr](Db& db) { db.confirm_date(id, v, pr); });
+            p.date_value = v;
+            p.needs_review = false;
+            a.rows_dirty = true;
+            a.catalog_gen++;
+        }
+        tip(tr("Use this date for the photo"));
+        ImGui::PopID();
+    }
+}
+
+static void draw_library(App& a) {
+    if (a.stats.total == 0 && !a.pipe->running()) {
+        if (a.view.loading()) { ImGui::TextDisabled("%s", tr("Loading...")); return; }
+        ImGui::Dummy(ImVec2(0, 40));
+        ImGui::TextWrapped("%s", tr("No photos here yet. Analyze reads your folders; browsing and search work while it runs."));
+        if (primary_button(tr("Analyze"), tr("Scan your folders"))) request_analyze(a);
+        return;
+    }
+    draw_library_header(a);
+    ImGui::BeginChild("libcontent", ImVec2(0, 0));
+    if (a.photo_grid) draw_photo_grid(a);
+    else draw_photo_table(a);
+    ImGui::EndChild();
+}
+
+// ---- first run: folders, what the app may do, start
+
+static void draw_first_run(App& a) {
+    float w = std::min(620.0f, ImGui::GetContentRegionAvail().x - 40);
+    ImGui::SetCursorPosX((ImGui::GetContentRegionAvail().x - w) / 2);
+    ImGui::BeginChild("welcome", ImVec2(w, 0));
+    ImGui::Dummy(ImVec2(0, 30));
+    ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 1.6f);
+    ImGui::TextUnformatted(tr("Welcome to jev photos"));
+    ImGui::PopFont();
+    ImGui::TextWrapped("%s", tr("Find any photo by what is in it, fix missing dates, clear out duplicates, and organize your library. Your originals are only changed if you choose to."));
+    ImGui::Dummy(ImVec2(0, 12));
+    ImGui::TextColored(g_accent, "1");
+    ImGui::SameLine();
+    ImGui::TextUnformatted(tr("Add your photo folders"));
+    for (auto& f : a.cfg.folders) ImGui::BulletText("%s", f.c_str());
+    if (ImGui::Button(util::fmt("%s %s", ICON_FOLDER_PLUS, tr("Add folder...")).c_str())) start_dir_dialog(a, 3);
+    tip(tr("Choose a folder; add as many as you like"));
+    ImGui::Dummy(ImVec2(0, 8));
+    ImGui::TextColored(g_accent, "2");
+    ImGui::SameLine();
+    ImGui::TextUnformatted(tr("What may jev photos do with your files?"));
+    static int goal = 0;
+    ImGui::RadioButton(tr("Only browse and search (nothing in my folders changes)"), &goal, 0);
+    tip(tr("The catalog lives in the app's own data folder. You can organize later."));
+    ImGui::RadioButton(tr("Also make organized copies with date names"), &goal, 1);
+    tip(tr("Copies go to a jev-organized folder inside each photo folder; your originals stay as they are."));
+    ImGui::PushStyleColor(ImGuiCol_Text, g_warn_red);
+    ImGui::RadioButton(tr("Rename my originals with date names"), &goal, 2);
+    ImGui::PopStyleColor();
+    tip(tr("Changes your original files' names (you can undo it from Activity)."));
+    ImGui::Dummy(ImVec2(0, 8));
+    ImGui::TextColored(g_accent, "3");
+    ImGui::SameLine();
+    ImGui::TextUnformatted(tr("Start"));
+    ImGui::TextDisabled("%s", tr("Analysis runs in the background; you can browse and search right away."));
+    ImGui::BeginDisabled(a.cfg.folders.empty());
+    if (primary_button(tr("Start"), tr("Save these choices and analyze your folders"), ImVec2(160, 0))) {
+        a.cfg.file_op = goal == 2 ? OP_RENAME : OP_COPY;
+        a.cfg.goal = goal;
+        a.cfg.first_run_done = true;
+        save_config(a.cfg, a.config_file);
+        a.opts.clip_mode = a.opts.tag_mode = 0;
+        start_run(a, analyze_stages(a.cfg));
+        set_section(a, SEC_ALL);
+    }
+    ImGui::EndDisabled();
+    ImGui::EndChild();
+}
+
+// ---- Settings in their own window
+
+static void draw_settings_window(App& a) {
+    if (!a.show_settings) return;
+    ImGui::SetNextWindowSize(ImVec2(820, 640), ImGuiCond_FirstUseEver);
+    ImVec2 vs = ImGui::GetMainViewport()->Size;
+    ImGui::SetNextWindowPos(ImVec2(vs.x / 2, vs.y / 2), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
+    if (ImGui::Begin(tr("Settings###settingswin"), &a.show_settings, ImGuiWindowFlags_NoCollapse)) draw_settings(a);
+    ImGui::End();
+}
+
+// ---- Activity: what ran, Undo, jev's decisions
+
+static void draw_history(App& a);
+static void draw_activity(App& a) {
+    ImGui::TextWrapped("%s", tr("Everything that changed your files is listed here and can be undone, newest first."));
+    draw_history(a);
+    ImGui::SeparatorText(tr("How jev helped"));
+    const DecisionStats& ds = a.decision_stats;
+    if (!ds.total) ImGui::TextDisabled("%s", tr("No jev decisions yet."));
+    else {
+        auto kind = [&](const char* k, const char* label) {
+            auto it = ds.by_kind.find(k);
+            return util::fmt("%s %d", label, it == ds.by_kind.end() ? 0 : it->second.first);
+        };
+        ImGui::Text("%d %s · %s · %s · %s · %s · %d %s", ds.total, tr("decisions"), kind("date", tr("dates")).c_str(), kind("place", tr("places")).c_str(),
+                    kind("search", tr("search")).c_str(), kind("description", tr("descriptions")).c_str(), ds.changed, tr("changed the result"));
+    }
+    if (ImGui::BeginTable("decisions2", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingFixedFit,
+                          ImVec2(0, 240))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn(tr("Kind"), 0, 80);
+        ImGui::TableSetupColumn(tr("About"), 0, 300);
+        ImGui::TableSetupColumn(tr("Rules / LLM said"), 0, 200);
+        ImGui::TableSetupColumn(tr("jev chose"), 0, 220);
+        ImGui::TableSetupColumn(tr("Result"), 0, 150);
+        ImGui::TableHeadersRow();
+        for (auto& d : a.decisions) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(tr(d.kind.c_str()));
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted((d.kind == "search" ? "\"" + d.subject + "\"  " + d.question : rel_path(a.cfg, d.subject)).c_str());
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(d.rules_pick.c_str());
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(d.jev_pick.substr(0, 70).c_str());
+            ImGui::TableNextColumn();
+            if (d.changed) ImGui::TextColored(g_warn, "%s", d.final_pick.c_str());
+            else ImGui::TextUnformatted(d.final_pick.c_str());
+        }
+        ImGui::EndTable();
+    }
+    ImGui::SeparatorText(tr("Log"));
+    ImGui::BeginChild("logpane", ImVec2(0, 0), ImGuiChildFlags_Borders);
+    for (auto& l : a.log.tail(400)) {
+        ImVec4 col = l.level == 2 ? g_err : l.level == 1 ? g_warn : ImGui::GetStyleColorVec4(ImGuiCol_Text);
+        ImGui::TextColored(col, "%s  %s", l.time.c_str(), l.text.c_str());
+    }
+    ImGui::EndChild();
+}
+
+// ---- Undo: every applied run is journaled; undo puts it back, newest change first
+
+static void start_undo(App& a, const std::string& run) {
+    if (a.pipe->running()) return;
+    RunOptions o = a.opts;
+    o.stages = 0;
+    o.undo_run = run;
+    a.last_run_planned = false;
+    a.last_stages = 0;
+    a.undo_until = 0;
+    a.pipe->start(effective(a.cfg), o);
+    a.log.add(0, "undo of the run applied " + run);
+}
+
+static void draw_history(App& a) {
+    static std::vector<JournalRun> runs;
+    static int runs_gen = -1;
+    if (runs_gen != a.catalog_gen) {
+        runs = a.ui_db.journal_runs(10);
+        runs_gen = a.catalog_gen;
+    }
+    if (runs.empty()) {
+        ImGui::TextDisabled("%s", tr("Nothing applied yet."));
+        return;
+    }
+    if (ImGui::BeginTable("history", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_BordersInnerH)) {
+        ImGui::TableSetupColumn(tr("When"), 0, 170);
+        ImGui::TableSetupColumn(tr("What"), ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn(tr("Changes"), 0, 70);
+        ImGui::TableSetupColumn("", 0, 110);
+        ImGui::TableHeadersRow();
+        for (auto& r : runs) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(r.at.substr(0, 19).c_str());
+            ImGui::TableNextColumn();
+            std::string what;
+            for (auto& k : util::split(r.kinds, ',')) {
+                const char* w = k == "copy" ? tr("copied") : k == "move" ? tr("moved") : k == "rename" ? tr("renamed") : k == "refile" ? tr("re-filed")
+                              : k == "meta" ? tr("info saved in files") : k.c_str();
+                what += (what.empty() ? "" : ", ") + std::string(w);
+            }
+            ImGui::TextUnformatted(what.c_str());
+            ImGui::TableNextColumn();
+            ImGui::Text("%d", r.count);
+            ImGui::TableNextColumn();
+            ImGui::PushID(r.run.c_str());
+            if (r.undone) ImGui::TextDisabled("%s", tr("undone"));
+            else {
+                ImGui::BeginDisabled(a.pipe->running());
+                if (ImGui::SmallButton(util::fmt("%s %s", ICON_ARROW_BACK_UP, tr("Undo")).c_str())) start_undo(a, r.run);
+                ImGui::EndDisabled();
+                tip(tr("Put everything this run changed back: files return to their old names and places, copies go to the Trash, files whose info was written get their earlier version back"));
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+}
+
+static void draw_undo_banner(App& a) {
+    if (a.undo_run.empty() || glfwGetTime() > a.undo_until || a.pipe->running()) return;
+    ImVec2 vs = ImGui::GetMainViewport()->Size, vp = ImGui::GetMainViewport()->Pos;
+    ImGui::SetNextWindowPos(ImVec2(vp.x + vs.x / 2, vp.y + vs.y - 24), 0, ImVec2(0.5f, 1));
+    ImGui::SetNextWindowBgAlpha(0.95f);
+    ImGui::Begin("##undo", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
+                                     ImGuiWindowFlags_NoFocusOnAppearing);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(g_ok, ICON_CIRCLE_CHECK);
+    ImGui::SameLine();
+    ImGui::TextUnformatted(a.undo_text.c_str());
+    ImGui::SameLine(0, 16);
+    if (ImGui::Button(util::fmt("%s %s", ICON_ARROW_BACK_UP, tr("Undo")).c_str())) start_undo(a, a.undo_run);
+    tip(tr("Put it all back (Ctrl+Z). Later runs can be undone from Activity."));
+    ImGui::SameLine();
+    if (ImGui::SmallButton(ICON_X)) a.undo_until = 0;
+    ImGui::End();
+}
+
+// ---- the window
+
+static void open_start_tab(App& a) {
+    // Older entry points (--tab, ui scripts, buttons) name a tab; map it onto the sidebar.
+    if (a.show_plan_tab) { set_section(a, a.plan_op == OP_METADATA ? SEC_SAVE : SEC_ORGANIZE); a.show_plan_tab = false; }
+    a.show_overview = false;
+    if (a.start_tab.empty()) return;
+    std::string t = a.start_tab;
+    a.start_tab.clear();
+    if (t == "photos" || t == "overview") set_section(a, a.section == SEC_FAV ? SEC_FAV : SEC_ALL);
+    else if (t == "favorites") set_section(a, SEC_FAV);
+    else if (t == "preview") set_section(a, a.plan_op == OP_METADATA ? SEC_SAVE : SEC_ORGANIZE);
+    else if (t == "write") set_section(a, SEC_SAVE);
+    else if (t == "dupes") set_section(a, SEC_DUPES);
+    else if (t == "dates") set_section(a, SEC_DATES);
+    else if (t == "tags") set_section(a, a.meta_sub == "write" ? SEC_SAVE : SEC_TAGS);
+    else if (t == "corrections") set_section(a, SEC_SUGG);
+    else if (t == "clip") set_section(a, SEC_RECOG);
+    else if (t == "log" || t == "activity") set_section(a, SEC_ACTIVITY);
+    else if (t == "settings") a.show_settings = true;
+    a.meta_sub.clear();
+}
+
+static void draw_content(App& a) {
+    switch (a.section) {
+        case SEC_DUPES: draw_dupes(a); break;
+        case SEC_SUGG: draw_corrections(a); break;
+        case SEC_ORGANIZE: draw_plan(a, false); break;
+        case SEC_SAVE: draw_plan(a, true); break;
+        case SEC_TAGS: draw_tags(a); break;
+        case SEC_RECOG: draw_clip_tab(a); break;
+        case SEC_ACTIVITY: draw_activity(a); break;
+        default: draw_library(a); break;
     }
 }
 
@@ -4315,83 +4674,66 @@ static void draw_ui(App& a) {
     ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->WorkPos);
     ImGui::SetNextWindowSize(vp->WorkSize);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::Begin("jev-photos", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus);
-    draw_toolbar(a);
-    window_chrome(a, ImGui::GetCursorPosY());
-    g_prof.mark("toolbar");
-    if (ImGui::BeginTabBar("tabs")) {
-        auto sel = [&](const char* name) {
-            bool on = a.start_tab == name;
-            if (on) a.start_tab.clear();
-            return on ? ImGuiTabItemFlags_SetSelected : 0;
-        };
-        a.on_overview = false;
-        ImGuiTabItemFlags of = a.show_overview || a.start_tab == "overview" ? ImGuiTabItemFlags_SetSelected : 0;
-        if (a.start_tab == "overview") a.start_tab.clear();
-        a.show_overview = false;
-        if (ImGui::BeginTabItem(tr("Overview"), nullptr, of)) { draw_overview(a); g_prof.mark("tab:Overview"); ImGui::EndTabItem(); }
-        tip(tr("What was found and what to do next"));
-        if (a.start_tab == "favorites") { a.fav_only = true; a.rows_dirty = true; a.start_tab = "photos"; }
-        if (ImGui::BeginTabItem(tr("Photos"), nullptr, sel("photos"))) { draw_photos(a); g_prof.mark("tab:Photos"); ImGui::EndTabItem(); }
-        tip(tr("Browse and search your photos; star favorites"));
-        // Actions: everything that changes files or the catalog, one sub-tab per kind of change.
-        static const std::set<std::string> action_tabs = {"preview", "corrections", "dupes", "tags", "clip"};
-        ImGuiTabItemFlags pf = a.show_plan_tab || action_tabs.count(a.start_tab) ? ImGuiTabItemFlags_SetSelected : 0;
-        // The sub-tab to open is kept until the Actions tab is really drawn (the parent switches a frame later).
-        if (a.show_plan_tab) a.action_sub = "preview";
-        if (action_tabs.count(a.start_tab)) { a.action_sub = a.start_tab; a.start_tab.clear(); }
-        a.show_plan_tab = false;
-        int pending = count_plan(a.plan, false);  // only what is still to apply: applied items no longer count
-        std::string plan_label = std::string(tr("Actions")) + (pending ? util::fmt(" (%d)", pending) : "") + "###plan";
-        bool was_tags = a.on_tags;
-        a.on_tags = false;
-        if (ImGui::BeginTabItem(plan_label.c_str(), nullptr, pf)) {
-            if (ImGui::BeginTabBar("actiontabs")) {
-                std::string sub = a.action_sub;
-                a.action_sub.clear();
-                auto subsel = [&](const char* k) { return sub == k ? ImGuiTabItemFlags_SetSelected : 0; };
-                int nd = 0;
-                for (auto& r : a.dup_rows) nd += r.dup_of != 0;
-                std::string dl = std::string(tr("Duplicates")) + (nd ? util::fmt(" (%d)", nd) : "") + "###dupes";
-                if (ImGui::BeginTabItem(dl.c_str(), nullptr, subsel("dupes"))) { draw_dupes(a); ImGui::EndTabItem(); }
-                tip(tr("Identical files (and optionally similar photos): which copy is kept, and moving the extra copies to the Trash. Best done first."));
-                int org_n = a.plan_op != OP_METADATA ? pending : 0, meta_n = a.plan_op == OP_METADATA ? pending : 0;
-                std::string l1 = std::string(tr("Organization")) + (org_n ? util::fmt(" (%d)", org_n) : "") + "###act_files";
-                if (ImGui::BeginTabItem(l1.c_str(), nullptr, subsel("preview"))) { draw_plan(a, false); ImGui::EndTabItem(); }
-                tip(tr("Files only: copy, move or rename them into month folders with date names. Everything is listed before it happens."));
-                std::string l2 = std::string(tr("Metadata")) + (meta_n ? util::fmt(" (%d)", meta_n) : "") + "###act_meta";
-                if (ImGui::BeginTabItem(l2.c_str(), nullptr, subsel("tags"))) {
-                    // Tags of each photo, and what gets written into the files.
-                    if (ImGui::BeginTabBar("metatabs")) {
-                        std::string ms = a.meta_sub;
-                        a.meta_sub.clear();
-                        if (ImGui::BeginTabItem(tr("Photos and tags"), nullptr, ms == "tags" ? ImGuiTabItemFlags_SetSelected : 0)) { draw_tags(a); ImGui::EndTabItem(); }
-                        tip(tr("Each photo's tags and what its file already carries; edit tags, fill in missing ones, edit the tag list"));
-                        std::string wl = std::string(tr("Write into files")) + (meta_n ? util::fmt(" (%d)", meta_n) : "") + "###metawrite";
-                        if (ImGui::BeginTabItem(wl.c_str(), nullptr, ms == "write" ? ImGuiTabItemFlags_SetSelected : 0)) { draw_plan(a, true); ImGui::EndTabItem(); }
-                        tip(tr("Fill in missing dates, keywords, descriptions and places in the files where they are; listed before anything is written"));
-                        ImGui::EndTabBar();
-                    }
-                    ImGui::EndTabItem();
-                }
-                tip(tr("Tags (what the pictures show) and what is written into the files: keywords, descriptions, dates, places"));
-                if (ImGui::BeginTabItem(tr("CLIP"), nullptr, subsel("clip"))) { draw_clip_tab(a); ImGui::EndTabItem(); }
-                tip(tr("Image analysis: analyse new photos, the quick model, re-analyse or re-tag, and a smart update of what is worth it"));
-                std::string cl = std::string(tr("Corrections")) + (a.corrections.empty() ? "" : util::fmt(" (%zu)", a.corrections.size())) + "###corr";
-                if (ImGui::BeginTabItem(cl.c_str(), nullptr, subsel("corrections"))) { draw_corrections(a); ImGui::EndTabItem(); }
-                tip(tr("Proposed fixes of generated tags and names, each with how sure jev-photos is. Nothing changes until you apply them."));
-                ImGui::EndTabBar();
-            }
-            g_prof.mark("tab:Actions");
-            ImGui::EndTabItem();
+    ImGui::PopStyleVar();
+    open_start_tab(a);
+    bool was_tags = a.on_tags;
+    a.on_tags = a.section == SEC_TAGS;
+    if (a.on_tags && !was_tags) a.rows_dirty = true;  // entering Tags: fetch its rows
+    // keys: Ctrl+I inspector, Ctrl+, settings, Ctrl+Z undo the last run, Ctrl+F search
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_I, false)) a.inspector_on = !a.inspector_on;
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Comma, false)) a.show_settings = !a.show_settings;
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F, false)) a.focus_search = true;
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z, false) && !io.WantTextInput && !a.undo_run.empty() && glfwGetTime() < a.undo_until) start_undo(a, a.undo_run);
+    bool first_run = !a.cfg.first_run_done && a.stats.total == 0 && !a.pipe->running();
+
+    // top bar (also the window's drag area when there is no system title bar)
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, g_sidebar);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10, 8));
+    float bar_h = ImGui::GetFrameHeight() + 16;
+    ImGui::BeginChild("topbar", ImVec2(0, bar_h), ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar);
+    draw_topbar(a);
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+    if (!a.cfg.system_titlebar) window_chrome(a, bar_h);
+    g_prof.mark("topbar");
+
+    if (first_run) {
+        draw_first_run(a);
+    } else {
+        // sidebar | content | inspector
+        if (a.sidebar_on) {
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, g_sidebar);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8, 6));
+            ImGui::BeginChild("sidebar", ImVec2(a.sidebar_w, 0), ImGuiChildFlags_AlwaysUseWindowPadding);
+            draw_sidebar(a);
+            ImGui::EndChild();
+            ImGui::PopStyleVar();
+            ImGui::PopStyleColor();
+            vsplit("##split_side", a.sidebar_w, 160, 420, false);
         }
-        tip(tr("Everything that changes files: organizing, tags and metadata, corrections and duplicates"));
-        if (a.on_tags && !was_tags) a.rows_dirty = true;  // entering Tags & metadata: fetch its rows
-        if (a.start_tab == "log") { a.show_log = true; a.start_tab.clear(); }
-        if (ImGui::BeginTabItem(tr("Settings"), nullptr, sel("settings"))) { draw_settings(a); g_prof.mark("tab:Settings"); ImGui::EndTabItem(); }
-        tip(tr("Models, servers, naming and decision rules"));
-        ImGui::EndTabBar();
+        bool insp = a.inspector_on && library_section(a.section);
+        float avail = ImGui::GetContentRegionAvail().x;
+        a.inspector_w = std::clamp(a.inspector_w, 260.0f, std::max(260.0f, avail - 360));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12, 10));
+        ImGui::BeginChild("content", ImVec2(insp ? avail - a.inspector_w - 8 : 0, 0), ImGuiChildFlags_AlwaysUseWindowPadding);
+        draw_content(a);
+        ImGui::EndChild();
+        if (insp) {
+            vsplit("##split_insp", a.inspector_w, 260, 2000, true);
+            ImGui::BeginChild("inspector", ImVec2(0, 0), ImGuiChildFlags_AlwaysUseWindowPadding);
+            if (!a.selected) ImGui::TextDisabled("%s", tr("Select a photo to see its date, place, tags and file info."));
+            else {
+                draw_detail(a);
+            }
+            ImGui::EndChild();
+        }
+        ImGui::PopStyleVar();
     }
+    g_prof.mark("content");
     draw_trash_modal(a);
     draw_analyze_dialog(a);
     draw_tag_editor(a);
@@ -4399,8 +4741,15 @@ static void draw_ui(App& a) {
     draw_smart_modal(a);
     draw_corr_confirm(a);
     ImGui::End();
+    draw_settings_window(a);
     draw_help(a);
+    draw_undo_banner(a);
     draw_viewer(a);
+    if (a.show_log) {
+        ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x * 0.7f, vp->WorkSize.y * 0.55f), ImGuiCond_FirstUseEver);
+        if (ImGui::Begin(tr("Log"), &a.show_log)) draw_log(a);
+        ImGui::End();
+    }
     ImGui::Begin("jev-photos");
     if (glfwGetTime() < a.toast_until) {
         ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - 20, vp->WorkPos.y + vp->WorkSize.y - 20), 0, ImVec2(1, 1));
@@ -4835,7 +5184,7 @@ int main(int argc, char** argv) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     if (getenv("JEV_PHOTOS_HIDDEN") && (!shot.empty() || !ui_script.empty())) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);  // tests
-    glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);  // our own top bar: drag, double-click, window buttons, resize grip
+    glfwWindowHint(GLFW_DECORATED, app.cfg.system_titlebar ? GLFW_TRUE : GLFW_FALSE);  // our own top bar: drag, double-click, window buttons, resize grip
     glfwWindowHintString(GLFW_X11_CLASS_NAME, "jev-photos");
     glfwWindowHintString(GLFW_X11_INSTANCE_NAME, "jev-photos");
     app.win = glfwCreateWindow(1400, 860, "jev photos", nullptr, nullptr);
@@ -4859,6 +5208,7 @@ int main(int argc, char** argv) {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
+    if (!app.cfg.first_run_done && !app.cfg.folders.empty()) app.cfg.first_run_done = true;  // set up before the welcome screen existed
     apply_style(app.cfg);
     build_fonts();
     ImGui_ImplGlfw_InitForOpenGL(app.win, true);
@@ -4921,11 +5271,13 @@ int main(int argc, char** argv) {
         if (!app.cfg.folders.empty() && (app.rows_dirty || app.dups_dirty || (app.pipe->running() && now - app.last_refresh > 1.5))) {
             ViewRequest vr;
             vr.month = app.month;
-            vr.folder = view_scope(app.cfg);
-            vr.review_only = app.review_only;
+            vr.folder = app.section == SEC_FOLDER && !app.section_folder.empty() ? app.section_folder : all_scope(app.cfg);
+            vr.ai_only = app.section == SEC_AI;
+            vr.place = app.section == SEC_PLACE ? app.place : "";
+            vr.review_only = app.review_only || app.section == SEC_DATES;
             vr.dup_similar = app.dup_show_similar;
-            vr.sq.text = util::trim(app.search);
-            vr.sq.mode = app.search_mode;
+            vr.sq.text = compose_query(app);
+            vr.sq.mode = app.regex ? SM_REGEX : app.ask_go ? SM_ASK : SM_SMART;
             vr.sq.in_name = app.in_name;
             vr.sq.in_exif = app.in_exif;
             vr.sq.in_desc = app.in_desc;
@@ -4958,6 +5310,8 @@ int main(int argc, char** argv) {
                     app.tags_built = true;
                 }
                 app.decisions = std::move(v.decisions);
+                app.places = std::move(v.places);
+                app.ai_count = v.ai_count;
                 app.favorites = std::move(v.favorites);
                 app.corrections = std::move(v.corrections);
                 app.decision_stats = v.decision_stats;
@@ -4976,6 +5330,21 @@ int main(int argc, char** argv) {
             app.health_at = glfwGetTime();
             check_health(app);
         }
+        // Folder watching: now and then, while idle, pick up new or changed photos quietly (incremental scan; only
+        // new pictures are analysed). Nothing in the files changes, and no list to apply is built.
+        {
+            static double last_busy = glfwGetTime();
+            if (app.pipe->running() || app.view.loading()) last_busy = glfwGetTime();
+            else if (app.cfg.watch_folders && app.cfg.first_run_done && !app.cfg.folders.empty() && !ui_test && ui_script.empty() &&
+                     shot.empty() && glfwGetTime() - last_busy > 600) {
+                last_busy = glfwGetTime();
+                RunOptions keep = app.opts;
+                app.opts.clip_mode = app.opts.tag_mode = 0;
+                app.log.add(0, "watching: looking for new photos");
+                start_run(app, (ST_SCAN | ST_DUPES | ST_DECIDE | (app.cfg.clip_enabled ? ST_TAG : 0)));
+                app.opts = keep;
+            }
+        }
         static int seen_runs = 0;
         if (app.pipe->progress.finished_runs != seen_runs && !app.pipe->running()) {
             seen_runs = app.pipe->progress.finished_runs;
@@ -4984,7 +5353,16 @@ int main(int argc, char** argv) {
             app.dups_dirty = true;
             app.catalog_gen++;
             app.plan = app.pipe->plan();
-            if (app.last_run_planned && !app.plan.empty()) app.show_overview = true;  // show what was found and what to do next
+            static std::string seen_apply;
+            if (app.pipe->last_applied_run != seen_apply) {  // a run changed files: offer Undo for a while
+                seen_apply = app.pipe->last_applied_run;
+                int n = 0;
+                for (auto& it : app.plan) n += it.result == "ok";
+                app.undo_run = seen_apply;
+                app.undo_text = util::fmt("%d %s", n, tr(app.plan_op == OP_METADATA ? "files updated" : app.plan_op == OP_COPY ? "photos copied"
+                                                        : app.plan_op == OP_MOVE ? "photos moved" : "photos renamed"));
+                app.undo_until = glfwGetTime() + 30;
+            }
         }
         if (!app.dlg_running) {
             std::lock_guard<std::mutex> l(app.dlg_mu);
@@ -5027,11 +5405,14 @@ int main(int argc, char** argv) {
                         else if (t == "trash-dialog") app.trash_confirm = true;
                         else if (util::starts_with(t, "ask:")) {  // Ask search for the given sentence
                             snprintf(app.search, sizeof app.search, "%s", t.substr(4).c_str());
-                            app.search_mode = SM_ASK;
+                            app.ask_go = true;
                             app.rows_dirty = true;
                         }
                         else if (t == "plan") start_run(app, ST_ORGANIZE, true);
                         else if (t == "analyze") request_analyze(app);
+                        else if (t == "undo") { if (!app.undo_run.empty()) start_undo(app, app.undo_run); }
+                        else if (t == "find") app.focus_search = true;
+                        else if (util::starts_with(t, "type:")) sio.AddInputCharactersUTF8(t.substr(5).c_str());
                         else if (t == "apply") apply_plan(app);
                         else if (t == "help") app.show_help = true;
                         else if (t == "tageditor") app.tag_editor_open = true;
@@ -5049,7 +5430,7 @@ int main(int argc, char** argv) {
         int fw, fh;
         glfwGetFramebufferSize(app.win, &fw, &fh);
         glViewport(0, 0, fw, fh);
-        glClearColor(0.07f, 0.08f, 0.10f, 1);
+        { ImVec4 bg = ImGui::GetStyle().Colors[ImGuiCol_WindowBg]; glClearColor(bg.x, bg.y, bg.z, 1); }
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         g_prof.mark("gl");

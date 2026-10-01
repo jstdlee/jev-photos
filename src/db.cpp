@@ -39,6 +39,9 @@ CREATE TABLE IF NOT EXISTS corrections(id INTEGER PRIMARY KEY, photo_id INTEGER,
   confidence REAL, reason TEXT, source TEXT, status TEXT DEFAULT 'pending', at TEXT);
 CREATE INDEX IF NOT EXISTS corrections_photo ON corrections(photo_id);
 CREATE TABLE IF NOT EXISTS translations(term TEXT PRIMARY KEY, alts TEXT, at TEXT);
+CREATE TABLE IF NOT EXISTS journal(id INTEGER PRIMARY KEY, run TEXT, at TEXT, kind TEXT, photo_id INTEGER, src TEXT, dst TEXT,
+  prev_dest TEXT, backup TEXT, undone INTEGER DEFAULT 0);
+CREATE INDEX IF NOT EXISTS journal_run ON journal(run);
 CREATE VIRTUAL TABLE IF NOT EXISTS photos_fts USING fts5(text, tokenize='trigram');
 INSERT OR IGNORE INTO kv VALUES('schema', '1');
 )SQL";
@@ -302,6 +305,15 @@ void Db::save_organize(const Photo& p) {
     s.b(p.day_key).b(p.sn).b(p.organized_at).b(p.meta_state).b(p.write_error).b(p.id);
     s.run();
     reindex(p.id);
+}
+
+void Db::confirm_date(int64_t id, const std::string& value, const std::string& prec) {
+    Lock l(mu_);
+    Stmt s(db_, R"(UPDATE photos SET date_value=?, date_prec=?, manual_date=?, date_source='you', date_conf=1, date_decider='you',
+                   needs_review=0, resolved=1 WHERE id=?)");
+    s.b(value).b(prec).b(value + "|" + prec).b(id);
+    s.run();
+    reindex(id);
 }
 
 void Db::set_manual_date(int64_t id, const std::string& v) {
@@ -875,7 +887,7 @@ std::vector<PhotoRow> Db::query(const std::string& search, bool review_only, con
     std::string sql = R"(SELECT id, date_value, date_prec, date_source, date_decider, location, scene, tags, dest_path, src_path,
                          vision_status, date_conf, needs_review, dup_of, COALESCE(similar_to,0), size, COALESCE(width,0),
                          COALESCE(height,0), COALESCE(clip_tags,''), COALESCE(clip_scene,''), COALESCE(user_tags,''), COALESCE(tag_fix,''),
-                         COALESCE(favorite,0) FROM photos WHERE 1)";
+                         COALESCE(favorite,0), COALESCE(gen_tool,'')<>'' FROM photos WHERE 1)";
     std::vector<std::string> binds;
     for (auto& raw : util::split(search, ' ')) {
         std::string t = util::trim(raw);
@@ -912,6 +924,7 @@ std::vector<PhotoRow> Db::query(const std::string& search, bool review_only, con
         tp.user_tags = s.t(c++);
         tp.tag_fix = s.t(c++);
         r.favorite = s.i(c++) != 0;
+        r.ai = s.i(c++) != 0;
         for (auto& t : effective_tags(tp)) r.tags += (r.tags.empty() ? "" : ", ") + t;
         if (r.scene.empty()) r.scene = clip_scene;
         out.push_back(std::move(r));
@@ -952,4 +965,73 @@ DbStats Db::stats(const std::string& folder) {
         st.total_bytes = s.i(9); st.dup_bytes = s.i(10); st.similar = int(s.i(11)); st.tagged = int(s.i(12));
     }
     return st;
+}
+
+// ---- undo journal
+
+void Db::journal_add(const JournalEntry& e) {
+    Lock l(mu_);
+    Stmt s(db_, "INSERT INTO journal(run, at, kind, photo_id, src, dst, prev_dest, backup) VALUES(?,?,?,?,?,?,?,?)");
+    s.b(e.run).b(util::now_iso()).b(e.kind).b(e.photo_id).b(e.src).b(e.dst).b(e.prev_dest).b(e.backup);
+    s.run();
+}
+
+std::vector<JournalEntry> Db::journal_entries(const std::string& run) {
+    Lock l(mu_);
+    std::vector<JournalEntry> out;
+    Stmt s(db_, "SELECT id, run, at, kind, photo_id, src, dst, prev_dest, backup, undone FROM journal WHERE run=? ORDER BY id");
+    s.b(run);
+    while (s.step()) {
+        JournalEntry e;
+        e.id = s.i(0); e.run = s.t(1); e.at = s.t(2); e.kind = s.t(3); e.photo_id = s.i(4);
+        e.src = s.t(5); e.dst = s.t(6); e.prev_dest = s.t(7); e.backup = s.t(8); e.undone = s.i(9) != 0;
+        out.push_back(e);
+    }
+    return out;
+}
+
+std::vector<JournalRun> Db::journal_runs(int limit) {
+    Lock l(mu_);
+    std::vector<JournalRun> out;
+    Stmt s(db_, R"(SELECT run, MIN(at), COUNT(DISTINCT photo_id), MIN(undone), group_concat(DISTINCT kind) FROM journal GROUP BY run ORDER BY run DESC LIMIT ?)");
+    s.b(limit);
+    while (s.step()) {
+        JournalRun r;
+        r.run = s.t(0); r.at = s.t(1); r.count = int(s.i(2)); r.undone = s.i(3) != 0; r.kinds = s.t(4);
+        out.push_back(r);
+    }
+    return out;
+}
+
+void Db::journal_mark_undone(int64_t entry_id) {
+    Lock l(mu_);
+    Stmt s(db_, "UPDATE journal SET undone=1 WHERE id=?");
+    s.b(entry_id);
+    s.run();
+}
+
+std::vector<std::string> Db::journal_prune(int keep_runs) {
+    std::vector<std::string> old;
+    {
+        Lock l(mu_);
+        Stmt s(db_, "SELECT DISTINCT run FROM journal ORDER BY run DESC LIMIT -1 OFFSET ?");
+        s.b(keep_runs);
+        while (s.step()) old.push_back(s.t(0));
+    }
+    for (auto& r : old) {
+        Lock l(mu_);
+        Stmt d(db_, "DELETE FROM journal WHERE run=?");
+        d.b(r);
+        d.run();
+    }
+    return old;
+}
+
+void Db::clear_dest(int64_t id, const std::string& dest) {
+    Lock l(mu_);
+    Stmt s(db_, "UPDATE photos SET dest_path=?, organized_at=CASE WHEN ? IS NULL THEN NULL ELSE organized_at END, meta_state=CASE WHEN ? IS NULL THEN NULL ELSE meta_state END WHERE id=?");
+    if (dest.empty()) s.null().null().null(); else s.b(dest).b(dest).b(dest);
+    s.b(id);
+    s.run();
+    reindex(id);
 }

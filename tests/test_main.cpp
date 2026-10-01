@@ -753,7 +753,37 @@ static void test_search_filters() {
     util::run({"rm", "-rf", dir});
 }
 
+static void test_journal() {
+    std::string dir = util::temp_path("journal"), err;
+    util::mkdirs(dir);
+    Db db;
+    CHECK(db.open(dir + "/j.sqlite", err));
+    for (int r = 0; r < 12; r++)
+        for (int k = 0; k < 3; k++) {
+            JournalEntry e;
+            e.run = util::fmt("2026-10-02T01:%02d:00", r);
+            e.kind = k == 2 ? "meta" : "rename";
+            e.photo_id = k == 2 ? 1 : k + 1;  // the meta write is to photo 1 again: 2 photos per run
+            e.src = "/a" + std::to_string(k);
+            e.dst = "/b" + std::to_string(k);
+            db.journal_add(e);
+        }
+    auto runs = db.journal_runs(50);
+    CHECK(runs.size() == 12 && runs[0].run == "2026-10-02T01:11:00" && runs[0].count == 2 && !runs[0].undone);
+    CHECK(runs[0].kinds.find("meta") != std::string::npos && runs[0].kinds.find("rename") != std::string::npos);
+    auto es = db.journal_entries(runs[0].run);
+    CHECK(es.size() == 3 && es[0].src == "/a0" && es[2].kind == "meta");
+    for (auto& e : es) db.journal_mark_undone(e.id);
+    CHECK(db.journal_runs(1)[0].undone);
+    db.journal_mark_undone(db.journal_entries(runs[1].run)[0].id);  // partly undone is not undone
+    CHECK(!db.journal_runs(2)[1].undone);
+    auto old = db.journal_prune(10);
+    CHECK(old.size() == 2 && old[0] == "2026-10-02T01:01:00");
+    CHECK(db.journal_runs(50).size() == 10);
+}
+
 int main() {
+    test_journal();
     test_civil();
     test_name_patterns();
     test_decisions();
