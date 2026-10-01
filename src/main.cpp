@@ -146,6 +146,23 @@ static void build_fonts() {
 }
 
 // ---------------------------------------------------------------------------
+// Photos are drawn smaller than they are: mipmaps (trilinear) and anisotropic filtering keep them smooth instead of
+// jagged. glGenerateMipmap is not in ImGui's GL loader, so it is fetched once from GLFW.
+typedef void (*PFN_GenerateMipmap)(GLenum);
+static PFN_GenerateMipmap gl_generate_mipmap() {
+    static PFN_GenerateMipmap f = (PFN_GenerateMipmap)glfwGetProcAddress("glGenerateMipmap");
+    return f;
+}
+static float gl_max_anisotropy() {
+    static float v = -1;
+    if (v < 0) {
+        v = 0;
+        if (glfwExtensionSupported("GL_EXT_texture_filter_anisotropic") || glfwExtensionSupported("GL_ARB_texture_filter_anisotropic"))
+            if (auto get = (void (*)(GLenum, float*))glfwGetProcAddress("glGetFloatv")) get(0x84FF /* GL_MAX_TEXTURE_MAX_ANISOTROPY */, &v);
+    }
+    return v;
+}
+
 struct Texture {
     GLuint tex = 0;
     int w = 0, h = 0;
@@ -158,11 +175,19 @@ struct Texture {
         unload();
         glGenTextures(1, &tex);
         glBindTexture(GL_TEXTURE_2D, tex);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, pw, ph, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+        if (auto gen = gl_generate_mipmap()) {
+            gen(GL_TEXTURE_2D);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, 0x2703 /* GL_LINEAR_MIPMAP_LINEAR */);
+            if (float an = gl_max_anisotropy(); an > 1) glTexParameteri(GL_TEXTURE_2D, 0x84FE /* GL_TEXTURE_MAX_ANISOTROPY */, int(std::min(an, 8.0f)));
+        } else {
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        }
         w = pw;
         h = ph;
         return true;
@@ -638,7 +663,8 @@ static ImVec4 g_accent(0.30f, 0.78f, 0.47f, 1);
 // Theme colours for meaning (set by apply_style): danger, warning, a warning about originals, success, error, info.
 static ImVec4 kDanger(0.86f, 0.30f, 0.27f, 1);
 static ImVec4 g_warn(0.95f, 0.72f, 0.4f, 1), g_warn_red(1.0f, 0.62f, 0.55f, 1), g_ok(0.5f, 0.9f, 0.6f, 1), g_err(1, 0.5f, 0.4f, 1),
-    g_info(0.6f, 0.75f, 1, 1), g_star(1, 0.8f, 0.25f, 1), g_text_dim(0.55f, 0.57f, 0.62f, 1), g_sidebar(0.09f, 0.10f, 0.12f, 1);
+    g_info(0.6f, 0.75f, 1, 1), g_star(1, 0.8f, 0.25f, 1), g_text_dim(0.55f, 0.57f, 0.62f, 1), g_sidebar(0.09f, 0.10f, 0.12f, 1),
+    g_panel(0.11f, 0.12f, 0.15f, 1), g_seg_on(1, 1, 1, 0.14f);  // cards, and the chosen pill of a segmented control
 
 // Themes: Dark, Tokyo Night (the editor theme: #1a1b26 night, #7aa2f7 blue) and Light. The accent comes from the
 // settings (choosing a theme sets its own accent first).
@@ -729,6 +755,8 @@ static void apply_style(const Config& c) {
     g_star = th.star;
     g_text_dim = th.dim;
     g_sidebar = th.sidebar;
+    g_panel = th.panel;
+    g_seg_on = c.theme == THEME_LIGHT ? ImVec4(1, 1, 1, 1) : th.frame_hover;
 }
 
 static std::string fmt_eta(double s) {
@@ -3076,259 +3104,378 @@ static void draw_log(App& a) {
     ImGui::EndChild();
 }
 
+// ---- Settings, laid out like a preferences page: small-caps section titles, rounded cards, one setting per row
+// (title and a one-line explanation on the left, the control on the right). Every change is saved at once.
+
+namespace prefs {
+struct Card {
+    ImVec2 p0;
+    float x0 = 0, w = 0;
+    bool first = true;
+};
+static Card g_card;
+static bool g_dirty = false;
+static const float kPad = 14;
+
+static void section(const char* title) {
+    ImGui::Dummy(ImVec2(0, 10));
+    std::string up;
+    for (const char* s = title; *s; s++) up += char(toupper((unsigned char)*s));  // non-ASCII stays as it is
+    ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 0.82f);
+    ImGui::SetCursorPosX(g_card.x0 + 2);
+    ImGui::TextDisabled("%s", up.c_str());
+    ImGui::PopFont();
+    ImGui::Dummy(ImVec2(0, 2));
+}
+
+static void card_begin() {
+    g_card.first = true;
+    ImGui::SetCursorPosX(g_card.x0);
+    g_card.p0 = ImGui::GetCursorScreenPos();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->ChannelsSplit(2);
+    dl->ChannelsSetCurrent(1);
+}
+
+static void card_end() {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 p1(g_card.p0.x + g_card.w, ImGui::GetCursorScreenPos().y);
+    dl->ChannelsSetCurrent(0);
+    dl->AddRectFilled(g_card.p0, p1, ImGui::GetColorU32(g_panel), 10.0f);
+    dl->AddRect(g_card.p0, p1, ImGui::GetColorU32(ImGuiCol_Border), 10.0f);
+    dl->ChannelsMerge();
+}
+
+// One row. Returns the screen position where a control of width ctrl_w goes (vertically centred, right-aligned).
+static ImVec2 row(const char* title, const char* desc, float ctrl_w, const char* more = nullptr) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImGui::SetCursorPosX(g_card.x0);
+    ImVec2 top = ImGui::GetCursorScreenPos();
+    float lh = ImGui::GetTextLineHeight(), small = ImGui::GetStyle().FontSizeBase * 0.86f;
+    float h = kPad * 2 + lh + (desc && *desc ? small + 4 : 0);
+    if (!g_card.first) dl->AddLine(ImVec2(top.x + 1, top.y), ImVec2(top.x + g_card.w - 1, top.y), ImGui::GetColorU32(ImGuiCol_Border));
+    g_card.first = false;
+    float text_w = g_card.w - kPad * 3 - ctrl_w;
+    ImGui::SetCursorScreenPos(ImVec2(top.x + kPad, top.y + kPad));
+    ImGui::TextUnformatted(title);
+    if (desc && *desc) {
+        ImGui::SetCursorScreenPos(ImVec2(top.x + kPad, top.y + kPad + lh + 3));
+        ImGui::PushFont(nullptr, small);
+        std::string d = desc;  // one line, cut with an ellipsis; the whole text on hover
+        bool cut = false;
+        while (d.size() > 8 && ImGui::CalcTextSize(d.c_str()).x > text_w) {
+            size_t k = d.size() - 1;
+            while (k > 0 && (d[k] & 0xC0) == 0x80) k--;  // stay on UTF-8 boundaries
+            d.resize(k);
+            cut = true;
+        }
+        if (cut) d += "…";
+        ImGui::TextDisabled("%s", d.c_str());
+        ImGui::PopFont();
+        if (cut || more) tip(more ? (std::string(desc) + "\n" + more) : std::string(desc));
+    } else if (more) {
+        tip(more);
+    }
+    ImGui::SetCursorScreenPos(ImVec2(top.x, top.y + h));
+    ImGui::Dummy(ImVec2(g_card.w, 0));
+    ImVec2 after = ImGui::GetCursorScreenPos();
+    ImGui::SetCursorScreenPos(ImVec2(top.x + g_card.w - kPad - ctrl_w, top.y + (h - ImGui::GetFrameHeight()) / 2));
+    (void)after;
+    return top;
+}
+// Call after the control: continue below the row.
+static void row_end(ImVec2 top, const char* desc) {
+    float lh = ImGui::GetTextLineHeight(), small = ImGui::GetStyle().FontSizeBase * 0.86f;
+    float h = kPad * 2 + lh + (desc && *desc ? small + 4 : 0);
+    ImGui::SetCursorScreenPos(ImVec2(top.x, top.y + h));
+    ImGui::Dummy(ImVec2(g_card.w, 0));
+    ImGui::SetCursorScreenPos(ImVec2(top.x, top.y + h));
+}
+
+static float seg_width(const std::vector<std::string>& labels) {
+    float w = 4;
+    for (auto& l : labels) w += ImGui::CalcTextSize(l.c_str()).x + 22;
+    return w;
+}
+// Segmented control: the chosen option is a raised pill.
+static bool seg(const char* id, int* v, const std::vector<std::string>& labels) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float h = ImGui::GetFrameHeight(), w = seg_width(labels);
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), ImGui::GetColorU32(ImGuiCol_FrameBg), 7.0f);
+    bool changed = false;
+    float x = p.x + 2;
+    ImGui::PushID(id);
+    for (int i = 0; i < int(labels.size()); i++) {
+        float iw = ImGui::CalcTextSize(labels[size_t(i)].c_str()).x + 22;
+        ImGui::SetCursorScreenPos(ImVec2(x, p.y));
+        ImGui::PushID(i);
+        if (ImGui::InvisibleButton("##s", ImVec2(iw, h)) && *v != i) { *v = i; changed = true; }
+        bool hov = ImGui::IsItemHovered();
+        ImGui::PopID();
+        ImVec2 a(x, p.y + 2), b(x + iw, p.y + h - 2);
+        if (*v == i) {
+            dl->AddRectFilled(a, b, ImGui::GetColorU32(g_seg_on), 6.0f);
+            dl->AddRect(a, b, ImGui::GetColorU32(ImGuiCol_Border), 6.0f);
+        } else if (hov) {
+            dl->AddRectFilled(a, b, ImGui::GetColorU32(ImGuiCol_FrameBgHovered), 6.0f);
+        }
+        ImVec2 ts = ImGui::CalcTextSize(labels[size_t(i)].c_str());
+        dl->AddText(ImVec2(x + (iw - ts.x) / 2, p.y + (h - ts.y) / 2), ImGui::GetColorU32(*v == i ? ImGuiCol_Text : ImGuiCol_TextDisabled),
+                    labels[size_t(i)].c_str());
+        x += iw;
+    }
+    ImGui::PopID();
+    ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h));
+    g_dirty |= changed;
+    return changed;
+}
+
+// The row helpers: a title, an explanation, and one control.
+static bool choice(const char* title, const char* desc, int* v, const std::vector<std::string>& labels, const char* more = nullptr) {
+    ImVec2 top = row(title, desc, seg_width(labels), more);
+    bool ch = seg(title, v, labels);
+    row_end(top, desc);
+    return ch;
+}
+static bool toggle(const char* title, const char* desc, bool* b, const char* more = nullptr) {
+    int v = *b ? 1 : 0;
+    bool ch = choice(title, desc, &v, {tr("Off"), tr("On")}, more);
+    *b = v == 1;
+    return ch;
+}
+static bool combo(const char* title, const char* desc, int* v, const char* const* items, int n, float w, const char* more = nullptr) {
+    ImVec2 top = row(title, desc, w, more);
+    ImGui::SetNextItemWidth(w);
+    bool ch = ImGui::Combo((std::string("##") + title).c_str(), v, items, n);
+    row_end(top, desc);
+    g_dirty |= ch;
+    return ch;
+}
+static bool slider_i(const char* title, const char* desc, int* v, int lo, int hi, const char* fmt = "%d") {
+    ImVec2 top = row(title, desc, 200);
+    ImGui::SetNextItemWidth(200);
+    bool ch = ImGui::SliderInt((std::string("##") + title).c_str(), v, lo, hi, fmt);
+    row_end(top, desc);
+    g_dirty |= ch;
+    return ch;
+}
+static bool slider_f(const char* title, const char* desc, float* v, float lo, float hi, const char* fmt = "%.2f") {
+    ImVec2 top = row(title, desc, 200);
+    ImGui::SetNextItemWidth(200);
+    bool ch = ImGui::SliderFloat((std::string("##") + title).c_str(), v, lo, hi, fmt);
+    row_end(top, desc);
+    g_dirty |= ch;
+    return ch;
+}
+// Text: saved when you leave the field.
+static void text(const char* title, const char* desc, char* buf, size_t n, float w, const char* hint = "", bool password = false) {
+    ImVec2 top = row(title, desc, w);
+    ImGui::SetNextItemWidth(w);
+    ImGui::InputTextWithHint((std::string("##") + title + desc).c_str(), hint, buf, n, password ? ImGuiInputTextFlags_Password : 0);
+    if (ImGui::IsItemDeactivatedAfterEdit()) g_dirty = true;
+    row_end(top, desc);
+}
+static void number(const char* title, const char* desc, int* v, int step = 1) {
+    ImVec2 top = row(title, desc, 130);
+    ImGui::SetNextItemWidth(130);
+    ImGui::InputInt((std::string("##") + title + desc).c_str(), v, step);
+    if (ImGui::IsItemDeactivatedAfterEdit()) g_dirty = true;
+    row_end(top, desc);
+}
+}  // namespace prefs
+
 static void draw_settings(App& a) {
+    using namespace prefs;
     if (!a.settings_loaded) load_settings_buffers(a);
     Config& c = a.cfg;
-    bool busy = a.pipe->running();
-    ImGui::BeginChild("settings");
-    if (ImGui::CollapsingHeader(tr("Appearance"), ImGuiTreeNodeFlags_DefaultOpen)) {
-    const char* themes[] = {tr("Dark"), tr("Tokyo Night"), tr("Light")};
-    ImGui::SetNextItemWidth(160);
-    if (ImGui::Combo(tr("Theme"), &c.theme, themes, 3)) {
-        theme_default_accent(c.theme, c.accent);  // each theme brings its own accent; change it below if you like
+    ImGui::BeginChild("settings", ImVec2(0, 0), 0, ImGuiWindowFlags_None);
+    float avail = ImGui::GetContentRegionAvail().x;
+    g_card.w = std::min(avail - 8, 760.0f);
+    g_card.x0 = std::max(4.0f, (avail - g_card.w) / 2);
+    g_dirty = false;
+
+    section(tr("Preferences"));
+    card_begin();
+    if (choice(tr("Appearance"), tr("Dark, Tokyo Night (deep blue with soft neon colours) or Light"), &c.theme,
+               {tr("Dark"), tr("Tokyo Night"), tr("Light")})) {
+        theme_default_accent(c.theme, c.accent);  // each theme brings its own accent
         apply_style(c);
-        save_config(c, a.config_file);
     }
-    tip(tr("Dark, Tokyo Night (deep blue with soft neon colours) or Light"));
-    int lang = get_lang();
-    ImGui::SetNextItemWidth(160);
-    if (ImGui::Combo(tr("Language"), &lang, kLangNames, L_COUNT)) {
-        set_lang(Lang(lang));
-        c.lang = kLangCodes[lang];
+    {
+        ImVec2 top = row(tr("Accent colour"), tr("The main buttons and highlights; each theme sets its own first"), ImGui::GetFrameHeight());
+        if (ImGui::ColorEdit3("##accent", c.accent, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel)) { apply_style(c); g_dirty = true; }
+        row_end(top, "x");
     }
-    tip(tr("Interface language"));
-    ImGui::SetNextItemWidth(160);
-    ImGui::SliderFloat(tr("Font size"), &c.font_size, 12, 26, "%.0f");
-    tip(tr("Interface text size"));
-    if (ImGui::ColorEdit3(tr("Accent"), c.accent, ImGuiColorEditFlags_NoInputs)) apply_style(c);
-    tip(tr("The colour of the main buttons and highlights"));
-    if (ImGui::Checkbox(tr("Use the system title bar"), &c.system_titlebar)) save_config(c, a.config_file);
-    tip(tr("Show the desktop's own title bar instead of the app's top bar with its window buttons (applies after restart)"));
-    const char* rend[] = {tr("Auto (GPU, software if the driver crashes)"), tr("GPU only"), tr("Software")};
-    ImGui::SetNextItemWidth(320);
-    ImGui::Combo(tr("Renderer"), &c.renderer, rend, 3);
-    tip(tr("Graphics: GPU, or software rendering when the GPU driver cannot open a window"));
-    ImGui::SameLine();
-    ImGui::TextDisabled("%s (%s)", a.gl_renderer.c_str(), tr("applies after restart"));
-    }
-    if (ImGui::CollapsingHeader(tr("Folders"), ImGuiTreeNodeFlags_DefaultOpen)) {
-    if (ImGui::Checkbox(tr("Watch the folders for new photos"), &c.watch_folders)) save_config(c, a.config_file);
-    tip(tr("Every 10 minutes, while nothing else runs, look for new or changed photos and analyse them quietly (dates, duplicates, recognition). Nothing in your files changes."));
-    }
-    ImGui::BeginDisabled(busy);
-
-    if (ImGui::CollapsingHeader(tr("Organized copies"), ImGuiTreeNodeFlags_DefaultOpen)) {
-    ImGui::Checkbox(tr("Preview before changes (recommended)"), &c.preview_first);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tr("Analyze ends with a plan to review; nothing is copied or written until you press Apply."));
-    ImGui::SetNextItemWidth(520);
-    std::string hint = a.cfg.folder.empty() ? std::string(tr("default: <photo folder>/jev-organized")) : a.cfg.folder + "/jev-organized";
-    ImGui::InputTextWithHint(tr("Organized copies folder"), hint.c_str(), a.lib_buf, sizeof a.lib_buf);
-    ImGui::SameLine();
-    if (ImGui::Button((std::string(tr("Browse...")) + "##out").c_str())) start_dir_dialog(a, 1);
-    tip(tr("Choose a folder with the file dialog"));
-    ImGui::TextDisabled("%s", tr("Leave empty to keep the organized copies next to your photos."));
-    const char* layouts[] = {"2019/2019-05", "2019-05", "2019/05"};
-    ImGui::SetNextItemWidth(200);
-    ImGui::Combo(tr("Folder layout"), &c.layout, layouts, LAYOUT_COUNT);
-    tip(tr("How month folders are named inside the organized folder"));
-    const char* ops[] = {tr("Copy and rename (originals untouched)"), tr("Move and rename (no copies)"), tr("Rename in place (same folders)"),
-                         tr("Add metadata only (no moving or renaming)")};
-    ImGui::SetNextItemWidth(320);
-    ImGui::Combo(tr("File operation"), &c.file_op, ops, OP_COUNT);
-    tip(tr("What Organize does with each photo"));
-    if (c.file_op == OP_COPY) ImGui::TextDisabled("%s", tr("Your photos stay as they are; renamed copies go into month folders."));
-    else if (c.file_op == OP_MOVE) ImGui::TextColored(g_warn, "%s", tr("Your photos are moved into the month folders and renamed; no second copy uses disk space."));
-    else if (c.file_op == OP_RENAME) ImGui::TextColored(g_warn, "%s", tr("Your photos keep their folders and only get date names (20190512_00001.jpg)."));
-    else ImGui::TextDisabled("%s", tr("Missing dates, tags, descriptions and places are added to the files where they are."));
-    const char* ns[] = {tr("Date and serial (20190512_00001)"), tr("Original name, then date and serial (IMG_20190512_00001)")};
-    ImGui::SetNextItemWidth(420);
-    ImGui::Combo(tr("File names"), &c.name_style, ns, NAME_COUNT);
-    tip(tr("How new file names are built"));
-    ImGui::Checkbox(tr("Replace keywords jev-photos wrote earlier"), &c.rewrite_tags);
-    tip(tr("When tags change, keywords jev-photos wrote before are updated; the file's own keywords stay"));
-    ImGui::Checkbox(tr("Write a description (the AI prompt, plus \"Shows: <tags>\")"), &c.write_description);
-    tip(tr("Write the AI prompt and 'Shows: <tags>' as the file's description (an existing one is only changed as you decide)"));
-    ImGui::Checkbox(tr("Keywords from AI generation prompts"), &c.gen_keywords);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tr("Tag-style prompts (\"1girl, hat, beach\") give their words directly; prose prompts are summarised by the LLM, once per distinct prompt."));
-    const char* dp[] = {tr("Only fill empty descriptions (never change existing text)"), tr("Rules + LLM, jev cross-checks; disagreements go to you (recommended)"),
-                        tr("Rules + LLM"), tr("Always ask me")};
-    ImGui::SetNextItemWidth(460);
-    ImGui::Combo(tr("Existing descriptions"), &c.desc_policy, dp, DESC_COUNT);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tr("Placeholders (\"OLYMPUS DIGITAL CAMERA\", file names) are replaced by the rules; text that already covers ours is kept. For the rest, keep / append / replace is decided as chosen here. Replaced text is kept in Xmp.jev.PreviousDescription."));
-    const char* wm[] = {tr("Embed into the organized copy"), tr("XMP sidecar"), tr("Database only")};
-    ImGui::SetNextItemWidth(260);
-    ImGui::Combo(tr("Metadata write"), &c.write_mode, wm, WRITE_COUNT);
-    tip(tr("Where new metadata goes: into the file, into a .xmp file next to it, or only the catalog"));
-    const char* seps[] = {"_", "-", " ", ""};
-    int sep_idx = c.name_sep == "-" ? 1 : c.name_sep == " " ? 2 : c.name_sep.empty() ? 3 : 0;
-    ImGui::SetNextItemWidth(120);
-    if (ImGui::Combo(tr("Name separator"), &sep_idx, "_ (20190512_00001)\0- (20190512-00001)\0space\0none\0")) c.name_sep = seps[sep_idx];
-    tip(tr("The character between the date and the serial number"));
-    ImGui::SetNextItemWidth(120);
-    ImGui::SliderInt(tr("Serial digits"), &c.sn_digits, 3, 8);
-    tip(tr("How many digits the serial number has"));
-
-    }
-
-    if (ImGui::CollapsingHeader(tr("Tagging and search (CLIP)"), ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::Checkbox((std::string(tr("Tag pictures with CLIP")) + "##clip").c_str(), &c.clip_enabled);
-        tip(tr("Analyse each picture with CLIP for tags and meaning search"));
-        ImGui::Checkbox(tr("Ask how much to analyse when pressing Analyze"), &c.analyze_ask);
-        tip(tr("Analyse each picture with CLIP for tags and meaning search"));
-        const char* cm[] = {tr("Auto (ViT-L/14 when downloaded, else ViT-B/32)"), "ViT-B/32 (fast)", "ViT-L/14 (much better, ~0.3 s per photo on the CPU)"};
-        int ci = c.clip_model == "b32" ? 1 : c.clip_model == "l14" ? 2 : 0;
-        ImGui::SetNextItemWidth(420);
-        if (ImGui::Combo(tr("Model"), &ci, cm, 3)) c.clip_model = ci == 1 ? "b32" : ci == 2 ? "l14" : "auto";
-        tip(tr("Which model to use"));
-        const char* cd[] = {tr("Auto"), tr("CPU"), tr("GPU")};
-        ImGui::SetNextItemWidth(160);
-        ImGui::Combo(tr("Run on"), &c.clip_device, cd, 3);
-        tip(tr("CPU or GPU (the GPU needs an ONNX Runtime build with CUDA)"));
-        ImGui::SetNextItemWidth(160);
-        ImGui::SliderInt(tr("CPU threads"), &c.clip_threads, 1, 16);
-        tip(tr("More threads analyse faster but leave less of the machine for other work"));
-        ImGui::SetNextItemWidth(160);
-        ImGui::SliderInt(tr("Tags per photo"), &c.clip_max_tags, 1, 15);
-        tip(tr("At most this many tags per photo"));
-        ImGui::SetNextItemWidth(160);
-        ImGui::SliderInt(tr("Photo thumbnail side"), &c.thumb_side, 256, 1024);
-        tip(tr("Size of the cached thumbnails the analysis and the lists use"));
-        if (ImGui::Button(tr("Edit tag list..."))) a.tag_editor_open = true;
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s", tag_vocabulary_path().c_str());
-        std::string cdet;
-        {
-            std::lock_guard<std::mutex> l(a.health_mu);
-            cdet = a.clip_detail;
+    {
+        int lang = get_lang();
+        std::vector<std::string> names;
+        for (int i = 0; i < L_COUNT; i++) names.push_back(kLangNames[i]);
+        if (choice(tr("Language"), tr("Applies at once, no restart"), &lang, names)) {
+            set_lang(Lang(lang));
+            c.lang = kLangCodes[lang];
         }
-        ImGui::TextDisabled("%s", cdet.c_str());
+    }
+    {
+        const float sizes[] = {16, 17.6f, 20, 24};
+        int si = 0;
+        for (int i = 0; i < 4; i++)
+            if (std::fabs(c.font_size - sizes[i]) < std::fabs(c.font_size - sizes[si])) si = i;
+        if (choice(tr("Text size"), tr("Everything in the window, larger"), &si, {"100%", "110%", "125%", "150%"})) c.font_size = sizes[si];
+    }
+    {
+        int tb = c.system_titlebar ? 1 : 0;
+        if (choice(tr("Title bar"), tr("The app's own top bar with window buttons, or the desktop's (after restart)"), &tb, {tr("App"), tr("System")}))
+            c.system_titlebar = tb == 1;
+    }
+    choice(tr("Renderer"), (std::string(tr("Software when the GPU driver cannot open a window; now: ")) + a.gl_renderer).c_str(), &c.renderer,
+           {tr("Auto"), tr("GPU"), tr("Software")}, tr("Applies after restart"));
+    card_end();
+
+    section(tr("Folders and organizing"));
+    card_begin();
+    toggle(tr("Watch the folders"), tr("Every 10 minutes while idle, new or changed photos are analysed quietly; files are not changed"), &c.watch_folders);
+    toggle(tr("Preview before changes"), tr("Analyze ends with a list to review; nothing is copied or written until you press Apply"), &c.preview_first);
+    {
+        const char* ops[] = {tr("Copy and rename"), tr("Move and rename"), tr("Rename in place"), tr("Only add metadata")};
+        const char* what = c.file_op == OP_COPY ? tr("Your photos stay as they are; renamed copies go into month folders")
+                         : c.file_op == OP_MOVE ? tr("Your photos are moved into month folders and renamed (no copies)")
+                         : c.file_op == OP_RENAME ? tr("Your photos keep their folders and get date names")
+                                                  : tr("Missing dates, tags, descriptions and places are added where the files are");
+        combo(tr("Organize does"), what, &c.file_op, ops, OP_COUNT, 200);
+    }
+    choice(tr("File names"), tr("20190512_00001.jpg, or the original name in front: IMG_20190512_00001.jpg"), &c.name_style,
+           {tr("Date"), tr("Original + date")});
+    {
+        const char* seps[] = {"_", "-", " ", ""};
+        int si = c.name_sep == "-" ? 1 : c.name_sep == " " ? 2 : c.name_sep.empty() ? 3 : 0;
+        if (choice(tr("Name separator"), tr("Between the date and the serial number"), &si, {"_", "-", tr("space"), tr("none")})) c.name_sep = seps[si];
+    }
+    {
+        int d = std::clamp(c.sn_digits, 3, 6) - 3;
+        if (choice(tr("Serial digits"), tr("How many digits the serial number has"), &d, {"3", "4", "5", "6"})) c.sn_digits = d + 3;
+    }
+    choice(tr("Month folders"), tr("How month folders are named inside the organized folder"), &c.layout, {"2019/2019-05", "2019-05", "2019/05"});
+    {
+        std::string hint = c.folder.empty() ? std::string(tr("next to your photos")) : util::basename(c.folder) + "/jev-organized";
+        ImVec2 top = row(tr("Organized copies folder"), tr("Empty: a jev-organized folder inside each photo folder"), 330);
+        ImGui::SetNextItemWidth(250);
+        ImGui::InputTextWithHint("##outdir", hint.c_str(), a.lib_buf, sizeof a.lib_buf);
+        if (ImGui::IsItemDeactivatedAfterEdit()) g_dirty = true;
+        ImGui::SameLine(0, 6);
+        if (ImGui::Button((std::string(tr("Browse...")) + "##out").c_str(), ImVec2(74, 0))) start_dir_dialog(a, 1);
+        tip(tr("Choose a folder with the file dialog"));
+        row_end(top, "x");
+    }
+    card_end();
+
+    section(tr("Info written into files"));
+    card_begin();
+    choice(tr("Where it goes"), tr("Into the file, a .xmp file next to it, or only the catalog"), &c.write_mode,
+           {tr("In the file"), tr("Sidecar"), tr("Catalog only")});
+    toggle(tr("Replace keywords written earlier"), tr("When tags change, keywords jev-photos wrote are updated; the file's own stay"), &c.rewrite_tags);
+    toggle(tr("Write a description"), tr("The AI prompt plus \"Shows: <tags>\"; existing text only changes as you decide"), &c.write_description);
+    toggle(tr("Keywords from AI prompts"), tr("Tag-style prompts give their words; prose prompts are summarised by the LLM, once each"), &c.gen_keywords);
+    {
+        const char* dp[] = {tr("Only fill empty ones"), tr("Rules + LLM + jev (recommended)"), tr("Rules + LLM"), tr("Always ask me")};
+        combo(tr("Existing descriptions"), tr("Placeholders are replaced; for the rest, keep / append / replace is decided like this"), &c.desc_policy, dp,
+              DESC_COUNT, 240, tr("Replaced text is kept in Xmp.jev.PreviousDescription."));
+    }
+    card_end();
+
+    section(tr("Image recognition"));
+    card_begin();
+    toggle(tr("Recognise pictures"), tr("CLIP reads each picture once, for tags and search by meaning"), &c.clip_enabled);
+    toggle(tr("Ask before analysing"), tr("Analyze first asks how much image analysis to do (the slow part)"), &c.analyze_ask);
+    {
+        int ci = c.clip_model == "b32" ? 1 : c.clip_model == "l14" ? 2 : 0;
+        if (choice(tr("Model"), tr("Best: ViT-L/14, ~0.35 s per photo; Fast: ViT-B/32, ~60 ms"), &ci, {tr("Auto"), tr("Fast"), tr("Best")}))
+            c.clip_model = ci == 1 ? "b32" : ci == 2 ? "l14" : "auto";
+    }
+    choice(tr("Run on"), tr("The GPU needs an ONNX Runtime build with CUDA"), &c.clip_device, {tr("Auto"), tr("CPU"), tr("GPU")});
+    slider_i(tr("CPU threads"), tr("More is faster but leaves less of the machine for other work"), &c.clip_threads, 1, 16);
+    slider_i(tr("Tags per photo"), tr("At most this many tags per photo"), &c.clip_max_tags, 1, 15);
+    slider_i(tr("Thumbnail size"), tr("Side of the cached thumbnails the analysis and the lists use (px)"), &c.thumb_side, 256, 1024);
+    {
+        ImVec2 top = row(tr("Tag list"), tag_vocabulary_path().c_str(), 90);
+        if (ImGui::Button((std::string(tr("Edit...")) + "##tags").c_str(), ImVec2(90, 0))) a.tag_editor_open = true;
+        tip(tr("The words recognition chooses from: add, rename, move or delete tags"));
+        row_end(top, "x");
+    }
+    card_end();
+
+    section(tr("Assistant (language model)"));
+    card_begin();
+    toggle(tr("Use the language model"), tr("Ask search, keywords from prompts, description and tag checks"), &c.llm_enabled);
+    text(tr("Address"), tr("An OpenAI-compatible server"), a.llm_url, sizeof a.llm_url, 300, "http://127.0.0.1:8888/v1");
+    text(tr("Model"), tr("The model name on that server"), a.llm_model, sizeof a.llm_model, 300);
+    text(tr("API key"), tr("Only for servers that need one; kept in the settings file (mode 0600)"), a.llm_key, sizeof a.llm_key, 300, "", true);
+    toggle(tr("Disable thinking"), tr("Much faster answers from reasoning models (Qwen3 style)"), &c.llm_no_think);
+    {
+        const char* dec[] = {tr("LLM"), tr("jev only"), tr("Local ranking only"), tr("LLM, jev for close calls")};
+        combo(tr("Who picks Ask results"), tr("Who rates the candidates of a sentence search"), &c.ask_decider, dec, JUDGE_COUNT, 220);
+    }
+    slider_i(tr("Keep results rated at least"), tr("Ask search drops candidates rated below this"), &c.ask_keep, 0, 100, "%d%%");
+    slider_i(tr("Candidates per request"), tr("How many candidates go into one LLM request"), &c.ask_batch, 5, 60);
+    slider_i(tr("Most candidates to check"), tr("Ask search rates at most this many"), &c.ask_max_candidates, 20, 500);
+    slider_f(tr("Meaning search strictness"), tr("How clearly a picture must show what you typed; higher = fewer, surer results"), &c.search_min_match, 0.1f, 0.8f);
+    number(tr("Timeout (s)"), tr("Give up on a request after this many seconds"), &c.llm_timeout);
+    card_end();
+
+    section(tr("jev decisions"));
+    card_begin();
+    toggle(tr("Use jev"), tr("Settles close calls: dates, places, search results, checks of the LLM"), &c.jev_enabled);
+    text(tr("Address"), tr("The jev decision API"), a.jev_url, sizeof a.jev_url, 300, "http://127.0.0.1:8011");
+    text(tr("Model"), tr("The jev model name, e.g. julia-1"), a.jev_model, sizeof a.jev_model, 300);
+    text(tr("API key"), tr("Only when the server needs one"), a.jev_key, sizeof a.jev_key, 300, "", true);
+    number(tr("Timeout (s)"), tr("Give up on a request after this many seconds"), &c.jev_timeout);
+    card_end();
+
+    static bool advanced = false;
+    section(tr("Advanced"));
+    card_begin();
+    toggle(tr("Show advanced settings"), tr("The vision-language model and the numbers behind date and place decisions"), &advanced);
+    card_end();
+    if (advanced) {
+        section(tr("Vision-language model"));
+        card_begin();
+        toggle(tr("Use a vision model"), tr("Captions and text in screenshots; needs a model server and a lot of memory"), &c.vl_enabled);
+        text(tr("Address"), tr("OpenAI-compatible, e.g. http://127.0.0.1:11434/v1"), a.vl_url, sizeof a.vl_url, 300);
+        text(tr("Model"), tr("The vision model name"), a.vl_model, sizeof a.vl_model, 300);
+        text(tr("API key"), tr("Only when the server needs one"), a.vl_key, sizeof a.vl_key, 300, "", true);
+        text(tr("Tag language"), tr("The language of the tags it writes"), a.vl_lang, sizeof a.vl_lang, 160);
+        slider_i(tr("Screenshot image side"), tr("Size of images sent for screenshots and text (px)"), &c.vl_max_side, 384, 1024);
+        choice(tr("Run on (Ollama)"), tr("Where Ollama runs the vision model"), &c.vl_device, {tr("Auto"), tr("CPU")});
+        number(tr("Context"), tr("Ollama num_ctx"), &c.vl_num_ctx, 1024);
+        c.vl_num_ctx = std::clamp(c.vl_num_ctx, 2048, 65536);
+        slider_i(tr("Concurrency"), tr("Photos handled at once"), &c.vl_concurrency, 1, 8);
+        number(tr("Timeout (s)"), tr("Give up on a request after this many seconds"), &c.vl_timeout);
+        toggle(tr("JSON mode"), tr("Ask for strict JSON answers"), &c.vl_json_mode);
+        card_end();
+
+        section(tr("Decision rules"));
+        card_begin();
+        slider_f(tr("Uncertain below"), tr("Dates less sure than this are marked uncertain"), &c.review_below, 0, 1);
+        slider_f(tr("Ask jev when margin below"), tr("jev is asked when the best two date answers are this close"), &c.jev_margin, 0.5f, 1);
+        slider_f(tr("jev weight for dates"), tr("How much jev's answer counts in a close date decision"), &c.jev_date_weight, 0, 1);
+        slider_f(tr("Place vote: rules"), tr("Weight of the folder-name rules"), &c.loc_w_rules, 0, 1);
+        slider_f(tr("Place vote: vision model"), tr("Weight of the vision model"), &c.loc_w_vl, 0, 1);
+        slider_f(tr("Place vote: jev"), tr("Weight of jev"), &c.loc_w_jev, 0, 1);
+        slider_f(tr("Accept a place at"), tr("A place needs at least this score"), &c.loc_accept, 0, 1);
+        number(tr("Earliest year"), tr("Dates before this year are treated as wrong"), &c.min_year);
+        slider_i(tr("Scan threads"), tr("Files read in parallel while scanning"), &c.scan_threads, 1, 16);
+        card_end();
     }
 
-    if (ImGui::CollapsingHeader(tr("Ask search (AI)"))) {
-        ImGui::TextDisabled("%s", tr("Ask turns a sentence into keywords, places and dates, searches locally, then lets a model pick what you meant."));
-        ImGui::Checkbox((std::string(tr("Enabled")) + "##llm").c_str(), &c.llm_enabled);
-        tip(tr("Use this service"));
-        ImGui::SetNextItemWidth(420);
-        ImGui::InputText("URL (OpenAI-compatible)##llm", a.llm_url, sizeof a.llm_url);
-        tip(tr("The LLM server's address, e.g. http://127.0.0.1:8888/v1"));
-        ImGui::SetNextItemWidth(320);
-        ImGui::InputText((std::string(tr("Model")) + "##llm").c_str(), a.llm_model, sizeof a.llm_model);
-        tip(tr("The model name on that server"));
-        ImGui::SetNextItemWidth(220);
-        ImGui::InputText((std::string(tr("API key")) + "##llm").c_str(), a.llm_key, sizeof a.llm_key, ImGuiInputTextFlags_Password);
-        ImGui::Checkbox(tr("Disable thinking (much faster for reasoning models)"), &c.llm_no_think);
-        tip(tr("Much faster answers from reasoning models (Qwen3 style)"));
-        const char* dec[] = {tr("LLM"), tr("jev only"), tr("None: local ranking only"), tr("LLM, jev settles its close calls (recommended)")};
-        ImGui::SetNextItemWidth(340);
-        ImGui::Combo(tr("Who picks the results"), &c.ask_decider, dec, JUDGE_COUNT);
-        tip(tr("Who rates the candidates of an Ask search"));
-        ImGui::SetNextItemWidth(160);
-        ImGui::SliderInt(tr("Keep results rated at least (%)"), &c.ask_keep, 0, 100);
-        tip(tr("Ask search drops candidates rated below this"));
-        ImGui::SetNextItemWidth(160);
-        ImGui::SliderInt(tr("Candidates per decision request"), &c.ask_batch, 5, 60);
-        tip(tr("How many candidates go into one LLM request"));
-        ImGui::SetNextItemWidth(160);
-        ImGui::SliderInt(tr("Most candidates to check"), &c.ask_max_candidates, 20, 500);
-        tip(tr("Ask search rates at most this many candidates"));
-        ImGui::SetNextItemWidth(160);
-        ImGui::SliderFloat(tr("Meaning search strictness"), &c.search_min_match, 0.1f, 0.8f, "%.2f");
-        tip(tr("How clearly a picture must show what you typed, scored like a tag against the other tags of its kind. Higher = fewer, surer results."));
-        ImGui::SetNextItemWidth(120);
-        ImGui::InputInt((std::string(tr("Timeout (s)")) + "##llm").c_str(), &c.llm_timeout);
-        tip(tr("Give up on a request after this many seconds"));
-    }
-
-    if (ImGui::CollapsingHeader(tr("Dates and places (jev decision API)"))) {
-    ImGui::Checkbox((std::string(tr("Enabled")) + "##jev").c_str(), &c.jev_enabled);
-    tip(tr("Use this service"));
-    ImGui::SetNextItemWidth(420);
-    ImGui::InputText("URL##jev", a.jev_url, sizeof a.jev_url);
-    tip(tr("The jev decision API's address, e.g. http://127.0.0.1:8011"));
-    ImGui::SetNextItemWidth(220);
-    ImGui::InputText((std::string(tr("Model")) + "##jev").c_str(), a.jev_model, sizeof a.jev_model);
-    tip(tr("The jev model name, e.g. julia-1"));
-    ImGui::SetNextItemWidth(220);
-    ImGui::InputText((std::string(tr("API key")) + "##jev").c_str(), a.jev_key, sizeof a.jev_key, ImGuiInputTextFlags_Password);
-    ImGui::SetNextItemWidth(120);
-    ImGui::InputInt((std::string(tr("Timeout (s)")) + "##jev").c_str(), &c.jev_timeout);
-    tip(tr("Give up on a request after this many seconds"));
-
-    }
-
-    if (ImGui::CollapsingHeader(tr("Vision-language model (advanced, off by default)"))) {
-    ImGui::TextDisabled("%s", tr("Writes captions and reads text in screenshots. Needs a model server and a lot of memory."));
-    ImGui::Checkbox((std::string(tr("Enabled")) + "##vl").c_str(), &c.vl_enabled);
-    tip(tr("Use this service"));
-    ImGui::SetNextItemWidth(420);
-    ImGui::InputText("URL (OpenAI-compatible, e.g. http://127.0.0.1:11434/v1)##vl", a.vl_url, sizeof a.vl_url);
-    tip(tr("The vision model server's address"));
-    ImGui::SetNextItemWidth(520);
-    ImGui::InputText((std::string(tr("Model")) + "##vl").c_str(), a.vl_model, sizeof a.vl_model);
-    tip(tr("The vision model name"));
-    ImGui::SetNextItemWidth(220);
-    ImGui::InputText((std::string(tr("API key")) + "##vl").c_str(), a.vl_key, sizeof a.vl_key, ImGuiInputTextFlags_Password);
-    tip(tr("Only for servers that need a key; stored in the settings file (mode 0600)"));
-    ImGui::SetNextItemWidth(160);
-    ImGui::InputText(tr("Tag language"), a.vl_lang, sizeof a.vl_lang);
-    ImGui::SetNextItemWidth(160);
-    ImGui::SliderInt(tr("Screenshot thumbnail side"), &c.vl_max_side, 384, 1024);
-    tip(tr("Size of the images sent to the vision model for screenshots and text"));
-    const char* devs[] = {tr("Auto (GPU when it fits)"), tr("CPU only")};
-    ImGui::SetNextItemWidth(220);
-    ImGui::Combo(tr("Run the model on (Ollama)"), &c.vl_device, devs, 2);
-    tip(tr("Where Ollama runs the vision model"));
-    ImGui::SetNextItemWidth(160);
-    ImGui::InputInt(tr("Context (Ollama num_ctx)"), &c.vl_num_ctx, 1024);
-    tip(tr("The vision model's context length"));
-    c.vl_num_ctx = std::clamp(c.vl_num_ctx, 2048, 65536);
-    ImGui::SetNextItemWidth(160);
-    ImGui::SliderInt(tr("Concurrency"), &c.vl_concurrency, 1, 8);
-    tip(tr("How many photos the vision model handles at once"));
-    ImGui::SetNextItemWidth(120);
-    ImGui::InputInt((std::string(tr("Timeout (s)")) + "##vl").c_str(), &c.vl_timeout);
-    tip(tr("Give up on a request after this many seconds"));
-    ImGui::Checkbox(tr("JSON mode"), &c.vl_json_mode);
-    tip(tr("Ask the vision model for strict JSON answers"));
-
-    }
-
-    if (ImGui::CollapsingHeader(tr("Decision rules (advanced)"))) {
-    ImGui::SetNextItemWidth(200);
-    ImGui::SliderFloat(tr("Review below confidence"), &c.review_below, 0, 1, "%.2f");
-    tip(tr("Dates less sure than this are marked uncertain"));
-    ImGui::SetNextItemWidth(200);
-    ImGui::SliderFloat(tr("Ask jev when margin below"), &c.jev_margin, 0.5f, 1, "%.2f");
-    tip(tr("jev is asked when the best two date answers are this close"));
-    ImGui::SetNextItemWidth(200);
-    ImGui::SliderFloat(tr("Jev weight (dates)"), &c.jev_date_weight, 0, 1, "%.2f");
-    tip(tr("How much jev's answer counts in a close date decision"));
-    ImGui::TextUnformatted(tr("Location vote weights"));
-    ImGui::SetNextItemWidth(140);
-    ImGui::SliderFloat(tr("Rules"), &c.loc_w_rules, 0, 1, "%.2f");
-    tip(tr("Weight of the folder-name rules in the place vote"));
+    ImGui::Dummy(ImVec2(0, 10));
+    ImGui::SetCursorPosX(g_card.x0);
+    if (ImGui::Button(tr("Test connections"))) check_health(a);
+    tip(tr("Check image recognition, the language model and jev now"));
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(140);
-    ImGui::SliderFloat("VL", &c.loc_w_vl, 0, 1, "%.2f");
-    tip(tr("Weight of the vision model in the place vote"));
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(140);
-    ImGui::SliderFloat("jev", &c.loc_w_jev, 0, 1, "%.2f");
-    ImGui::SetNextItemWidth(200);
-    ImGui::SliderFloat(tr("Accept location at"), &c.loc_accept, 0, 1, "%.2f");
-    tip(tr("A place needs at least this score to be used"));
-    ImGui::SetNextItemWidth(120);
-    ImGui::InputInt(tr("Minimum year"), &c.min_year);
-    tip(tr("Dates before this year are treated as wrong"));
-    ImGui::SetNextItemWidth(160);
-    ImGui::SliderInt(tr("Scan threads"), &c.scan_threads, 1, 16);
-    tip(tr("Files read in parallel while scanning"));
-    }
-    ImGui::EndDisabled();
+    ImGui::TextDisabled("%s", tr("Changes are saved as you make them."));
+    ImGui::Dummy(ImVec2(0, 10));
 
-    ImGui::Spacing();
-    ImGui::BeginDisabled(busy);
-    if (primary_button(tr("Save settings"), tr("Keep these settings (they are also used by the command line)"), ImVec2(160, 0))) {
+    if (g_dirty) {  // keep it: the text fields, then the file (the command line reads it too)
         c.output = util::trim(a.lib_buf);
         c.jev_url = a.jev_url;
         c.jev_model = a.jev_model;
@@ -3342,16 +3489,12 @@ static void draw_settings(App& a) {
         c.llm_key = a.llm_key;
         c.jev_timeout = std::clamp(c.jev_timeout, 1, 600);
         c.vl_timeout = std::clamp(c.vl_timeout, 5, 3600);
+        c.llm_timeout = std::clamp(c.llm_timeout, 1, 3600);
         save_config(c, a.config_file);
         if (!a.db.is_open()) open_db(a);
-        check_health(a);
-        a.toast = tr("Saved");
-        a.toast_until = glfwGetTime() + 2;
+        static double last_health = 0;
+        if (glfwGetTime() - last_health > 2) { last_health = glfwGetTime(); check_health(a); }
     }
-    ImGui::EndDisabled();
-    ImGui::SameLine();
-    if (ImGui::Button(tr("Test connections"), ImVec2(160, 0))) check_health(a);
-    tip(tr("Check the jev, LLM and CLIP status now"));
     ImGui::EndChild();
 }
 
@@ -4332,7 +4475,7 @@ static void draw_topbar(App& a) {
     ImGui::TextUnformatted(title.c_str());
     ImGui::PopFont();
     ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 12, full * 0.22f));
-    float right_w = 400 + (a.cfg.system_titlebar ? 0 : ImGui::GetFrameHeight() * 3.9f + 16);
+    float right_w = 330 + ImGui::GetFrameHeight() * 1.3f * (a.cfg.system_titlebar ? 2 : 5) + (a.cfg.system_titlebar ? 0 : 20);
     float sw = std::max(240.0f, full - ImGui::GetCursorPosX() - right_w);
     draw_search(a, sw);
     ImGui::SameLine(0, 6);
@@ -4381,17 +4524,18 @@ static void draw_topbar(App& a) {
     if (primary_button(tr("Analyze"), tr("Scan your folders for new or changed photos and update dates, tags and the lists to review. Nothing in your files changes.")))
         request_analyze(a);
     ImGui::EndDisabled();
-    ImGui::SameLine(0, 10);
-    ImGui::SameLine(0, 10);
-    if (ImGui::Button(ICON_HELP)) a.show_help = !a.show_help;
+    // The top-right corner: help and settings, then the window buttons at the very edge.
+    float bw = ImGui::GetFrameHeight() * 1.3f, sp = 2, gap = 14;
+    bool own = !a.cfg.system_titlebar;
+    float corner = bw * 2 + sp + (own ? gap + bw * 3 + sp * 2 : 0);
+    ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 12, ImGui::GetWindowContentRegionMax().x - corner));
+    if (ImGui::Button(ICON_HELP, ImVec2(bw, 0))) a.show_help = !a.show_help;
     tip(tr("Help: what is what, keys, search syntax, credits"));
-    ImGui::SameLine(0, 2);
-    if (ImGui::Button(ICON_SETTINGS)) a.show_settings = !a.show_settings;
+    ImGui::SameLine(0, sp);
+    if (ImGui::Button(ICON_SETTINGS, ImVec2(bw, 0))) a.show_settings = !a.show_settings;
     tip(tr("Settings (Ctrl+,)"));
-    if (!a.cfg.system_titlebar) {
-        // Window buttons at the very right edge, like the desktop's own.
-        float bw = ImGui::GetFrameHeight() * 1.3f, sp = 2;
-        ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 12, ImGui::GetWindowContentRegionMax().x - bw * 3 - sp * 2));
+    if (own) {
+        ImGui::SameLine(0, gap);
         if (ImGui::Button(ICON_MINUS, ImVec2(bw, 0))) glfwIconifyWindow(a.win);
         tip(tr("Minimise"));
         ImGui::SameLine(0, 2);
