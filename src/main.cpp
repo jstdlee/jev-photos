@@ -663,6 +663,15 @@ static void load_settings_buffers(App& a) {
     a.settings_loaded = true;
 }
 
+// View all folders at once (or go back to one).
+static void set_view_all(App& a, bool all) {
+    a.cfg.view_all = all && a.cfg.folders.size() > 1;
+    save_config(a.cfg, a.config_file);
+    a.month.clear();
+    a.selected = 0;
+    a.rows_dirty = a.dups_dirty = true;
+}
+
 static void set_folder(App& a, const std::string& f_in) {
     std::error_code ec;
     std::string f = std::filesystem::weakly_canonical(util::trim(f_in), ec).string();
@@ -674,6 +683,7 @@ static void set_folder(App& a, const std::string& f_in) {
         return;
     }
     remember_folder(a.cfg, f);
+    a.cfg.view_all = false;
     snprintf(a.folder_buf, sizeof a.folder_buf, "%s", f.c_str());
     save_config(a.cfg, a.config_file);
     a.month.clear();
@@ -682,18 +692,16 @@ static void set_folder(App& a, const std::string& f_in) {
 }
 
 static void start_run(App& a, int stages, bool force_preview = false) {
-    if (a.cfg.folder.empty()) {  // nothing chosen yet: ask for the folder first
+    if (a.cfg.folders.empty()) {  // nothing chosen yet: ask for the folder first
         start_dir_dialog(a, 3);
         return;
     }
     if (!a.db.is_open() && !open_db(a)) return;
-    if (!util::dir_exists(a.cfg.folder)) {
-        a.log.add(2, "folder not found: " + a.cfg.folder);
-        return;
-    }
+    for (auto& f : a.cfg.folders)
+        if (!util::dir_exists(f)) a.log.add(1, "folder not found (skipped): " + f);
     RunOptions o = a.opts;
     o.stages = stages;
-    o.scope = a.cfg.folder;
+    o.scope = all_scope(a.cfg);  // every folder in the list, together
     o.plan_only = (stages & ST_ORGANIZE) && (a.cfg.preview_first || force_preview || a.cfg.dry_run);
     a.last_run_planned = o.plan_only;
     a.last_stages = stages;
@@ -708,7 +716,7 @@ static void apply_plan(App& a) {
     RunOptions o = a.opts;
     o.stages = ST_ORGANIZE;
     o.apply_plan = true;
-    o.scope = a.cfg.folder;
+    o.scope = all_scope(a.cfg);  // every folder in the list, together
     a.last_run_planned = false;
     a.last_stages = ST_ORGANIZE;
     a.show_plan_tab = true;
@@ -717,6 +725,13 @@ static void apply_plan(App& a) {
 
 // ---------------------------------------------------------------------------
 // UI pieces
+
+// A path as shown: relative to the photo folder it is in (prefixed with that folder's name when there are several).
+static std::string rel_path(const Config& c, const std::string& p) {
+    for (auto& f : c.folders)
+        if (util::starts_with(p, f + "/")) return (c.folders.size() > 1 ? util::basename(f) + "/" : std::string()) + p.substr(f.size() + 1);
+    return p;
+}
 
 static void status_dot(int ok, const char* label, const std::string& detail) {
     // green = answered the last automatic test, yellow = down / not ready, gray = not tested yet (or disabled)
@@ -767,26 +782,72 @@ static void draw_toolbar(App& a) {
     bool busy = a.pipe->running();
     ImVec4 acc(a.cfg.accent[0], a.cfg.accent[1], a.cfg.accent[2], 1);
 
+    // Folders: a list scanned together; the selector shows one folder or all of them.
     ImGui::BeginDisabled(busy);
     ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted(tr("Photo folder"));
+    ImGui::TextUnformatted(tr(a.cfg.folders.size() > 1 ? "Photo folders" : "Photo folder"));
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(std::max(220.0f, ImGui::GetContentRegionAvail().x - 430));
-    if (ImGui::InputTextWithHint("##folder", tr("choose the folder with your photos"), a.folder_buf, sizeof a.folder_buf,
-                                 ImGuiInputTextFlags_EnterReturnsTrue))
-        set_folder(a, a.folder_buf);
-    if (ImGui::IsItemDeactivatedAfterEdit()) set_folder(a, a.folder_buf);
-    ImGui::SameLine(0, 2);
-    if (ImGui::ArrowButton("##recent", ImGuiDir_Down)) ImGui::OpenPopup("recent");
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tr("Recent folders"));
-    if (ImGui::BeginPopup("recent")) {
-        if (a.cfg.recent.empty()) ImGui::TextDisabled("%s", tr("No recent folders"));
-        for (auto& r : std::vector<std::string>(a.cfg.recent))
-            if (ImGui::Selectable(r.c_str(), r == a.cfg.folder)) set_folder(a, r);
+    ImGui::SetNextItemWidth(std::max(220.0f, ImGui::GetContentRegionAvail().x - 470));
+    std::string cur = a.cfg.folders.empty() ? std::string(tr("choose the folder with your photos"))
+                    : a.cfg.view_all ? util::fmt("%s (%zu)", tr("All folders"), a.cfg.folders.size()) : a.cfg.folder;
+    if (ImGui::BeginCombo("##folders", cur.c_str())) {
+        if (a.cfg.folders.size() > 1 && ImGui::Selectable(util::fmt("%s (%zu)", tr("All folders"), a.cfg.folders.size()).c_str(), a.cfg.view_all))
+            set_view_all(a, true);
+        for (auto& f : std::vector<std::string>(a.cfg.folders))
+            if (ImGui::Selectable(f.c_str(), !a.cfg.view_all && f == a.cfg.folder)) set_folder(a, f);
+        if (a.cfg.folders.empty()) ImGui::TextDisabled("%s", tr("No folders yet: press Add."));
+        ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered() && a.cfg.folders.size() > 1)
+        ImGui::SetTooltip("%s", tr("Analyze scans every folder in the list. Here you choose what the tabs show: one folder or all."));
+    ImGui::SameLine();
+    if (ImGui::Button(tr("+ Add..."))) start_dir_dialog(a, 3);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tr("Add a photo folder to the list"));
+    ImGui::SameLine();
+    if (ImGui::Button(util::fmt("%s (%zu)", tr("Folders"), a.cfg.folders.size()).c_str())) ImGui::OpenPopup("folders");
+    if (ImGui::BeginPopup("folders")) {
+        ImGui::TextDisabled("%s", tr("Scanned together by Analyze. Removing a folder only takes it off the list: no file is touched."));
+        std::string remove;
+        if (ImGui::BeginTable("fl", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
+            for (auto& f : a.cfg.folders) {
+                ImGui::TableNextRow();
+                ImGui::PushID(f.c_str());
+                ImGui::TableNextColumn();
+                bool exists = util::dir_exists(f);
+                if (exists) ImGui::TextUnformatted(f.c_str());
+                else ImGui::TextColored(ImVec4(0.95f, 0.6f, 0.4f, 1), "%s  (%s)", f.c_str(), tr("not found"));
+                ImGui::TableNextColumn();
+                if (ImGui::SmallButton(tr("Open"))) run_detached({"xdg-open", f});
+                ImGui::TableNextColumn();
+                if (ImGui::SmallButton(tr("Remove"))) remove = f;
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        if (!remove.empty()) {
+            remove_folder(a.cfg, remove);
+            save_config(a.cfg, a.config_file);
+            a.month.clear();
+            a.selected = 0;
+            a.rows_dirty = a.dups_dirty = true;
+        }
+        ImGui::Separator();
+        ImGui::SetNextItemWidth(420);
+        bool go = ImGui::InputTextWithHint("##addpath", tr("type or paste a folder path"), a.folder_buf, sizeof a.folder_buf, ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::SameLine();
+        if ((ImGui::Button(tr("Add")) || go) && a.folder_buf[0]) set_folder(a, a.folder_buf);
+        ImGui::SameLine();
+        if (ImGui::Button(tr("Browse..."))) start_dir_dialog(a, 3);
+        std::vector<std::string> again;
+        for (auto& r : a.cfg.recent)
+            if (std::find(a.cfg.folders.begin(), a.cfg.folders.end(), r) == a.cfg.folders.end()) again.push_back(r);
+        if (!again.empty()) {
+            ImGui::TextDisabled("%s", tr("Recent folders (click to add again)"));
+            for (auto& r : again)
+                if (ImGui::Selectable(r.c_str())) set_folder(a, r);
+        }
         ImGui::EndPopup();
     }
-    ImGui::SameLine();
-    if (ImGui::Button(tr("Browse..."))) start_dir_dialog(a, 3);
     ImGui::EndDisabled();
     ImGui::SameLine(0, 16);
 
@@ -866,7 +927,7 @@ static void draw_toolbar(App& a) {
         if (p.errors) label += util::fmt("  ·  %d %s", p.errors.load(), tr("errors"));
     } else {
         std::lock_guard<std::mutex> l(p.mu);
-        label = p.summary.empty() ? (a.cfg.folder.empty() ? tr("Choose a photo folder, then press Analyze.") : tr("Ready. Press Analyze.")) : p.summary;
+        label = p.summary.empty() ? (a.cfg.folders.empty() ? tr("Choose a photo folder, then press Analyze.") : tr("Ready. Press Analyze.")) : p.summary;
     }
     g_prof.mark("tb:label");
     ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 60);
@@ -1100,7 +1161,7 @@ static void draw_viewer(App& a) {
     if (ImGui::Button(">")) { if (v.idx + 1 < int(v.ids.size())) v.idx++; }
     ImGui::SameLine();
     std::string name = p.src_path;
-    if (util::starts_with(name, a.cfg.folder + "/")) name = name.substr(a.cfg.folder.size() + 1);
+    name = rel_path(a.cfg, name);
     ImGui::Text("%d / %zu   %s   ·   %s   ·   %s", v.idx + 1, v.ids.size(), name.c_str(),
                 p.date_value.empty() ? tr("undated") : util::parse_db_datetime(p.date_value + "|" + p.date_prec).pretty().c_str(),
                 util::human_size(p.size).c_str());
@@ -1136,11 +1197,11 @@ static void trash_duplicates(App& a) {
     // restorable; without gio they go to <folder>/jev-duplicates instead of being deleted.
     std::vector<std::pair<int64_t, std::string>> todo;
     for (auto& r : a.dup_rows)
-        if (r.dup_of && path_under(r.src_path, a.cfg.folder)) todo.push_back({r.id, r.src_path});
+        if (r.dup_of && path_under(r.src_path, view_scope(a.cfg))) todo.push_back({r.id, r.src_path});
     if (todo.empty() || a.trash_busy.exchange(true)) return;
     a.trash_done = a.trash_failed = 0;
-    std::string folder = a.cfg.folder;
-    std::thread([&a, todo, folder] {
+    std::vector<std::string> folders = a.cfg.folders;
+    std::thread([&a, todo, folders] {
         bool gio = util::which("gio");
         std::vector<int64_t> gone;
         for (auto& [id, path] : todo) {
@@ -1148,6 +1209,9 @@ static void trash_duplicates(App& a) {
             if (!util::file_exists(path)) ok = true;
             else if (gio) ok = util::run({"gio", "trash", "--", path}, "", 30).rc == 0;
             else {
+                std::string folder = util::dirname(path);
+                for (auto& f : folders)
+                    if (path_under(path, f)) folder = f;
                 std::string dest = folder + "/jev-duplicates/" + path.substr(folder.size() + 1);
                 util::mkdirs(util::dirname(dest));
                 ok = !util::file_exists(dest) && rename(path.c_str(), dest.c_str()) == 0;
@@ -1172,7 +1236,7 @@ static void draw_overview(App& a) {
     a.on_overview = true;
     ImVec4 acc(a.cfg.accent[0], a.cfg.accent[1], a.cfg.accent[2], 1);
     bool busy = a.pipe->running();
-    if (a.cfg.folder.empty()) {
+    if (a.cfg.folders.empty()) {
         ImGui::Dummy(ImVec2(0, 40));
         ImGui::TextUnformatted(tr("Choose a folder of photos to begin."));
         ImGui::TextDisabled("%s", tr("Nothing in it is changed: organized copies are made in a jev-organized folder inside it, after you approve a preview."));
@@ -1333,7 +1397,7 @@ static void draw_overview(App& a) {
                     ImGui::TextUnformatted(tr(d.kind.c_str()));
                     ImGui::TableNextColumn();
                     std::string about = d.kind == "search" ? "\"" + d.subject + "\"  " + d.question
-                                                           : (util::starts_with(d.subject, a.cfg.folder + "/") ? d.subject.substr(a.cfg.folder.size() + 1) : d.subject);
+                                                           : rel_path(a.cfg, d.subject);
                     ImGui::PushID(int(d.id));
                     ImGui::Selectable(about.c_str(), false, ImGuiSelectableFlags_SpanAllColumns);
                     if (ImGui::IsItemHovered()) {  // the question and every option with jev's probability
@@ -1382,7 +1446,7 @@ static void draw_trash_modal(App& a) {
     int n = 0;
     int64_t bytes = 0;
     for (auto& r : a.dup_rows)
-        if (r.dup_of && path_under(r.src_path, a.cfg.folder)) {
+        if (r.dup_of && path_under(r.src_path, view_scope(a.cfg))) {
             n++;
             bytes += r.size;
             if (!group_no.count(r.dup_of)) group_no[r.dup_of] = int(group_no.size()) + 1;
@@ -1392,7 +1456,7 @@ static void draw_trash_modal(App& a) {
     ImGui::TextWrapped("%s", gio ? tr("They go to the desktop Trash, so they can be restored. The kept copy of every group stays where it is. Each file was confirmed identical byte by byte.")
                                  : tr("No desktop Trash is available: they are moved into jev-duplicates inside the folder instead. Nothing is deleted."));
     if (!a.cfg.verify_dupes) ImGui::TextColored(ImVec4(1, 0.6f, 0.4f, 1), "%s", tr("Byte-verify is off: turn it on and check duplicates again first."));
-    auto rel = [&](const std::string& p) { return util::starts_with(p, a.cfg.folder + "/") ? p.substr(a.cfg.folder.size() + 1) : p; };
+    auto rel = [&](const std::string& p) { return rel_path(a.cfg, p); };
     if (ImGui::BeginTable("trashlist", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_Resizable,
                           ImVec2(0, ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() - 8))) {
         ImGui::TableSetupScrollFreeze(0, 1);
@@ -1403,7 +1467,7 @@ static void draw_trash_modal(App& a) {
         ImGui::TableHeadersRow();
         std::vector<const DupRow*> rows;
         for (auto& r : a.dup_rows)
-            if (r.dup_of && path_under(r.src_path, a.cfg.folder)) rows.push_back(&r);
+            if (r.dup_of && path_under(r.src_path, view_scope(a.cfg))) rows.push_back(&r);
         std::stable_sort(rows.begin(), rows.end(), [&](const DupRow* x, const DupRow* y) { return group_no[x->dup_of] < group_no[y->dup_of]; });
         for (auto* r : rows) {
             ImGui::TableNextRow();
@@ -1491,6 +1555,15 @@ static void draw_detail(App& a) {
     if (ImGui::SmallButton(p.favorite ? "\xE2\x98\x85 Favorite" : "\xE2\x98\x86 Favorite")) set_favorite(a, p.id, !p.favorite);
     ImGui::PopStyleColor();
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tr("f also stars the selected photo"));
+    ImGui::SameLine();
+    if (ImGui::SmallButton(tr("Find similar"))) {  // CLIP image-to-image: like:#id in the search box
+        snprintf(a.search, sizeof a.search, "like:#%lld", (long long)p.id);
+        if (a.search_mode != SM_SMART && a.search_mode != SM_KEYWORD) a.search_mode = SM_SMART;
+        a.month.clear();
+        a.rows_dirty = true;
+        a.start_tab = "photos";
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tr("Photos that look like this one (CLIP); also: like:#id or like:<file name> in the search box"));
     ImGui::SameLine();
     if (ImGui::SmallButton(tr("Open file"))) run_detached({"xdg-open", open_target});
     ImGui::SameLine();
@@ -1669,7 +1742,7 @@ static bool date_picker(const char* id, std::string& value, const char* empty_la
 
 static void draw_photos(App& a) {
     double now = glfwGetTime();
-    if (a.cfg.folder.empty()) {
+    if (a.cfg.folders.empty()) {
         ImGui::Dummy(ImVec2(0, 60));
         float w = ImGui::GetContentRegionAvail().x;
         const char* msg = tr("Choose a folder of photos to begin.");
@@ -1725,7 +1798,7 @@ static void draw_photos(App& a) {
         a.search_translate = false;
     }
     if (ImGui::IsItemHovered() && a.search_mode != SM_ASK)
-        ImGui::SetTooltip("%s", tr("beach sunset      both\nbeach | sea, beach OR sea      either\n-night, NOT night, !night      without\n(beach | sea) -night      grouping\n\"new york\"      phrase\ntag:dog  name:IMG  desc:..  prompt:..  exif:canon      one field\nis:fav  is:ai  is:untagged\nWords in Chinese, Japanese or Korean also find English tags (and the other way round)."));
+        ImGui::SetTooltip("%s", tr("beach sunset      both\nbeach | sea, beach OR sea      either\n-night, NOT night, !night      without\n(beach | sea) -night      grouping\n\"new york\"      phrase\n~webiste      close spellings too\ntag:dog  name:IMG  desc:..  prompt:..  exif:..  place:paris      one field\ncamera:canon  model:sdxl  lora:ink      camera / generator\ndate:2019  date:2019-05..2019-08  date:>2020  year:2018..2020\nsize:>2mb  w:>3000  h:<1000  mp:>12  ext:png  ext:raw\nis:fav  is:ai  is:untagged  is:uncertain  is:portrait  is:landscape\nhas:gps  has:prompt  has:place  has:desc  has:keywords\nlike:#123  like:IMG_0042      looks like that photo\nWords in Chinese, Japanese or Korean also find English tags (and the other way round)."));
     ImGui::SameLine();
     const char* modes[] = {tr("Smart"), tr("Words"), tr("Meaning"), tr("Regex"), tr("Ask (AI)")};
     ImGui::SetNextItemWidth(110);
@@ -1882,7 +1955,7 @@ static void draw_photos(App& a) {
                 if (ImGui::IsItemHovered() && r.width) ImGui::SetTooltip("%d x %d px, %lld bytes", r.width, r.height, (long long)r.size);
                 ImGui::TableNextColumn();
                 std::string shown = r.src_path;
-                if (util::starts_with(shown, a.cfg.folder + "/")) shown = shown.substr(a.cfg.folder.size() + 1);
+                shown = rel_path(a.cfg, shown);
                 if (r.dup_of) ImGui::TextDisabled("%s  (%s)", shown.c_str(), tr("duplicate"));
                 else ImGui::TextUnformatted(shown.c_str());
                 if (ImGui::IsItemHovered() && !r.dest_path.empty()) ImGui::SetTooltip("-> %s", r.dest_path.c_str());
@@ -1955,7 +2028,7 @@ static void draw_plan_controls(App& a) {
     ImGui::EndDisabled();
     if (changed) {
         save_config(c, a.config_file);
-        if (!busy && !a.cfg.folder.empty()) start_run(a, ST_ORGANIZE, true);  // show the new list right away
+        if (!busy && !a.cfg.folders.empty()) start_run(a, ST_ORGANIZE, true);  // show the new list right away
     }
 }
 
@@ -1972,7 +2045,7 @@ static void draw_plan(App& a) {
             ImGui::TextWrapped("%s", util::fmt(tr("Nothing to do: all %d photos are already organized and their metadata is up to date. To add missing fields to the files, choose \"Add metadata only\"."), a.stats.organized).c_str());
         else
             ImGui::TextWrapped("%s", tr("Nothing to review yet. Press Analyze: every copy, rename and metadata addition is listed here first, and nothing changes until you press Apply."));
-        ImGui::BeginDisabled(busy || a.cfg.folder.empty());
+        ImGui::BeginDisabled(busy || a.cfg.folders.empty());
         if (ImGui::Button(tr("Build the list"))) start_run(a, ST_ORGANIZE, true);
         ImGui::EndDisabled();
         return;
@@ -2050,7 +2123,7 @@ static void draw_plan(App& a) {
     ImGuiTableFlags tf = ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable |
                          ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingFixedFit;
     auto rel = [&](const std::string& p) {
-        return util::starts_with(p, a.cfg.folder + "/") ? p.substr(a.cfg.folder.size() + 1) : p;
+        return rel_path(a.cfg, p);
     };
     if (ImGui::BeginTable("plan", 8, tf, ImVec2(0, ImGui::GetContentRegionAvail().y - detail_h))) {
         ImGui::TableSetupScrollFreeze(1, 1);
@@ -2217,7 +2290,7 @@ static void draw_tags(App& a) {
     if (ImGui::Button(tr("Tag untagged photos"))) {
         RunOptions o = a.opts;
         o.stages = ST_TAG;
-        o.scope = c.folder;
+        o.scope = all_scope(c);
         a.last_stages = ST_TAG;
         a.pipe->start(effective(c), o);
     }
@@ -2226,7 +2299,7 @@ static void draw_tags(App& a) {
     if (ImGui::Button(tr("Re-tag all"))) {
         RunOptions o = a.opts;
         o.stages = ST_TAG;
-        o.scope = c.folder;
+        o.scope = all_scope(c);
         o.retag_all = true;
         a.last_stages = ST_TAG;
         a.pipe->start(effective(c), o);
@@ -2357,7 +2430,7 @@ static void draw_tags(App& a) {
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();
                 ImGui::PushID(int(r.id));
-                std::string shown = util::starts_with(r.src_path, c.folder + "/") ? r.src_path.substr(c.folder.size() + 1) : r.src_path;
+                std::string shown = rel_path(c, r.src_path);
                 if (ImGui::Selectable(shown.c_str(), a.tags_sel == r.id, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick)) {
                     a.tags_sel = r.id;
                     if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) open_viewer(a, ids(), k);
@@ -2697,7 +2770,7 @@ static void draw_corrections(App& a) {
     if (ImGui::Button(tr("Check again"))) {
         RunOptions o = a.opts;
         o.stages = ST_FIX;
-        o.scope = a.cfg.folder;
+        o.scope = all_scope(a.cfg);  // every folder in the list, together
         o.recheck_all = true;
         a.last_stages = ST_FIX;
         a.pipe->start(effective(a.cfg), o);
@@ -2806,7 +2879,7 @@ static void draw_corrections(App& a) {
 }
 
 static void draw_dupes(App& a) {
-    if (a.cfg.folder.empty()) {
+    if (a.cfg.folders.empty()) {
         ImGui::TextWrapped("%s", tr("Choose a folder of photos to begin."));
         return;
     }
@@ -3462,15 +3535,15 @@ static int cli_explain(const Config& c, const std::string& file, const std::stri
 }
 
 static int run_cli(App& a, bool dry) {
-    if (a.cfg.folder.empty()) {
-        fprintf(stderr, "usage: jev-photos --cli FOLDER   (the folder with your photos)\n");
+    if (a.cfg.folders.empty()) {
+        fprintf(stderr, "usage: jev-photos --cli FOLDER [FOLDER...]   (the folders with your photos)\n");
         return 2;
     }
     if (!open_db(a)) return 2;
     a.log.echo = true;
-    a.opts.scope = a.opts.scope.empty() ? a.cfg.folder : fs::weakly_canonical(a.opts.scope).string();
+    a.opts.scope = a.opts.scope.empty() ? all_scope(a.cfg) : fs::weakly_canonical(a.opts.scope).string();
     a.opts.plan_only = dry;
-    fprintf(stderr, "folder %s\norganized copies -> %s\n", a.cfg.folder.c_str(), output_dir(a.cfg).c_str());
+    for (auto& f : a.cfg.folders) fprintf(stderr, "folder %s\norganized copies -> %s\n", f.c_str(), library_for(effective(a.cfg), f).c_str());
     a.pipe->start(effective(a.cfg), a.opts);
     bool tty = isatty(2);
     while (a.pipe->running()) {
@@ -3595,7 +3668,13 @@ int main(int argc, char** argv) {
         else if (!a.empty() && a[0] != '-') srcs.push_back(a);  // positional: the photo folder
         else { fprintf(stderr, "unknown option %s\n", a.c_str()); usage(); return 2; }
     }
-    if (!srcs.empty()) app.cfg.folder = fs::weakly_canonical(srcs[0]).string();
+    if (!srcs.empty()) {
+        // Folders on the command line: the CLI works on exactly those (together); the GUI adds them to its list.
+        if (cli) app.cfg.folders.clear();
+        for (auto& f : srcs) add_folder(app.cfg, fs::weakly_canonical(f).string());
+        app.cfg.folder = fs::weakly_canonical(srcs[0]).string();
+        app.cfg.view_all = cli && srcs.size() > 1;
+    }
     if (!lib.empty()) app.cfg.output = fs::weakly_canonical(lib).string();
     if (save_cfg) save_config(app.cfg, app.config_file);
     signal(SIGINT, [](int) { g_quit = 1; });
@@ -3606,7 +3685,7 @@ int main(int argc, char** argv) {
         if (!open_db(app)) return 2;
         std::vector<DupRow> rows;
         for (auto& r : app.db.dup_rows(false))
-            if (app.cfg.folder.empty() || path_under(r.src_path, app.cfg.folder)) rows.push_back(r);
+            if (app.cfg.folders.empty() || path_under(r.src_path, view_scope(app.cfg))) rows.push_back(r);
         std::map<int64_t, const DupRow*> by;
         std::map<int64_t, std::vector<const DupRow*>> exact, similar;
         for (auto& r : rows) by[r.id] = &r;
@@ -3628,11 +3707,11 @@ int main(int argc, char** argv) {
     }
     if (show_corrections) {  // --corrections: list the pending correction proposals
         if (!open_db(app)) return 2;
-        auto cs = app.db.corrections(app.cfg.folder, true);
+        auto cs = app.db.corrections(view_scope(app.cfg), true);
         for (auto& k : cs) {
             std::string what = k.field == "name" ? "rename " + k.current + " -> " + k.proposed : (k.action == "remove" ? "- " + k.current : "+ " + k.proposed);
             std::string path = k.path;
-            if (util::starts_with(path, app.cfg.folder + "/")) path = path.substr(app.cfg.folder.size() + 1);
+            path = rel_path(app.cfg, path);
             printf("%3.0f%%  %-34s %-28s %s  [%s]\n", k.confidence * 100, path.substr(0, 34).c_str(), what.c_str(), k.reason.c_str(), k.source.c_str());
         }
         printf("%zu pending corrections\n", cs.size());
@@ -3641,16 +3720,16 @@ int main(int argc, char** argv) {
     if (!search.empty() || stats || !sq.date_from.empty() || !sq.date_to.empty()) {
         if (!open_db(app)) return 2;
         if (stats) {
-            DbStats s = app.db.stats(app.cfg.folder);
+            DbStats s = app.db.stats(view_scope(app.cfg));
             printf("photos %d (%s)  resolved %d  needs-review %d  undated %d  located %d  described %d  organized %d\n"
                    "duplicates %d (%s reclaimable)  similar %d\n",
                    s.total, util::human_size(s.total_bytes).c_str(), s.resolved, s.review, s.undated, s.located, s.vision_done, s.organized,
                    s.dups, util::human_size(s.dup_bytes).c_str(), s.similar);
-            for (auto& m : app.db.months(app.cfg.folder)) printf("  %-8s %5d  %s\n", m.month.c_str(), m.count, util::human_size(m.bytes).c_str());
+            for (auto& m : app.db.months(view_scope(app.cfg))) printf("  %-8s %5d  %s\n", m.month.c_str(), m.count, util::human_size(m.bytes).c_str());
         }
         if (!search.empty() || !sq.date_from.empty() || !sq.date_to.empty()) {
             Searcher se;
-            se.load(app.db, app.cfg.folder, 0);
+            se.load(app.db, view_scope(app.cfg), 0);
             sq.text = search;
             sq.translate = true;  // the CLI waits for the LLM's other-language equivalents
             SearchResult sr = se.run(app.cfg, sq);
@@ -3662,13 +3741,13 @@ int main(int argc, char** argv) {
                         d.changed ? " (changed)" : "");
             }
             std::map<int64_t, PhotoRow> rows;
-            for (auto& r : app.db.query("", false, "", 1000000, app.cfg.folder)) rows[r.id] = r;
+            for (auto& r : app.db.query("", false, "", 1000000, view_scope(app.cfg))) rows[r.id] = r;
             for (auto& h : sr.hits) {
                 auto it = rows.find(h.id);
                 if (it == rows.end()) continue;
                 const PhotoRow& r = it->second;
                 std::string path = r.dest_path.empty() ? r.src_path : r.dest_path;
-                if (!app.cfg.folder.empty() && util::starts_with(path, app.cfg.folder + "/")) path = path.substr(app.cfg.folder.size() + 1);
+                path = rel_path(app.cfg, path);
                 printf("%.2f  %-10s  %-44s  %s\n", h.score, r.date_value.substr(0, 10).c_str(), path.c_str(), h.why.c_str());
             }
             fprintf(stderr, "%zu matches (%s, %zu photos searched)\n", sr.hits.size(), search_mode_name(sq.mode), se.size());
@@ -3771,10 +3850,10 @@ int main(int argc, char** argv) {
         }
         // Views are rebuilt by the worker: on demand, and every 1.5 s while a run is going.
         double now = glfwGetTime();
-        if (!app.cfg.folder.empty() && (app.rows_dirty || app.dups_dirty || (app.pipe->running() && now - app.last_refresh > 1.5))) {
+        if (!app.cfg.folders.empty() && (app.rows_dirty || app.dups_dirty || (app.pipe->running() && now - app.last_refresh > 1.5))) {
             ViewRequest vr;
             vr.month = app.month;
-            vr.folder = app.cfg.folder;
+            vr.folder = view_scope(app.cfg);
             vr.review_only = app.review_only;
             vr.dup_similar = app.dup_show_similar;
             vr.sq.text = util::trim(app.search);

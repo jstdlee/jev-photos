@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <map>
 #include <regex>
 #include <functional>
@@ -137,7 +138,8 @@ double Searcher::match(const Query& q, size_t i) const {
 // Query language
 
 namespace {
-const std::set<std::string> kFields = {"name", "tag", "desc", "prompt", "exif", "is"};
+const std::set<std::string> kFields = {"name", "tag", "desc", "prompt", "exif", "is", "has", "date", "year", "size", "width", "w", "height",
+                                       "h", "mp", "ext", "type", "place", "loc", "camera", "like", "model", "lora"};
 
 struct Tok {
     enum K { WORD, LP, RP, OR, AND, NOT } k;
@@ -155,6 +157,13 @@ std::vector<Tok> tokenize(const std::string& q) {
         if (ch == '|') { out.push_back({Tok::OR, "", ""}); i++; continue; }
         if (ch == '&') { out.push_back({Tok::AND, "", ""}); i++; continue; }
         if ((ch == '!' || ch == '-') && i + 1 < q.size() && !isspace((unsigned char)q[i + 1])) { out.push_back({Tok::NOT, "", ""}); i++; continue; }
+        if (ch == '~' && i + 1 < q.size() && !isspace((unsigned char)q[i + 1])) {  // ~word: close spellings too
+            size_t e = i + 1;
+            while (e < q.size() && !isspace((unsigned char)q[e]) && q[e] != ')' && q[e] != '|') e++;
+            out.push_back({Tok::WORD, util::lower(q.substr(i + 1, e - i - 1)), "fuzzy"});
+            i = e;
+            continue;
+        }
         std::string field;
         // field:value
         size_t colon = q.find(':', i);
@@ -244,7 +253,8 @@ QNode parse_query(const std::string& q, std::string& err) {
 
 void query_terms(const QNode& n, std::vector<std::string>& out) {
     if (n.kind == QNode::TERM) {
-        if (!n.term.empty() && n.field != "is" && n.field != "exif") out.push_back(n.term);
+        static const std::set<std::string> free_text = {"", "name", "tag", "desc", "prompt", "place", "loc"};
+        if (!n.term.empty() && free_text.count(n.field)) out.push_back(n.term);
     } else {
         for (auto& k : n.kids) query_terms(k, out);
     }
@@ -538,6 +548,83 @@ SearchResult Searcher::run(const Config& cfg, const SearchQuery& q) {
 // Query-language search: every leaf is a word (or its equivalents) in the chosen fields, or (Smart mode, no field)
 // something the picture shows.
 
+namespace {
+// "2mb", "500kb", "12mp", "1024" -> number (bytes / pixels / plain)
+double parse_amount(std::string v) {
+    v = util::lower(v);
+    double mul = 1;
+    for (auto [suf, m] : std::initializer_list<std::pair<const char*, double>>{{"gb", 1e9}, {"mb", 1e6}, {"kb", 1e3}, {"mp", 1e6}, {"k", 1e3}, {"m", 1e6}, {"b", 1}})
+        if (v.size() > strlen(suf) && v.compare(v.size() - strlen(suf), strlen(suf), suf) == 0) { mul = m; v = v.substr(0, v.size() - strlen(suf)); break; }
+    return atof(v.c_str()) * mul;
+}
+// ">2mb", "<=1000", "2..5mb", plain = equal within 10%
+bool compare_amount(double x, const std::string& spec) {
+    if (spec.find("..") != std::string::npos) {
+        std::string a = spec.substr(0, spec.find("..")), b = spec.substr(spec.find("..") + 2);
+        std::string unit;
+        for (size_t i = b.size(); i > 0 && isalpha((unsigned char)b[i - 1]); i--) unit = b[i - 1] + unit;
+        bool a_unit = !a.empty() && isalpha((unsigned char)a.back());
+        return (a.empty() || x >= parse_amount(a_unit ? a : a + unit)) && (b.empty() || x <= parse_amount(b));
+    }
+    if (util::starts_with(spec, ">=")) return x >= parse_amount(spec.substr(2));
+    if (util::starts_with(spec, "<=")) return x <= parse_amount(spec.substr(2));
+    if (util::starts_with(spec, ">")) return x > parse_amount(spec.substr(1));
+    if (util::starts_with(spec, "<")) return x < parse_amount(spec.substr(1));
+    double v = parse_amount(spec);
+    return std::fabs(x - v) <= 0.1 * v;
+}
+// date:2019, date:2019-05, date:2019-05-01..2019-08-31, date:>2020, year:2018..2020
+bool match_date(const SearchDoc& d, const std::string& spec) {
+    if (d.date.size() < 4) return spec == "none" || spec == "undated";
+    auto lo_of = [](std::string v) { return v.size() == 4 ? v + "-01-01" : v.size() == 7 ? v + "-01" : v; };
+    auto hi_of = [](std::string v) { return v.size() == 4 ? v + "-12-31" : v.size() == 7 ? v + "-31" : v; };
+    std::string from, to;
+    if (spec.find("..") != std::string::npos) { from = spec.substr(0, spec.find("..")); to = spec.substr(spec.find("..") + 2); }
+    else if (util::starts_with(spec, ">=")) from = spec.substr(2);
+    else if (util::starts_with(spec, "<=")) to = spec.substr(2);
+    else if (util::starts_with(spec, ">")) { from = spec.substr(1); if (from.size() == 4) from = std::to_string(atoi(from.c_str()) + 1); }
+    else if (util::starts_with(spec, "<")) { to = spec.substr(1); if (to.size() == 4) to = std::to_string(atoi(to.c_str()) - 1); }
+    else { from = spec; to = spec; }
+    return date_in_range(d.date, d.prec, from.empty() ? "" : lo_of(from), to.empty() ? "" : hi_of(to));
+}
+// Edit distance with an early exit (bytes; fine for typos).
+int edit_distance(const std::string& a, const std::string& b, int limit) {
+    if (std::abs(int(a.size()) - int(b.size())) > limit) return limit + 1;
+    std::vector<int> prev(b.size() + 1), cur(b.size() + 1);
+    for (size_t j = 0; j <= b.size(); j++) prev[j] = int(j);
+    for (size_t i = 1; i <= a.size(); i++) {
+        cur[0] = int(i);
+        int best = cur[0];
+        for (size_t j = 1; j <= b.size(); j++) {
+            cur[j] = std::min({prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1)});
+            best = std::min(best, cur[j]);
+        }
+        if (best > limit) return limit + 1;
+        std::swap(prev, cur);
+    }
+    return prev[b.size()];
+}
+// The word of `text` closest to `w` within the allowed typos, or "".
+std::string fuzzy_word(const std::string& text, const std::string& w) {
+    int limit = w.size() <= 4 ? 1 : 2;
+    std::string word, best;
+    int best_d = limit + 1;
+    auto flush = [&] {
+        if (word.size() + 2 >= w.size()) {
+            int dd = edit_distance(word, w, limit);
+            if (dd < best_d) { best_d = dd; best = word; }
+        }
+        word.clear();
+    };
+    for (unsigned char ch : text) {
+        if (isalnum(ch) || ch >= 0x80) word += char(ch);
+        else flush();
+    }
+    flush();
+    return best_d <= limit ? best : "";
+}
+}  // namespace
+
 SearchResult Searcher::run_logic(const Config& cfg, const SearchQuery& q, const std::vector<size_t>& pool, const QNode& root) {
     SearchResult res;
     std::map<std::string, Query> clip_q;
@@ -554,6 +641,16 @@ SearchResult Searcher::run_logic(const Config& cfg, const SearchQuery& q, const 
         if (ascii_only(en) && prepare(cfg, en, qq, cerr)) clip_q[n.term] = qq;
     };
     prep(root);
+    // like:<id> (or like:<part of a file name>): the embedding of that photo
+    std::map<std::string, Vec> like_target;
+    std::function<void(const QNode&)> likes = [&](const QNode& n) {
+        if (n.kind != QNode::TERM) { for (auto& k : n.kids) likes(k); return; }
+        if (n.field != "like" || n.term.empty()) return;
+        std::string t = n.term[0] == '#' ? n.term.substr(1) : n.term;
+        for (auto& d : docs_)
+            if (!d.vec.empty() && (std::to_string(d.id) == t || d.name.find(t) != std::string::npos)) { like_target[n.term] = d.vec; break; }
+    };
+    likes(root);
     // value > 0 = matches (the score adds up); NOT inverts.
     std::function<double(const QNode&, size_t, std::string*)> eval = [&](const QNode& n, size_t i, std::string* why) -> double {
         const SearchDoc& d = docs_[i];
@@ -576,11 +673,95 @@ SearchResult Searcher::run_logic(const Config& cfg, const SearchQuery& q, const 
             case QNode::TERM: break;
         }
         if (n.term.empty()) return 0.01;
+        auto note = [&](const std::string& w) {
+            if (why && why->size() < 90) *why += (why->empty() ? "" : " · ") + w;
+        };
         if (n.field == "is") {
             bool on = (n.term == "fav" || n.term == "favorite" || n.term == "favourite" || n.term == "star") ? d.favorite
                     : n.term == "ai" || n.term == "generated" ? !d.prompt_raw.empty()
-                    : n.term == "untagged" ? d.tags.empty() : false;
+                    : n.term == "untagged" ? d.tags.empty()
+                    : n.term == "uncertain" || n.term == "review" ? d.uncertain
+                    : n.term == "undated" ? d.date.empty()
+                    : n.term == "portrait" ? d.height > d.width && d.width > 0
+                    : n.term == "landscape" ? d.width > d.height && d.height > 0
+                    : n.term == "square" ? d.width == d.height && d.width > 0 : false;
             return on ? 0.5 : 0;
+        }
+        if (n.field == "has") {
+            bool on = n.term == "gps" ? d.has_gps
+                    : n.term == "prompt" ? !d.prompt_raw.empty()
+                    : n.term == "place" || n.term == "location" ? !d.location.empty() || d.has_gps
+                    : n.term == "tags" ? !d.tags.empty()
+                    : n.term == "desc" || n.term == "description" ? d.exif.find("xmp.dc.description") != std::string::npos
+                    : n.term == "keywords" ? d.exif.find("xmp.dc.subject") != std::string::npos || d.exif.find("keywords") != std::string::npos
+                    : n.term == "camera" ? d.exif.find("exif.image.model") != std::string::npos
+                    : n.term == "date" ? !d.date.empty() : false;
+            return on ? 0.5 : 0;
+        }
+        if (n.field == "date" || n.field == "year") {
+            if (!match_date(d, n.term)) return 0;
+            note("date " + d.date.substr(0, 10));
+            return 0.5;
+        }
+        if (n.field == "size") {
+            if (!compare_amount(double(d.size), n.term)) return 0;
+            note(util::human_size(d.size));
+            return 0.5;
+        }
+        if (n.field == "width" || n.field == "w" || n.field == "height" || n.field == "h") {
+            int v = n.field[0] == 'w' ? d.width : d.height;
+            if (!v || !compare_amount(v, n.term)) return 0;
+            note(util::fmt("%d x %d", d.width, d.height));
+            return 0.5;
+        }
+        if (n.field == "mp")
+            return d.width && compare_amount(double(d.width) * d.height, n.term.find_first_of("mk") == std::string::npos ? n.term + "mp" : n.term) ? 0.5 : 0;
+        if (n.field == "ext" || n.field == "type") {
+            std::string e = n.term == "jpeg" ? "jpg" : n.term;
+            bool raw = e == "raw" && std::string(" dng cr2 cr3 nef arw raf orf rw2 ").find(" " + d.ext + " ") != std::string::npos;
+            return d.ext == e || (e == "jpg" && d.ext == "jpeg") || raw ? 0.5 : 0;
+        }
+        if (n.field == "camera") {  // Make / Model / lens lines of the EXIF
+            for (auto& line : util::split(d.exif, '\n'))
+                if ((util::starts_with(line, "exif.image.make") || util::starts_with(line, "exif.image.model") || line.find("lensmodel") != std::string::npos) &&
+                    line.find(n.term) != std::string::npos) {
+                    note("camera: " + line.substr(std::min(line.size(), line.find('=') + 2)));
+                    return 1.0;
+                }
+            return 0;
+        }
+        if (n.field == "model" || n.field == "lora") {  // the generator's checkpoint / LoRA names (last line of the prompt field)
+            size_t nl = d.prompt.rfind('\n');
+            std::string tail = nl == std::string::npos ? "" : d.prompt.substr(nl + 1);
+            if (tail.find(n.term) == std::string::npos) return 0;
+            note(n.field + ": " + n.term);
+            return 1.0;
+        }
+        if (n.field == "like") {  // looks like photo #id: CLIP image-to-image similarity
+            auto it = like_target.find(n.term);
+            if (it == like_target.end() || d.vec.empty()) return 0;
+            double c = dot(it->second, d.vec);
+            if (c < 0.80) return 0;
+            note(util::fmt("looks like it (%.0f%%)", c * 100));
+            return 3.0 * c;
+        }
+        if (n.field == "fuzzy") {
+            for (auto* field : {&d.desc, &d.name, &d.prompt}) {
+                std::string w = fuzzy_word(*field, n.term);
+                if (!w.empty()) {
+                    note("~" + n.term + ": " + w);
+                    return 1.0;
+                }
+            }
+            return 0;
+        }
+        if (n.field == "place" || n.field == "loc") {
+            for (auto& a : alternates(cfg, n.term, false))
+                if (d.location.find(a) != std::string::npos) {
+                    note("place: " + d.location);
+                    return 1.0;
+                }
+            return 0;
         }
         auto alts = alternates(cfg, n.term, false);
         if (n.field == "tag") {

@@ -81,6 +81,20 @@ std::string join_json_list(const std::string& j) {
     return out;
 }
 
+// Paths under any of the folders ("folders" may hold several, one per line): the SQL condition and its values.
+std::string under_sql(const std::string& folders, const char* col, std::vector<std::string>& binds) {
+    std::string out;
+    for (auto& f0 : util::split(folders, '\n')) {
+        std::string f = util::trim(f0);
+        if (f.empty()) continue;
+        out += std::string(out.empty() ? "" : " OR ") + "(" + col + "=? OR substr(" + col + ",1,length(?))=?)";
+        binds.push_back(f);
+        binds.push_back(f + "/");
+        binds.push_back(f + "/");
+    }
+    return out.empty() ? "" : "(" + out + ")";
+}
+
 }  // namespace
 
 std::vector<std::pair<std::string, float>> parse_tag_list(const std::string& j) {
@@ -475,11 +489,13 @@ std::vector<TagRow> Db::tag_rows(const std::string& folder, const std::string& m
     std::string sql = R"(SELECT id, src_path, COALESCE(dest_path,''), COALESCE(date_value,''), COALESCE(date_prec,''), COALESCE(location,''),
                          COALESCE(clip_tags,''), COALESCE(user_tags,''), COALESCE(tags,''), COALESCE(clip_model,''), COALESCE(clip_vocab,''),
                          COALESCE(meta_json,''), size, COALESCE(gen_tool,''), COALESCE(gen_keywords,''), COALESCE(tag_fix,''),
-                         COALESCE(name_keywords,''), COALESCE(favorite,0) FROM photos WHERE (dup_of IS NULL OR dup_of=0))";
-    if (!folder.empty()) sql += " AND (src_path=? OR substr(src_path,1,length(?))=?)";
+                         COALESCE(name_keywords,''), COALESCE(favorite,0), COALESCE(size,0), COALESCE(width,0), COALESCE(height,0),
+                         COALESCE(ext,''), COALESCE(has_gps,0), COALESCE(needs_review,0) FROM photos WHERE (dup_of IS NULL OR dup_of=0))";
+    std::vector<std::string> binds;
+    if (std::string u = under_sql(folder, "src_path", binds); !u.empty()) sql += " AND " + u;
     sql += " ORDER BY src_path";
     Stmt s(db_, sql.c_str());
-    if (!folder.empty()) s.b(folder).b(folder + "/").b(folder + "/");
+    for (auto& b : binds) s.b(b);
     std::vector<TagRow> out;
     while (s.step()) {
         TagRow r;
@@ -537,11 +553,15 @@ void Db::add_decision(const Decision& d) {
 std::vector<Decision> Db::decisions(const std::string& folder, int limit) {
     Lock l(mu_);
     std::string sql = "SELECT id, at, kind, photo_id, subject, question, options, rules_pick, jev_pick, final_pick, changed FROM decisions";
-    if (!folder.empty())
-        sql += " WHERE subject=? OR substr(subject,1,length(?))=? OR (kind='search' AND photo_id IN (SELECT id FROM photos WHERE substr(src_path,1,length(?))=?))";
+    std::vector<std::string> binds;
+    if (!folder.empty()) {
+        std::string a = under_sql(folder, "subject", binds);
+        std::string b = under_sql(folder, "src_path", binds);
+        sql += " WHERE " + a + " OR (kind='search' AND photo_id IN (SELECT id FROM photos WHERE " + b + "))";
+    }
     sql += " ORDER BY id DESC LIMIT " + std::to_string(limit);
     Stmt s(db_, sql.c_str());
-    if (!folder.empty()) s.b(folder).b(folder + "/").b(folder + "/").b(folder + "/").b(folder + "/");
+    for (auto& b : binds) s.b(b);
     std::vector<Decision> out;
     while (s.step()) {
         Decision d;
@@ -556,11 +576,15 @@ std::vector<Decision> Db::decisions(const std::string& folder, int limit) {
 DecisionStats Db::decision_stats(const std::string& folder) {
     Lock l(mu_);
     std::string sql = "SELECT kind, COUNT(*), SUM(changed) FROM decisions";
-    if (!folder.empty())
-        sql += " WHERE subject=? OR substr(subject,1,length(?))=? OR (kind='search' AND photo_id IN (SELECT id FROM photos WHERE substr(src_path,1,length(?))=?))";
+    std::vector<std::string> binds;
+    if (!folder.empty()) {
+        std::string a = under_sql(folder, "subject", binds);
+        std::string b = under_sql(folder, "src_path", binds);
+        sql += " WHERE " + a + " OR (kind='search' AND photo_id IN (SELECT id FROM photos WHERE " + b + "))";
+    }
     sql += " GROUP BY kind";
     Stmt s(db_, sql.c_str());
-    if (!folder.empty()) s.b(folder).b(folder + "/").b(folder + "/").b(folder + "/").b(folder + "/");
+    for (auto& b : binds) s.b(b);
     DecisionStats st;
     while (s.step()) {
         st.by_kind[s.t(0)] = {int(s.i(1)), int(s.i(2))};
@@ -576,10 +600,12 @@ std::vector<SearchDoc> Db::search_docs(const std::string& folder) {
                          COALESCE(scene,''), COALESCE(objects,''), COALESCE(tags,''), COALESCE(landmark,''), COALESCE(location,''),
                          COALESCE(vision_text,''), COALESCE(clip_tags,''), COALESCE(clip_scene,''), clip_vec, COALESCE(clip_model,''),
                          COALESCE(user_tags,''), COALESCE(gen_json,''), COALESCE(gen_keywords,''), COALESCE(tag_fix,''),
-                         COALESCE(name_keywords,''), COALESCE(favorite,0) FROM photos WHERE (dup_of IS NULL OR dup_of=0))";
-    if (!folder.empty()) sql += " AND (src_path=? OR substr(src_path,1,length(?))=?)";
+                         COALESCE(name_keywords,''), COALESCE(favorite,0), COALESCE(size,0), COALESCE(width,0), COALESCE(height,0),
+                         COALESCE(ext,''), COALESCE(has_gps,0), COALESCE(needs_review,0) FROM photos WHERE (dup_of IS NULL OR dup_of=0))";
+    std::vector<std::string> binds;
+    if (std::string u = under_sql(folder, "src_path", binds); !u.empty()) sql += " AND " + u;
     Stmt s(db_, sql.c_str());
-    if (!folder.empty()) s.b(folder).b(folder + "/").b(folder + "/");
+    for (auto& b : binds) s.b(b);
     std::vector<SearchDoc> out;
     while (s.step()) {
         SearchDoc d;
@@ -616,6 +642,13 @@ std::vector<SearchDoc> Db::search_docs(const std::string& folder) {
         tp.tag_fix = s.t(c++);
         std::string name_kw = s.t(c++);
         d.favorite = s.i(c++) != 0;
+        d.size = s.i(c++);
+        d.width = int(s.i(c++));
+        d.height = int(s.i(c++));
+        d.ext = util::lower(s.t(c++));
+        d.has_gps = s.i(c++) != 0;
+        d.uncertain = s.i(c++) != 0;
+        d.location = util::lower(location);
         // Only confident tags are searchable words: a tag the model gave 10% is a guess, not a description.
         std::string words;
         for (auto& t : effective_tags(tp)) {
@@ -698,10 +731,11 @@ std::vector<Correction> Db::corrections(const std::string& folder, bool pending_
     std::string sql = R"(SELECT c.id, c.photo_id, c.field, c.action, c.current, c.proposed, c.confidence, c.reason, c.source, c.status, p.src_path
                          FROM corrections c JOIN photos p ON p.id=c.photo_id WHERE 1)";
     if (pending_only) sql += " AND c.status='pending'";
-    if (!folder.empty()) sql += " AND (p.src_path=? OR substr(p.src_path,1,length(?))=?)";
+    std::vector<std::string> binds;
+    if (std::string u = under_sql(folder, "p.src_path", binds); !u.empty()) sql += " AND " + u;
     sql += " ORDER BY c.confidence DESC, p.src_path";
     Stmt s(db_, sql.c_str());
-    if (!folder.empty()) s.b(folder).b(folder + "/").b(folder + "/");
+    for (auto& b : binds) s.b(b);
     std::vector<Correction> out;
     while (s.step()) {
         Correction c;
@@ -798,7 +832,6 @@ void Db::reindex(int64_t id) {
     u.run();
 }
 
-static const char* kUnder = " AND (src_path=? OR substr(src_path,1,length(?))=?)";
 
 std::vector<PhotoRow> Db::query(const std::string& search, bool review_only, const std::string& month, int limit, const std::string& folder) {
     Lock l(mu_);
@@ -819,12 +852,7 @@ std::vector<PhotoRow> Db::query(const std::string& search, bool review_only, con
             binds.push_back("%" + util::lower(t) + "%");
         }
     }
-    if (!folder.empty()) {
-        sql += kUnder;
-        binds.push_back(folder);
-        binds.push_back(folder + "/");
-        binds.push_back(folder + "/");
-    }
+    if (std::string u = under_sql(folder, "src_path", binds); !u.empty()) sql += " AND " + u;
     if (review_only) sql += " AND (needs_review=1 OR date_value IS NULL OR date_value='')";
     if (month == "undated") sql += " AND (date_value IS NULL OR date_value='')";
     else if (!month.empty()) { sql += " AND date_value LIKE ?"; binds.push_back(month + "%"); }
@@ -860,10 +888,11 @@ std::vector<MonthInfo> Db::months(const std::string& folder) {
     std::string sql = R"(SELECT CASE WHEN date_value IS NULL OR date_value='' THEN 'undated'
                                 WHEN date_prec='year' THEN substr(date_value,1,4) ELSE substr(date_value,1,7) END AS m, COUNT(*),
                    SUM(size) FROM photos WHERE 1)";
-    if (!folder.empty()) sql += kUnder;
+    std::vector<std::string> binds;
+    if (std::string u = under_sql(folder, "src_path", binds); !u.empty()) sql += " AND " + u;
     sql += " GROUP BY m ORDER BY m";
     Stmt s(db_, sql.c_str());
-    if (!folder.empty()) s.b(folder).b(folder + "/").b(folder + "/");
+    for (auto& b : binds) s.b(b);
     while (s.step()) out.push_back({s.t(0), int(s.i(1)), s.i(2)});
     return out;
 }
@@ -875,9 +904,10 @@ DbStats Db::stats(const std::string& folder) {
                    SUM(vision_status='done'), SUM(vision_status='failed'), SUM(dest_path IS NOT NULL), SUM(dup_of>0),
                    SUM(location IS NOT NULL AND location<>''), COALESCE(SUM(size),0),
                    COALESCE(SUM(CASE WHEN dup_of>0 THEN size ELSE 0 END),0), SUM(COALESCE(similar_to,0)>0), SUM(clip_model IS NOT NULL AND clip_model<>'') FROM photos WHERE 1)";
-    if (!folder.empty()) sql += kUnder;
+    std::vector<std::string> binds;
+    if (std::string u = under_sql(folder, "src_path", binds); !u.empty()) sql += " AND " + u;
     Stmt s(db_, sql.c_str());
-    if (!folder.empty()) s.b(folder).b(folder + "/").b(folder + "/");
+    for (auto& b : binds) s.b(b);
     if (s.step()) {
         st.total = int(s.i(0)); st.resolved = int(s.i(1)); st.review = int(s.i(2)); st.undated = int(s.i(3));
         st.vision_done = int(s.i(4)); st.vision_failed = int(s.i(5)); st.organized = int(s.i(6)); st.dups = int(s.i(7));

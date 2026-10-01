@@ -122,6 +122,11 @@ struct SearchDoc {
     std::string prompt, prompt_raw;  // AI generation prompt (+ negative), lower-cased / original
     std::vector<std::string> tags;   // effective tags, lower-cased (for tag: filters and favorite-tag chips)
     bool favorite = false;
+    // for filters: size:, width:, ext:, place:, has:gps, is:uncertain
+    int64_t size = 0;
+    int width = 0, height = 0;
+    std::string ext, location;
+    bool has_gps = false, uncertain = false;
 };
 
 struct DupRow {  // everything the duplicate scan needs, without the heavy JSON columns

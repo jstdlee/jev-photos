@@ -20,8 +20,11 @@ struct Config {
     float accent[3] = {0.30f, 0.78f, 0.47f};
     int renderer = 0;  // 0 auto (GPU, software fallback if the driver crashes at start), 1 GPU only, 2 software
 
-    // The one thing the user picks: a photo folder. Organized copies go to output_dir() (default <folder>/jev-organized).
+    // The photo folders (scanned together) and the one being looked at. folder is the view: one of folders, or
+    // "" with view_all = every folder at once. Organized copies go to <each folder>/jev-organized unless output is set.
+    std::vector<std::string> folders;
     std::string folder;
+    bool view_all = false;
     std::vector<std::string> recent;   // recently used folders, newest first
     std::vector<std::string> fav_tags; // starred tags: one-click filters
     std::string output;                // optional override for the organized-copies folder
@@ -105,6 +108,11 @@ void load_config(Config& c, const std::string& path = "");
 void save_config(const Config& c, const std::string& path = "");
 std::string default_config_path();
 std::string db_path(const Config& c);     // shared catalog: $XDG_DATA_HOME/jev-photos/catalog.sqlite
-std::string output_dir(const Config& c);  // output, else <folder>/jev-organized
-Config effective(const Config& c);        // sources = {folder}, library = output_dir()
+std::string output_dir(const Config& c);  // output, else <folder>/jev-organized (the viewed folder)
+std::string library_for(const Config& c, const std::string& src_root);  // where a photo's organized copy goes
+std::string view_scope(const Config& c);   // the viewed folder, or all folders one per line (for filters)
+std::string all_scope(const Config& c);    // every folder, one per line (what Analyze scans)
+void add_folder(Config& c, const std::string& folder);
+void remove_folder(Config& c, const std::string& folder);
+Config effective(const Config& c);        // sources = folders, library = output (empty = per folder)
 void remember_folder(Config& c, const std::string& folder);

@@ -201,9 +201,13 @@ void Pipeline::run(Config cfg, RunOptions opt) {
         log_.add(2, "the catalog database could not be opened");
     } else {
         if (!opt.scope.empty()) {
-            std::error_code ec;
-            opt.scope = fs::weakly_canonical(opt.scope, ec).string();
-            log_.add(0, "scope: " + opt.scope);
+            std::string canon;
+            for (auto& sc : util::split(opt.scope, '\n')) {  // one folder per line
+                std::error_code ec;
+                if (!util::trim(sc).empty()) canon += (canon.empty() ? "" : "\n") + fs::weakly_canonical(util::trim(sc), ec).string();
+            }
+            opt.scope = canon;
+            log_.add(0, "scope: " + util::replace_all(opt.scope, "\n", ", "));
         }
         if ((opt.stages & ST_SCAN) && !stop_) scan(cfg, opt);
         if ((opt.stages & ST_DUPES) && !stop_) dedupe(cfg, opt);
@@ -237,18 +241,29 @@ void Pipeline::run(Config cfg, RunOptions opt) {
 void Pipeline::scan(const Config& c, const RunOptions& o) {
     begin(ST_SCAN, 0);
     std::vector<std::pair<std::string, std::string>> files;  // (root, path)
+    // Organized-copy folders are never scanned: the shared output folder, and each folder's own jev-organized.
+    std::set<std::string> libs;
+    if (!c.library.empty()) libs.insert(fs::weakly_canonical(c.library).string());
+    for (auto& s : c.sources) {
+        std::error_code ec;
+        libs.insert(library_for(c, fs::weakly_canonical(s, ec).string()));
+    }
     std::string lib = c.library.empty() ? "" : fs::weakly_canonical(c.library).string();
     // (root used for folder-name evidence, folder actually walked)
     std::vector<std::pair<std::string, std::string>> walks;
     if (!o.scope.empty()) {
-        // A chosen path keeps the configured source it lives in as its root, so folder names above it still count.
-        std::string root = o.scope;
-        for (auto& s : c.sources) {
-            std::error_code ec;
-            std::string cs = fs::weakly_canonical(s, ec).string();
-            if (path_under(o.scope, cs) && cs.size() < root.size()) root = cs;
+        // Each chosen path keeps the configured source it lives in as its root, so folder names above it still count.
+        for (auto& sc0 : util::split(o.scope, '\n')) {
+            std::string sc = util::trim(sc0);
+            if (sc.empty()) continue;
+            std::string root = sc;
+            for (auto& s : c.sources) {
+                std::error_code ec;
+                std::string cs = fs::weakly_canonical(s, ec).string();
+                if (path_under(sc, cs) && cs.size() < root.size()) root = cs;
+            }
+            walks.push_back({root, sc});
         }
-        walks.push_back({root, o.scope});
     } else {
         for (auto& s : c.sources) {
             std::error_code ec;
@@ -273,7 +288,7 @@ void Pipeline::scan(const Config& c, const RunOptions& o) {
             std::string name = p.filename().string();
             if (it->is_directory(ec)) {
                 // Skip hidden folders, the library itself and macOS/Synology thumbnail stores.
-                if ((!name.empty() && name[0] == '.') || name == "@eaDir" || (!lib.empty() && p.string() == lib))
+                if ((!name.empty() && name[0] == '.') || name == "@eaDir" || libs.count(p.string()))
                     it.disable_recursion_pending();
                 continue;
             }
@@ -1101,6 +1116,11 @@ void Pipeline::vision(const Config& c, const RunOptions& o) {
 
 bool path_under(const std::string& path, const std::string& dir) {
     if (dir.empty()) return true;
+    if (dir.find('\n') != std::string::npos) {  // several folders, one per line
+        for (auto& d : util::split(dir, '\n'))
+            if (!util::trim(d).empty() && path_under(path, util::trim(d))) return true;
+        return false;
+    }
     std::string d = dir;
     while (d.size() > 1 && d.back() == '/') d.pop_back();
     return path == d || (path.size() > d.size() && path.compare(0, d.size(), d) == 0 && path[d.size()] == '/');
@@ -1417,10 +1437,12 @@ std::vector<PlanItem> Pipeline::build_plan(const Config& c, const RunOptions& o)
             if (it.include) {
                 // Rename in place keeps each photo in its own folder; the others file into month folders.
                 bool in_place = c.file_op == OP_RENAME;
-                std::string dir = in_place ? util::dirname(refile ? p.dest_path : p.src_path) : c.library + "/" + folder;
+                std::string library = library_for(c, p.src_root);
+                std::string dir = in_place ? util::dirname(refile ? p.dest_path : p.src_path) : library + "/" + folder;
                 std::string sn_key = in_place ? dir + "|" + day_key : day_key;
                 std::string prefix = c.name_style == NAME_KEEP_PREFIX ? short_prefix(p) : "";
-                int sn = next_sn.count(sn_key) ? next_sn[sn_key] : db_.next_sn(day_key, in_place ? dir : c.library);
+                if (!in_place) sn_key = library + "|" + day_key;  // serials are per output folder
+                int sn = next_sn.count(sn_key) ? next_sn[sn_key] : db_.next_sn(day_key, in_place ? dir : library);
                 for (;; sn++) {
                     it.dest = dir + "/" + (prefix.empty() ? "" : prefix + c.name_sep) + day_key + c.name_sep + util::fmt("%0*d", c.sn_digits, sn) +
                               "." + norm_ext(p.ext);
@@ -1558,7 +1580,7 @@ void Pipeline::apply_item(const Config& c, PlanItem& it) {
 }
 
 void Pipeline::organize(const Config& c, const RunOptions& o) {
-    if (c.library.empty()) {
+    if (c.sources.empty()) {
         log_.add(2, "no output folder (choose a photo folder first)");
         return;
     }

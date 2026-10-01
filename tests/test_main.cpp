@@ -698,6 +698,56 @@ static void test_corrections() {
     util::run({"rm", "-rf", dir});
 }
 
+static void test_search_filters() {
+    std::string dir = util::temp_path("sf"), err;
+    util::mkdirs(dir);
+    Db db;
+    CHECK(db.open(dir + "/s.sqlite", err));
+    auto add = [&](const std::string& name, int64_t size, int w, int h, const std::string& date, const std::string& tags) {
+        Photo p;
+        p.src_path = dir + "/" + name;
+        p.src_root = dir;
+        p.size = size; p.width = w; p.height = h; p.ext = util::ext_lower(name);
+        int64_t id = db.upsert_scan(p);
+        p.id = id;
+        p.date_value = date; p.date_prec = "second"; p.needs_review = false;
+        db.save_date(p);
+        db.save_clip(id, "m", {1.0f, 0.0f}, tags, "", "v");
+        return id;
+    };
+    add("beach.jpg", 3000000, 4000, 3000, "2019-05-12 10:00:00", R"([["beach",0.8],["sea",0.6]])");
+    add("cat.png", 200000, 800, 1200, "2021-01-02 10:00:00", R"([["cat",0.9]])");
+    int64_t fav = add("night.jpg", 1500000, 3000, 2000, "2021-07-01 22:00:00", R"([["night city",0.7]])");
+    db.set_favorite(fav, true);
+    Config c;
+    c.clip_enabled = false;
+    c.llm_enabled = false;
+    Searcher se;
+    se.load(db, dir, 0);
+    auto n = [&](const std::string& q) {
+        SearchQuery sq;
+        sq.text = q;
+        sq.mode = SM_SMART;
+        return se.run(c, sq).hits.size();
+    };
+    CHECK(n("size:>1mb") == 2);
+    CHECK(n("size:100kb..2mb") == 2);
+    CHECK(n("w:>=3000") == 2);
+    CHECK(n("is:portrait") == 1);
+    CHECK(n("ext:png") == 1);
+    CHECK(n("date:2021") == 2);
+    CHECK(n("date:2019-05") == 1);
+    CHECK(n("date:>2020") == 2);
+    CHECK(n("year:2018..2020") == 1);
+    CHECK(n("is:fav") == 1);
+    CHECK(n("(beach | cat) -ext:png") == 1);
+    CHECK(n("tag:cat OR tag:\"night city\"") == 2);
+    CHECK(n("~beech") == 1);  // a typo still finds beach
+    CHECK(n("mp:>10") == 1);  // 12 MP yes, 6 MP no
+    db.close();
+    util::run({"rm", "-rf", dir});
+}
+
 int main() {
     test_civil();
     test_name_patterns();
@@ -716,6 +766,7 @@ int main() {
     test_query_language();
     test_name_words();
     test_corrections();
+    test_search_filters();
     printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

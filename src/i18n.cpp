@@ -304,6 +304,20 @@ const std::unordered_map<std::string, const char*>& zh() {
         {"No favorites yet. In the Photos tab, click the star of a photo or press f.", "还没有收藏。在照片页点击星标或按 f。"},
         {"all", "全部"},
         {"corrections proposed for generated tags or names (with how sure each one is)", "条针对生成标签或文件名的更正建议（附把握度）"},
+        {"Photo folders", "照片文件夹"},
+        {"All folders", "全部文件夹"},
+        {"+ Add...", "+ 添加..."},
+        {"Folders", "文件夹"},
+        {"Add a photo folder to the list", "把照片文件夹加入列表"},
+        {"Scanned together by Analyze. Removing a folder only takes it off the list: no file is touched.", "分析时一起扫描。移除只是从列表中去掉，不会动任何文件。"},
+        {"not found", "未找到"},
+        {"Open", "打开"},
+        {"Add", "添加"},
+        {"type or paste a folder path", "输入或粘贴文件夹路径"},
+        {"Recent folders (click to add again)", "最近的文件夹（点击重新添加）"},
+        {"No folders yet: press Add.", "还没有文件夹：点击添加。"},
+        {"Analyze scans every folder in the list. Here you choose what the tabs show: one folder or all.", "分析会扫描列表中的所有文件夹。这里选择各页显示的范围：一个文件夹或全部。"},
+        {"Find similar", "找相似"},
     };
     return m;
 }

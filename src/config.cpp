@@ -19,19 +19,44 @@ std::string db_path(const Config& c) {
 
 std::string output_dir(const Config& c) {
     if (!c.output.empty()) return c.output;
-    return c.folder.empty() ? "" : c.folder + "/jev-organized";
+    std::string f = !c.folder.empty() ? c.folder : c.folders.empty() ? "" : c.folders[0];
+    return f.empty() ? "" : f + "/jev-organized";
+}
+
+std::string library_for(const Config& c, const std::string& src_root) {
+    if (!c.output.empty()) return c.output;
+    return src_root.empty() ? "" : src_root + "/jev-organized";
+}
+
+std::string all_scope(const Config& c) {
+    std::string out;
+    for (auto& f : c.folders) out += (out.empty() ? "" : "\n") + f;
+    return out;
+}
+
+std::string view_scope(const Config& c) { return c.view_all || c.folder.empty() ? all_scope(c) : c.folder; }
+
+void add_folder(Config& c, const std::string& folder) {
+    if (folder.empty() || std::find(c.folders.begin(), c.folders.end(), folder) != c.folders.end()) return;
+    c.folders.push_back(folder);
+}
+
+void remove_folder(Config& c, const std::string& folder) {
+    c.folders.erase(std::remove(c.folders.begin(), c.folders.end(), folder), c.folders.end());
+    if (c.folder == folder) c.folder = c.folders.empty() ? "" : c.folders[0];
+    if (c.folders.size() < 2) c.view_all = false;
 }
 
 Config effective(const Config& c) {
     Config e = c;
-    if (!c.folder.empty()) {
-        e.sources = {c.folder};
-        e.library = output_dir(c);
-    }
+    e.sources = c.folders;
+    if (e.sources.empty() && !c.folder.empty()) e.sources = {c.folder};
+    e.library = c.output;  // empty: each folder gets its own jev-organized
     return e;
 }
 
 void remember_folder(Config& c, const std::string& folder) {
+    add_folder(c, folder);
     c.folder = folder;
     c.recent.erase(std::remove(c.recent.begin(), c.recent.end(), folder), c.recent.end());
     c.recent.insert(c.recent.begin(), folder);
@@ -55,6 +80,8 @@ void load_config(Config& c, const std::string& path_in) {
             else if (k == "accent") sscanf(v.c_str(), "%f,%f,%f", &c.accent[0], &c.accent[1], &c.accent[2]);
             else if (k == "renderer") c.renderer = iclamp(v, 0, 2);
             else if (k == "folder") c.folder = v;
+            else if (k == "folder_item") { if (!v.empty()) add_folder(c, v); }
+            else if (k == "view_all") c.view_all = v == "1";
             else if (k == "recent") { if (!v.empty()) c.recent.push_back(v); }
             else if (k == "fav_tag") { if (!v.empty()) c.fav_tags.push_back(v); }
             else if (k == "output") c.output = v;
@@ -122,6 +149,9 @@ void load_config(Config& c, const std::string& path_in) {
             // a malformed value keeps its default
         }
     }
+    // Older configs had one folder: it starts the list.
+    if (c.folders.empty() && !c.folder.empty()) c.folders.push_back(c.folder);
+    if (c.folders.size() < 2) c.view_all = false;
 }
 
 void save_config(const Config& c, const std::string& path_in) {
@@ -129,7 +159,8 @@ void save_config(const Config& c, const std::string& path_in) {
     std::ostringstream f;
     f << "lang=" << c.lang << "\nfont_size=" << c.font_size << "\naccent=" << c.accent[0] << "," << c.accent[1] << ","
       << c.accent[2] << "\n";
-    f << "renderer=" << c.renderer << "\nfolder=" << c.folder << "\n";
+    f << "renderer=" << c.renderer << "\nfolder=" << c.folder << "\nview_all=" << c.view_all << "\n";
+    for (auto& d : c.folders) f << "folder_item=" << d << "\n";
     for (auto& r : c.recent) f << "recent=" << r << "\n";
     for (auto& t : c.fav_tags) f << "fav_tag=" << t << "\n";
     f << "output=" << c.output << "\nlayout=" << c.layout << "\nwrite_mode=" << c.write_mode << "\nfile_op=" << c.file_op

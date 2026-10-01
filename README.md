@@ -23,6 +23,14 @@ the `exiv2` CLI for metadata.
 
 Each stage is resumable. A manual date override in the UI re-files the organized copy on the next *Decide* + *Organize*.
 
+### Folders
+
+Add any number of photo folders (**+ Add…**, or **Folders** to remove or re-add recent ones). **Analyze scans them
+all together**: one duplicate check across all of them, one catalog. The folder selector chooses what the tabs show,
+one folder or **All folders**. Each folder's organized copies go to its own `jev-organized` (or all to one folder,
+when *Organized copies folder* is set). Removing a folder only takes it off the list. From the command line:
+`jev-photos --cli ~/Pictures/phone ~/Pictures/camera` scans both.
+
 ### How files are organized
 
 Settings → *File operation*:
@@ -96,9 +104,23 @@ scene, place, captions) and **CLIP embeddings**:
 | Regex | `IMG_20(19|20)` | ECMAScript, case-insensitive |
 | Ask (AI) | `my dog at the beach last summer` (Enter) | an LLM turns the sentence into keywords, a picture description, a place and a date range; local search keeps candidates scoring ≥ 50 %; the LLM then rates the candidates in batches of 25, and results rated ≥ 50 % are listed best first |
 
-**Query language** (Smart and Words): `beach sunset` both · `beach | sea`, `beach OR sea` either · `-night`,
-`NOT night`, `!night` without · `( … )` grouping · `"new york"` phrase · `tag:dog` (exact tag), `name:`, `desc:`,
-`prompt:`, `exif:` one field · `is:fav`, `is:ai`, `is:untagged`. Hover the search box for the cheat sheet.
+| Similar | `like:#123`, `like:IMG_0042`, or *Find similar* in a photo's detail | photos that look like that one (CLIP image ↔ image, ≥ 80 % similar) |
+
+**Query language** (Smart and Words; hover the search box for the cheat sheet). Everything combines with `( )`,
+`OR`/`|`, `NOT`/`-`/`!` and implicit AND:
+
+| | Syntax | Example |
+|---|---|---|
+| words, phrases | `word`, `"a phrase"`, `~typo` (close spellings) | `~webiste` finds *website* |
+| one field | `tag:` (exact tag) `name:` `desc:` `prompt:` `exif:` `place:` | `tag:"night city" place:tokyo` |
+| camera, generator | `camera:` (make, model, lens) `model:` `lora:` | `camera:"x100v"`, `model:sdxl lora:ink` |
+| dates | `date:2019`, `date:2019-05`, `date:2019-05-01..2019-08-31`, `date:>2020`, `year:2018..2020` | `date:2021 -is:uncertain` |
+| size, shape | `size:>2mb`, `size:100kb..2mb`, `w:>3000`, `h:<1000`, `mp:>12`, `ext:png`, `ext:raw` | `mp:>20 ext:raw` |
+| state | `is:fav` `is:ai` `is:untagged` `is:uncertain` `is:undated` `is:portrait` `is:landscape` `is:square` | `is:fav is:portrait` |
+| has | `has:gps` `has:prompt` `has:place` `has:tags` `has:desc` `has:keywords` `has:camera` | `is:ai -has:desc` |
+| similar | `like:#id`, `like:<part of a file name>` | `like:#42 date:2019` |
+
+Every result says why it matched (`tag: website`, `prompt: …lighthouse…`, `looks like it (94%)`, `3.2 MB`).
 
 **Other languages**: each search term also matches its equivalents in English, Simplified/Traditional Chinese,
 Japanese and Korean. The LLM is asked once per term, after typing pauses for 0.7 s, and the answers are cached in the
@@ -250,6 +272,93 @@ says why it matched (`desc: lake | lake, mountain…`, `exif: Exif.Image.Model =
 * Metadata is only added: a field with a value is never changed. A camera's bogus `DateTimeOriginal` stays, and the
   recovered date goes to `Xmp.photoshop.DateCreated` (if missing) and `Xmp.jev.*`.
 * Formats exiv2 cannot write get a sidecar. If that fails too, the error is logged and skipped.
+
+## How updates are decided
+
+jev-photos separates what a file **is** (its own metadata, never rewritten) from what jev-photos **made** (names,
+tags, keywords and descriptions it generated, which may be refreshed or corrected). Every change is shown in Review
+before it happens.
+
+```mermaid
+flowchart LR
+    F[Photo file] --> G["Genuine, never changed:<br/>EXIF dates, camera, lens, GPS,<br/>AI prompt and workflow,<br/>keywords and descriptions others wrote"]
+    F --> M["Made by jev-photos, may be updated:<br/>date-based file name,<br/>CLIP tags, prompt and name keywords,<br/>keywords and description it wrote"]
+    G -->|evidence| D{Decision}
+    M -->|target| D
+    D --> R[Review: preview with confidence]
+    R -->|you apply| W[Write: only additions, or our own fields]
+    R -->|you reject| X[Remembered, not proposed again]
+```
+
+### File names
+
+```mermaid
+flowchart TD
+    S[Scan: EXIF, XMP, file name, folders, file times] --> C[Date candidates with weights]
+    C --> CL[Cluster by agreement]
+    CL --> M{Margin between the best clusters below 0.7?}
+    M -->|no| RD[Rules decide]
+    M -->|yes| J["jev chooses among the dates<br/>(blended with weight 0.3)"]
+    J --> RD2[Date and confidence]
+    RD --> RD2
+    RD2 --> N{Name style}
+    N -->|date and serial| A["20190512_00001.jpg"]
+    N -->|keep original name| P["Original name without dates, times, serials, copy markers"]
+    P --> L{More than 4 words or 30 characters?}
+    L -->|no| B["IMG_20190512_00001.jpg"]
+    L -->|yes| K["LLM picks 2-4 key words, decided once"]
+    K --> B2["sunset-mountains_20190512_00001.jpg"]
+    A --> RV[Review: From and To list]
+    B --> RV
+    B2 --> RV
+    RV -->|Apply all| FS["Copy, move or rename; never over an existing file"]
+```
+
+### Tags and corrections
+
+```mermaid
+flowchart TD
+    I[Image thumbnail] --> CLIP["CLIP ViT-L/14: per-category tags with confidence"]
+    CLIP --> T{Confidence 25% or more?}
+    T -->|no| GUESS["Shown dimmed as a guess; not searched, not written"]
+    T -->|yes| TAG[Tag]
+    TAG --> CHK[Correction check after each Analyze]
+    EV["Evidence: camera EXIF, file name, AI prompt"] --> CHK
+    CHK --> R1["Rules: a camera photo is not a screenshot or 3D render;<br/>a file named Screenshot is one"]
+    CHK --> R2["LLM reads the prompt: which tags does it contradict?<br/>Not wrong just because the prompt does not mention them;<br/>edits skipped; a tag whose word is in the prompt is kept"]
+    CHK --> R3["File-name words that CLIP confirms"]
+    R1 --> CONF["Confidence: LLM certainty lowered when CLIP saw the tag clearly"]
+    R2 --> CONF
+    R3 --> CONF
+    CONF --> REV["Review, Corrections tab: 70% or more ticked"]
+    REV -->|apply| FIX["tag_fix layer over CLIP tags (re-tagging keeps it)"]
+    REV -->|reject| NO[Not proposed again]
+    USER["Your own tags"] -->|replace automatic tags, never second-guessed| TAG
+```
+
+### Writing keywords and descriptions (EXIF / XMP)
+
+```mermaid
+flowchart TD
+    K[Keywords to write: tags, prompt keywords, scene, place] --> KK{Already in the file?}
+    KK -->|yes| KS[Skip]
+    KK -->|no| KA["Append to Xmp.dc.subject; recorded in Xmp.jev.Keywords"]
+    KO["Keyword jev-photos wrote earlier, no longer a tag"] --> KR["Removed (only our own; recorded ones)"]
+
+    D["Our description: AI prompt + 'Shows: tags'"] --> E{File's description}
+    E -->|empty| ADD[Fill it]
+    E -->|written by us| UPD[Refresh our text, also when appended to theirs]
+    E -->|camera default or placeholder| REP["Replace; old text kept in Xmp.jev.PreviousDescription"]
+    E -->|already says it all| KEEP[Keep]
+    E -->|other text| LLM["LLM: keep, append or replace?"]
+    LLM --> JEV["jev: is it a placeholder? does ours add information?"]
+    JEV --> AG{Do they agree?}
+    AG -->|yes| ACT[Apply that action]
+    AG -->|no| YOU["You decide in Review; left unchanged until then"]
+```
+
+Settings → *Existing descriptions* can also be: only fill empty fields, LLM alone, or always ask. In PNGs the
+generation chunks (`prompt`, `workflow`, `parameters`) are never touched: XMP goes in its own chunk.
 
 ## Build
 
