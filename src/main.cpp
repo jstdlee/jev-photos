@@ -51,6 +51,7 @@
 #include "llm.h"
 #include "search.h"
 #include "thumbs.h"
+#include "icon_png.h"
 #include "vision.h"
 
 using json = nlohmann::json;
@@ -3784,6 +3785,15 @@ int main(int argc, char** argv) {
     if (!app.win) {
         glfwTerminate();
         return 1;
+    }
+    {  // window icon (dock, Alt-Tab, title bar)
+        GLFWimage img;
+        int n = 0;
+        img.pixels = stbi_load_from_memory(kIconPng, int(sizeof kIconPng), &img.width, &img.height, &n, 4);
+        if (img.pixels) {
+            glfwSetWindowIcon(app.win, 1, &img);
+            stbi_image_free(img.pixels);
+        }
     }
     glfwMakeContextCurrent(app.win);
     glfwSwapInterval(1);

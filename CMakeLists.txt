@@ -54,7 +54,17 @@ target_link_libraries(jevcore PUBLIC sqlite3 ${ORT}/lib/libonnxruntime.so ${CMAK
 set(CMAKE_BUILD_RPATH ${ORT}/lib)
 set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib")
 
+# The window icon, embedded: assets/jev-photos-256.png -> a byte array header.
+set(ICON_PNG ${CMAKE_SOURCE_DIR}/assets/jev-photos-256.png)
+set(ICON_H ${CMAKE_BINARY_DIR}/generated/icon_png.h)
+file(READ ${ICON_PNG} ICON_HEX HEX)
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," ICON_BYTES "${ICON_HEX}")
+file(WRITE ${ICON_H}.tmp "// generated from assets/jev-photos-256.png\nstatic const unsigned char kIconPng[] = {${ICON_BYTES}};\n")
+configure_file(${ICON_H}.tmp ${ICON_H} COPYONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${ICON_PNG})
+
 add_executable(jev-photos src/main.cpp src/i18n.cpp)
+target_include_directories(jev-photos PRIVATE ${CMAKE_BINARY_DIR}/generated)
 target_link_libraries(jev-photos PRIVATE jevcore imgui glfw)
 
 add_executable(jev-photos-tests tests/test_main.cpp)
@@ -62,5 +72,7 @@ target_link_libraries(jev-photos-tests PRIVATE jevcore)
 
 set_target_properties(jev-photos jev-photos-tests PROPERTIES BUILD_RPATH ${ORT}/lib INSTALL_RPATH "$ORIGIN/../lib")
 install(TARGETS jev-photos RUNTIME DESTINATION bin)
+install(FILES assets/jev-photos.svg DESTINATION share/icons/hicolor/scalable/apps)
+install(FILES assets/jev-photos-256.png DESTINATION share/icons/hicolor/256x256/apps RENAME jev-photos.png)
 install(FILES ${ORT}/lib/libonnxruntime.so.1 ${ORT}/lib/libonnxruntime.so.1.22.0 DESTINATION lib)
 install(FILES jev-photos.desktop DESTINATION share/applications)

@@ -1,4 +1,4 @@
-# jev photos
+# <img src="assets/jev-photos.svg" width="40" align="top"> jev photos
 
 Organize a messy photo collection by **recovered capture date**, one folder per month, with names like
 `20190512_00001.jpg`. Date and location decisions use explainable evidence scoring plus the **jev decision API**.
@@ -380,6 +380,7 @@ DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 __GLX_VENDOR_LIBRARY_NAME=mesa build/jev-pho
 ```bash
 build/jev-photos                  # GUI
 build/jev-photos ~/Pictures/phone # GUI, opened on that folder
+scripts/install-desktop.sh        # icon, application-menu entry and a desktop shortcut (--remove undoes it)
 ```
 
 There is one thing to choose: the **Photo folder** (type it, pick it with *Browse…*, or reopen one from the ▾ recent

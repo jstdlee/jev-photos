@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- tile -->
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="#20262f"/>
+  <!-- photos behind, fanned -->
+  <path d="M169.9 36.8 L172.5 36.5 L175.1 36.7 L177.5 37.7 L179.6 39.3 L181.2 41.3 L182.2 43.7 L212.0 147.5 L212.4 150.1 L212.1 152.7 L211.2 155.1 L209.6 157.2 L207.6 158.8 L205.2 159.9 L82.1 195.2 L79.5 195.5 L76.9 195.3 L74.5 194.3 L72.4 192.7 L70.8 190.7 L69.8 188.3 L40.0 84.5 L39.6 81.9 L39.9 79.3 L40.8 76.9 L42.4 74.8 L44.4 73.2 L46.8 72.1 Z" fill="#8e9bb0"/>
+  <path d="M204.1 66.1 L206.6 66.9 L208.8 68.3 L210.6 70.2 L211.8 72.5 L212.4 75.1 L212.3 77.7 L193.5 184.0 L192.7 186.5 L191.3 188.7 L189.4 190.5 L187.1 191.7 L184.5 192.3 L181.9 192.1 L55.9 169.9 L53.4 169.1 L51.2 167.7 L49.4 165.8 L48.2 163.5 L47.6 160.9 L47.7 158.3 L66.5 52.0 L67.3 49.5 L68.7 47.3 L70.6 45.5 L72.9 44.3 L75.5 43.7 L78.1 43.9 Z" fill="#c3ccd9"/>
+  <!-- front photo: frame, sky, sun, mountains -->
+  <rect x="52" y="56" width="152" height="146" rx="10" fill="#ffffff"/>
+  <rect x="64" y="68" width="128" height="96" rx="5" fill="#9fd3ff"/>
+  <circle cx="158" cy="94" r="13" fill="#ffd25e"/>
+  <path d="M64 164 L64 150 L104 108 L128 136 L146 118 L192 158 L192 164 Z" fill="#3f8f5f"/>
+  <path d="M104 108 L117 122 L109 120 L101 126 L94 119 Z" fill="#eaf6ee"/>
+  <!-- date strip on the frame -->
+  <rect x="68" y="176" width="66" height="10" rx="5" fill="#d5dbe5"/>
+  <rect x="140" y="176" width="26" height="10" rx="5" fill="#d5dbe5"/>
+  <!-- tag badge with a check: tagged and decided -->
+  <path d="M168 196 L190 172 L224 172 Q230 172 230 178 L230 214 Q230 220 224 220 L190 220 Z" fill="#4cc778" stroke="#20262f" stroke-width="6" stroke-linejoin="round"/>
+  <circle cx="190" cy="196" r="5.5" fill="#20262f"/>
+  <path d="M199 197 l7 7 l14 -15" fill="none" stroke="#ffffff" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
