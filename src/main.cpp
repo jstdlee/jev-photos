@@ -404,7 +404,7 @@ struct GridThumbs {
     struct Done { int64_t id; Thumb t; };
     std::mutex mu;
     std::deque<Done> done;
-    std::set<int64_t> pending;
+    std::set<int64_t> pending, failed;  // failed: no thumbnail could be made (not retried)
     std::map<int64_t, Texture> tex;
     std::map<int64_t, int> used;  // id -> frame last drawn
     int frame = 0;
@@ -442,6 +442,8 @@ struct ViewerSlot {
     int w = 0, h = 0, stage = 0;
     int64_t id = 0;
     bool ready = false;
+    int64_t failed_id = 0;  // the photo that could not be read, and why
+    std::string error;
 };
 struct Viewer {
     bool open = false;
@@ -489,7 +491,7 @@ struct App {
     char manual_buf[64] = "";
 
     Texture thumb;
-    int64_t thumb_id = 0;
+    int64_t thumb_id = 0, thumb_failed = 0;
     std::shared_ptr<ThumbSlot> thumb_slot = std::make_shared<ThumbSlot>();
     ViewWorker view;
     std::atomic<bool> want_dupes_run{false};  // set by the worker once a keeper pin is stored
@@ -1059,6 +1061,7 @@ static void upload_thumb(App& a) {
     a.thumb_slot->ready = false;
     Thumb& t = a.thumb_slot->result;
     if (t.id == a.thumb_id && !t.rgba.empty()) a.thumb.upload(t.rgba.data(), t.w, t.h);
+    else if (t.id == a.thumb_id) a.thumb_failed = t.id;
     t.rgba.clear();
 }
 
@@ -1078,10 +1081,12 @@ static void viewer_load(App& a) {
     auto slot = v.slot;
     slot->want = id;
     std::thread([slot, key, dest, orient, side, id] {
+        bool shown = false;
         auto publish = [&](const std::string& jpeg, int stage) {
             int w, h, n;
             unsigned char* px = stbi_load_from_memory(reinterpret_cast<const unsigned char*>(jpeg.data()), int(jpeg.size()), &w, &h, &n, 4);
             if (!px) return;
+            shown = true;
             if (slot->want == id) {
                 std::lock_guard<std::mutex> l(slot->mu);
                 slot->rgba.assign(px, px + size_t(w) * h * 4);
@@ -1099,6 +1104,12 @@ static void viewer_load(App& a) {
         if (slot->want != id) return;
         std::string src = util::file_exists(key.src_path) ? key.src_path : dest;
         if (prepare_image(src, orient, 2048, jpeg, err)) publish(jpeg, 2);
+        if (!shown && slot->want == id) {  // say why instead of leaving the viewer blank
+            std::lock_guard<std::mutex> l(slot->mu);
+            slot->failed_id = id;
+            slot->error = !util::file_exists(src) ? "file not found: " + src : err.empty() ? "cannot decode " + src : err;
+            glfwPostEmptyEvent();
+        }
     }).detach();
 }
 
@@ -1200,7 +1211,9 @@ static void draw_viewer(App& a) {
     ImGui::SetNextWindowPos(vp->WorkPos);
     ImGui::SetNextWindowSize(vp->WorkSize);
     ImGui::SetNextWindowFocus();
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.02f, 0.02f, 0.03f, 0.97f));
+    ImVec4 bg = ImGui::GetStyleColorVec4(ImGuiCol_WindowBg);  // the theme's background, nearly opaque
+    bg.w = 0.98f;
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, bg);
     ImGui::Begin("##viewer", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
     const Photo& p = v.p;
     if (ImGui::Button("<")) { if (v.idx > 0) v.idx--; }
@@ -1214,7 +1227,12 @@ static void draw_viewer(App& a) {
     ImGui::Text("%d / %zu   %s   ·   %s   ·   %s", v.idx + 1, v.ids.size(), name.c_str(),
                 p.date_value.empty() ? tr("undated") : util::parse_db_datetime(p.date_value + "|" + p.date_prec).pretty().c_str(),
                 util::human_size(p.size).c_str());
-    ImGui::SameLine(ImGui::GetWindowWidth() - 300);
+    {
+        ImGuiStyle& st = ImGui::GetStyle();
+        float w = ImGui::CalcTextSize(tr("Open file")).x + ImGui::CalcTextSize(tr("Open folder")).x + ImGui::CalcTextSize(tr("Close")).x +
+                  st.FramePadding.x * 6 + st.ItemSpacing.x * 2 + st.WindowPadding.x;
+        ImGui::SameLine(ImGui::GetWindowWidth() - w);
+    }
     if (ImGui::Button(tr("Open file"))) run_detached({"xdg-open", p.src_path});
     tip(tr("Open the photo in the default viewer"));
     ImGui::SameLine();
@@ -1237,6 +1255,24 @@ static void draw_viewer(App& a) {
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail.x - sz.x) / 2);
         ImGui::Image(ImTextureRef((ImTextureID)(intptr_t)a.viewer_tex.tex), sz);
     } else {
+        // Not there yet (or unreadable): say so in the middle instead of an empty screen.
+        std::string msg, why;
+        {
+            std::lock_guard<std::mutex> l(v.slot->mu);
+            if (v.slot->failed_id == v.loaded_id) why = v.slot->error;
+        }
+        msg = why.empty() ? tr("Loading...") : tr("This photo cannot be shown");
+        ImVec2 c = ImGui::GetCursorPos();
+        ImVec2 ts = ImGui::CalcTextSize(msg.c_str());
+        ImGui::SetCursorPos(ImVec2(c.x + (avail.x - ts.x) / 2, c.y + avail.y / 2 - ts.y));
+        if (why.empty()) ImGui::TextDisabled("%s", msg.c_str());
+        else ImGui::TextColored(g_warn, "%s", msg.c_str());
+        if (!why.empty()) {
+            ImVec2 ws = ImGui::CalcTextSize(why.c_str());
+            ImGui::SetCursorPosX(c.x + std::max(0.0f, (avail.x - ws.x) / 2));
+            ImGui::TextDisabled("%s", why.c_str());
+        }
+        ImGui::SetCursorPos(c);
         ImGui::Dummy(avail);
     }
     ImGui::TextDisabled("%s", tr("Left/Right or H/L: previous/next  ·  Esc or Q: close"));
@@ -1429,7 +1465,12 @@ static void draw_detail(App& a) {
         float s = std::min(avail / a.thumb.w, 300.0f / a.thumb.h);
         ImGui::Image(ImTextureRef((ImTextureID)(intptr_t)a.thumb.tex), ImVec2(a.thumb.w * s, a.thumb.h * s));
     } else {
+        ImVec2 c = ImGui::GetCursorPos();
         ImGui::Dummy(ImVec2(avail, 60));
+        ImGui::SetCursorPos(ImVec2(c.x + 8, c.y + 20));
+        if (a.thumb_failed == p.id) ImGui::TextColored(g_warn, "%s", util::file_exists(p.src_path) ? tr("No preview: the file cannot be decoded") : tr("No preview: the file is not there any more"));
+        else ImGui::TextDisabled("%s", tr("Loading..."));
+        ImGui::SetCursorPos(ImVec2(c.x, c.y + 64));
     }
     copy_text(a, p.src_path);
     if (!p.dest_path.empty()) copy_text(a, p.dest_path, "-> " + p.dest_path, &g_ok);
@@ -2434,7 +2475,7 @@ static const Texture* grid_thumb(App& a, const PhotoRow& r) {
     auto it = g->tex.find(r.id);
     if (it != g->tex.end()) return &it->second;
     std::lock_guard<std::mutex> l(g->mu);
-    if (g->pending.count(r.id) || g->pending.size() >= 4) return nullptr;
+    if (g->pending.count(r.id) || g->failed.count(r.id) || g->pending.size() >= 4) return nullptr;
     g->pending.insert(r.id);
     ThumbKey key{r.src_path, r.size, 0};
     struct stat st{};
@@ -2469,6 +2510,7 @@ static void grid_upload(App& a) {
         g->done.pop_front();
         g->pending.erase(d.id);
         if (!d.t.rgba.empty()) g->tex[d.id].upload(d.t.rgba.data(), d.t.w, d.t.h);
+        else g->failed.insert(d.id);
     }
     if (g->tex.size() > 400) {  // drop what has not been on screen for a while
         for (auto it = g->tex.begin(); it != g->tex.end();) {
@@ -2677,6 +2719,18 @@ static void draw_photo_grid(App& a) {
                 ImVec2 q0(p0.x + (cell - 8 - sz.x) / 2, p0.y + (img - sz.y) / 2);
                 dl->AddImageRounded(ImTextureRef((ImTextureID)(intptr_t)t->tex), q0, ImVec2(q0.x + sz.x, q0.y + sz.y), ImVec2(0, 0), ImVec2(1, 1),
                                     IM_COL32_WHITE, 4.0f);
+            }
+            else {  // loading, or no preview possible
+                bool failed = false;
+                {
+                    std::lock_guard<std::mutex> l(a.grid->mu);
+                    failed = a.grid->failed.count(r.id) > 0;
+                }
+                ImVec2 q0(p0.x + 4, p0.y + 4), q1(p0.x + cell - 12, p0.y + img - 4);
+                dl->AddRectFilled(q0, q1, ImGui::GetColorU32(ImGuiCol_FrameBg), 4.0f);
+                const char* ic = failed ? ICON_ALERT_TRIANGLE : ICON_PHOTO;
+                ImVec2 ts = ImGui::CalcTextSize(ic);
+                dl->AddText(ImVec2((q0.x + q1.x - ts.x) / 2, (q0.y + q1.y - ts.y) / 2), ImGui::GetColorU32(failed ? g_warn : g_text_dim), ic);
             }
             if (r.favorite) dl->AddText(ImVec2(p0.x + 6, p0.y + 4), ImGui::GetColorU32(g_star), ICON_STAR);
             if (r.needs_review) dl->AddText(ImVec2(p0.x + cell - 30, p0.y + 4), ImGui::GetColorU32(g_warn), ICON_CALENDAR_QUESTION);
@@ -4214,8 +4268,11 @@ static void draw_activity_button(App& a) {
         if (ImGui::IsItemClicked()) ImGui::OpenPopup("activity");
         tip(tr("Click for details, or to stop"));
     } else {
+        bool down = (a.cfg.clip_enabled && a.clip_ok == 0) || (a.cfg.llm_enabled && a.llm_ok == 0) || (a.cfg.jev_enabled && a.jev_ok == 0);
+        if (down) ImGui::PushStyleColor(ImGuiCol_Text, g_warn);  // a helper is down: details in the popover
         if (ImGui::Button(ICON_ACTIVITY)) ImGui::OpenPopup("activity");
-        tip(tr("Activity: the last run, and Undo"));
+        if (down) ImGui::PopStyleColor();
+        tip(tr("Activity: the last run, Undo, and whether image recognition, the language model and jev are up"));
     }
     if (ImGui::BeginPopup("activity")) {
         std::string summary;
@@ -4228,6 +4285,26 @@ static void draw_activity_button(App& a) {
             if (danger_button(tr("Stop"), tr("Stop after the current photo; everything done so far is kept"))) a.pipe->stop();
         } else {
             ImGui::TextWrapped("%s", summary.empty() ? tr("Nothing has run yet.") : summary.c_str());
+        }
+        ImGui::SeparatorText(tr("Helpers"));
+        {
+            std::string cd, ld, jd;
+            {
+                std::lock_guard<std::mutex> l(a.health_mu);
+                cd = a.clip_detail;
+                ld = a.llm_detail;
+                jd = a.jev_detail;
+            }
+            auto row = [](int v, bool on, const char* name, const std::string& detail) {
+                ImVec4 col = !on ? g_text_dim : v == 1 ? g_ok : v == 0 ? g_warn : g_text_dim;
+                ImGui::TextColored(col, "%s", v == 1 && on ? ICON_CIRCLE_CHECK : ICON_CIRCLE_X);
+                ImGui::SameLine();
+                ImGui::Text("%s: %s", name, !on ? tr("off") : v == 1 ? tr("ready") : v == 0 ? tr("down") : tr("checking"));
+                if (!detail.empty()) tip(detail.c_str());
+            };
+            row(a.clip_ok, a.cfg.clip_enabled, tr("Image recognition"), cd);
+            row(a.llm_ok, a.cfg.llm_enabled, tr("Language model"), a.cfg.llm_url + "  " + ld);
+            row(a.jev_ok, a.cfg.jev_enabled, tr("jev decisions"), a.cfg.jev_url + "  " + jd);
         }
         ImGui::Separator();
         for (auto& l : a.log.tail(8)) ImGui::TextDisabled("%s %s", l.time.c_str(), l.text.substr(0, 110).c_str());
@@ -4250,7 +4327,7 @@ static void draw_topbar(App& a) {
     ImGui::TextUnformatted(title.c_str());
     ImGui::PopFont();
     ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 12, full * 0.22f));
-    float right_w = 430 + (a.cfg.system_titlebar ? 0 : 96);
+    float right_w = 400 + (a.cfg.system_titlebar ? 0 : ImGui::GetFrameHeight() * 3.9f + 16);
     float sw = std::max(240.0f, full - ImGui::GetCursorPosX() - right_w);
     draw_search(a, sw);
     ImGui::SameLine(0, 6);
@@ -4300,40 +4377,25 @@ static void draw_topbar(App& a) {
         request_analyze(a);
     ImGui::EndDisabled();
     ImGui::SameLine(0, 10);
-    // the assistant: one dot for CLIP, the LLM and jev together
-    int clip = a.clip_ok, llm = a.cfg.llm_enabled ? a.llm_ok.load() : 1, jev = a.cfg.jev_enabled ? a.jev_ok.load() : 1;
-    bool all_up = clip == 1 && llm == 1 && jev == 1, any_down = clip == 0 || llm == 0 || jev == 0;
-    ImGui::TextColored(all_up ? g_ok : any_down ? g_warn : g_text_dim, ICON_ROBOT);
-    {
-        std::string cd, ld, jd;
-        {
-            std::lock_guard<std::mutex> l(a.health_mu);
-            cd = a.clip_detail;
-            ld = a.llm_detail;
-            jd = a.jev_detail;
-        }
-        auto state = [](int v) { return v == 1 ? tr("ready") : v == 0 ? tr("down") : tr("checking"); };
-        tip(util::fmt("%s\n%s: %s (%s)\n%s: %s (%s)\n%s: %s (%s)", all_up ? tr("Assistant ready") : tr("Some helpers are down; the rest keeps working."),
-                      tr("Image recognition"), state(clip), cd.c_str(), tr("Language model"), state(llm), ld.c_str(), tr("jev decisions"), state(jev), jd.c_str()));
-    }
-    if (ImGui::IsItemClicked()) a.show_settings = true;
-    ImGui::SameLine(0, 8);
+    ImGui::SameLine(0, 10);
     if (ImGui::Button(ICON_HELP)) a.show_help = !a.show_help;
     tip(tr("Help: what is what, keys, search syntax, credits"));
     ImGui::SameLine(0, 2);
     if (ImGui::Button(ICON_SETTINGS)) a.show_settings = !a.show_settings;
     tip(tr("Settings (Ctrl+,)"));
     if (!a.cfg.system_titlebar) {
-        ImGui::SameLine(0, 12);
-        if (ImGui::Button(ICON_MINUS)) glfwIconifyWindow(a.win);
+        // Window buttons at the very right edge, like the desktop's own.
+        float bw = ImGui::GetFrameHeight() * 1.3f, sp = 2;
+        ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 12, ImGui::GetWindowContentRegionMax().x - bw * 3 - sp * 2));
+        if (ImGui::Button(ICON_MINUS, ImVec2(bw, 0))) glfwIconifyWindow(a.win);
         tip(tr("Minimise"));
         ImGui::SameLine(0, 2);
         bool maxed = glfwGetWindowAttrib(a.win, GLFW_MAXIMIZED);
-        if (ImGui::Button(maxed ? ICON_WINDOW_MINIMIZE : ICON_SQUARE)) maxed ? glfwRestoreWindow(a.win) : glfwMaximizeWindow(a.win);
+        if (ImGui::Button(maxed ? ICON_WINDOW_MINIMIZE : ICON_SQUARE, ImVec2(bw, 0))) maxed ? glfwRestoreWindow(a.win) : glfwMaximizeWindow(a.win);
         tip(maxed ? tr("Restore the window size") : tr("Maximise (or double-click the top bar)"));
         ImGui::SameLine(0, 2);
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(kDanger.x, kDanger.y, kDanger.z, 0.9f));
-        if (ImGui::Button(ICON_X "##close")) glfwSetWindowShouldClose(a.win, GLFW_TRUE);
+        if (ImGui::Button(ICON_X "##close", ImVec2(bw, 0))) glfwSetWindowShouldClose(a.win, GLFW_TRUE);
         ImGui::PopStyleColor();
         tip(tr("Close jev photos (a running step stops; everything done so far is kept)"));
     }
