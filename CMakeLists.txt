@@ -97,7 +97,11 @@ target_compile_definitions(jev-photos PRIVATE ICON_TTF="${TP}/tabler/tabler-icon
 set_property(SOURCE src/main.cpp APPEND PROPERTY OBJECT_DEPENDS ${TP}/tabler/tabler-icons.ttf)
 target_link_libraries(jev-photos PRIVATE jevcore imgui glfw ${JEV_STATIC_RUNTIME})
 
-add_executable(jev-photos-tests tests/test_main.cpp)
+if(WIN32)
+  add_executable(jev-photos-tests tests/test_main.cpp win/manifest.rc)  # UTF-8 code page for the tests too
+else()
+  add_executable(jev-photos-tests tests/test_main.cpp)
+endif()
 target_link_libraries(jev-photos-tests PRIVATE jevcore ${JEV_STATIC_RUNTIME})
 if(WIN32)  # the DLL next to the programs, so they run from the build folder
   add_custom_command(TARGET jev-photos POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different ${ORT}/lib/onnxruntime.dll $<TARGET_FILE_DIR:jev-photos>)

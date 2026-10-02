@@ -132,6 +132,9 @@ ProcResult run(const std::vector<std::string>& argv, const std::string& stdin_da
     CloseHandle(out_r);
     CloseHandle(err_r);
     r.rc = timed_out ? -2 : int(code);
+    // Console tools (exiv2, curl, ffmpeg) end lines with \r\n here; callers parse lines, as on Linux.
+    r.out = replace_all(r.out, "\r\n", "\n");
+    r.err = replace_all(r.err, "\r\n", "\n");
     if (timed_out) r.err += "\n(timed out)";
     return r;
 }
