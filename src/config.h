@@ -25,7 +25,8 @@ struct Config {
     bool first_run_done = false;       // the welcome screen was completed (or folders existed already)
     int goal = 0;                      // welcome choice: 0 browse only, 1 organized copies, 2 rename originals
     bool watch_folders = true;
-    bool auto_meta = false;            // after each Analyze, write missing dates, keywords, descriptions, places into the files         // look for new photos in the folders now and then, and analyse them quietly
+    bool auto_meta = false;
+    int motion = 0;                    // 0 follow the system, 1 full, 2 reduced (fades only, no movement)            // after each Analyze, write missing dates, keywords, descriptions, places into the files         // look for new photos in the folders now and then, and analyse them quietly
     int renderer = 0;  // 0 auto (GPU, software fallback if the driver crashes at start), 1 GPU only, 2 software
 
     // The photo folders (scanned together) and the one being looked at. folder is the view: one of folders, or

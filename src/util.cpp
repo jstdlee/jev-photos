@@ -646,6 +646,11 @@ bool which(const std::string& exe) {
 // ---------------------------------------------------------------------------
 // desktop
 
+bool system_reduce_motion() {  // GNOME's switch (other desktops: not set, full motion)
+    ProcResult r = run({"gsettings", "get", "org.gnome.desktop.interface", "enable-animations"}, "", 3);
+    return r.rc == 0 && trim(r.out) == "false";
+}
+
 bool have_trash() { return which("gio"); }
 bool trash(const std::string& path) { return run({"gio", "trash", "--", path}, "", 30).rc == 0; }
 void open_path(const std::string& p) {

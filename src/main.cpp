@@ -472,6 +472,7 @@ struct GridThumbs {
     std::deque<Done> done;
     std::set<int64_t> pending, failed;  // failed: no thumbnail could be made (not retried)
     std::map<int64_t, Texture> tex;
+    std::map<int64_t, double> shown_at;  // when each thumbnail arrived (it fades in)
     std::map<int64_t, int> used;  // id -> frame last drawn
     int frame = 0;
 };
@@ -502,6 +503,99 @@ static NavKey nav_key(bool allowed) {
 }
 
 // Large photo viewer: the cached thumbnail appears at once, then a sharper 2048 px version replaces it.
+static double g_wake_at = 0;
+
+// ---- Motion: a few short, purposeful animations (feedback, where things come from, no jarring pops). Keyboard
+// actions and things done 100+ times a day (palette, rename, delete confirm, list navigation, pane toggles) do not
+// animate. Curves are the CSS ones: ease-out cubic-bezier(0.23, 1, 0.32, 1), ease-in-out (0.77, 0, 0.175, 1).
+namespace anim {
+static bool g_reduce = false;  // reduced motion: fades stay (shorter), movement and zoom tweens go
+
+// y of a CSS cubic-bezier(x1, y1, x2, y2) at x (Newton, then bisection), as browsers evaluate it
+static float bezier(float x1, float y1, float x2, float y2, float x) {
+    if (x <= 0) return 0;
+    if (x >= 1) return 1;
+    auto bx = [&](float t) { return ((1 - 3 * x2 + 3 * x1) * t + (3 * x2 - 6 * x1)) * t * t + 3 * x1 * t; };
+    auto by = [&](float t) { return ((1 - 3 * y2 + 3 * y1) * t + (3 * y2 - 6 * y1)) * t * t + 3 * y1 * t; };
+    auto dx = [&](float t) { return 3 * (1 - 3 * x2 + 3 * x1) * t * t + 2 * (3 * x2 - 6 * x1) * t + 3 * x1; };
+    float t = x;
+    for (int i = 0; i < 8; i++) {
+        float e = bx(t) - x, d = dx(t);
+        if (std::fabs(e) < 1e-5f) return by(t);
+        if (std::fabs(d) < 1e-6f) break;
+        t -= e / d;
+    }
+    float lo = 0, hi = 1;
+    t = x;
+    for (int i = 0; i < 30; i++) {
+        float v = bx(t);
+        if (std::fabs(v - x) < 1e-5f) break;
+        (v < x ? lo : hi) = t;
+        t = (lo + hi) / 2;
+    }
+    return by(t);
+}
+static float ease_out(float x) { return bezier(0.23f, 1.0f, 0.32f, 1.0f, x); }
+static float ease_in_out(float x) { return bezier(0.77f, 0.0f, 0.175f, 1.0f, x); }
+
+static double now() { return glfwGetTime(); }
+static void keep_drawing() { g_wake_at = std::max(g_wake_at, now() + 0.012); }
+
+// Progress 0..1 of something that started at t0 and lasts dur seconds (eased); keeps frames coming until done.
+static float progress(double t0, float dur, float (*curve)(float) = ease_out) {
+    float x = dur <= 0 ? 1.0f : float((now() - t0) / dur);
+    if (x < 1) keep_drawing();
+    return curve(std::clamp(x, 0.0f, 1.0f));
+}
+
+// A value that eases towards its target and can be retargeted mid-flight (it continues from where it is, like a
+// CSS transition, never restarting from zero).
+struct Tween {
+    float from = 0, to = 0, dur = 0.18f;
+    double t0 = -1;
+    float value() const {
+        if (t0 < 0) return to;
+        float x = float((now() - t0) / dur);
+        if (x >= 1) return to;
+        keep_drawing();
+        return from + (to - from) * ease_out(std::max(0.0f, x));
+    }
+    void set(float target, bool instant = false) {
+        if (target == to && t0 >= 0) return;
+        if (instant || g_reduce) { from = to = target; t0 = -1; return; }
+        from = value();
+        to = target;
+        t0 = now();
+    }
+    void jump(float v) { from = to = v; t0 = -1; }
+};
+
+// Popovers opened by a click: a 150 ms ease-out fade (opacity only; they appear where ImGui places them).
+static std::map<ImGuiID, double> g_popup_open;
+static bool begin_popup(const char* id, ImGuiWindowFlags flags = 0) {
+    ImGuiID key = ImGui::GetID(id);
+    if (!ImGui::IsPopupOpen(id)) { g_popup_open.erase(key); return false; }
+    auto it = g_popup_open.find(key);
+    if (it == g_popup_open.end()) it = g_popup_open.emplace(key, now()).first;
+    float a = progress(it->second, g_reduce ? 0.08f : 0.15f);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, std::max(0.02f, a));
+    bool open = ImGui::BeginPopup(id, flags);
+    if (!open) ImGui::PopStyleVar();
+    return open;
+}
+static void end_popup() {
+    ImGui::EndPopup();
+    ImGui::PopStyleVar();
+}
+
+}  // namespace anim
+
+static void apply_motion(const Config& c) {
+    static int system = -1;  // asked once
+    if (c.motion == 0 && system < 0) system = util::system_reduce_motion() ? 1 : 0;
+    anim::g_reduce = c.motion == 2 || (c.motion == 0 && system == 1);
+}
+
 struct ViewerSlot {
     std::mutex mu;
     std::atomic<int64_t> want{0};
@@ -521,6 +615,8 @@ struct Viewer {
     int opened_frame = -1;  // the key that opened the viewer must not also move it
     float zoom = 1;         // 1 = fit the window; the wheel zooms around the pointer
     ImVec2 pan{0, 0};       // offset of the image centre from the window centre (pixels)
+    anim::Tween dz, dx, dy; // what is on screen, easing towards zoom / pan
+    double shown_at = 0;    // when the first picture arrived (it fades in)
     Photo p;
     std::shared_ptr<ViewerSlot> slot = std::make_shared<ViewerSlot>();
 };
@@ -558,6 +654,7 @@ struct App {
 
     Texture thumb;
     int64_t thumb_id = 0, thumb_failed = 0;
+    double thumb_shown_at = 0;
     std::shared_ptr<ThumbSlot> thumb_slot = std::make_shared<ThumbSlot>();
     ViewWorker view;
     std::atomic<bool> want_dupes_run{false};  // set by the worker once a keeper pin is stored
@@ -969,7 +1066,7 @@ static void apply_plan(App& a) {
 // that changes or removes original files.
 // Tooltips appear after the mouse rests on an item for 2 seconds. The main loop is asked to draw a frame then
 // (it otherwise sleeps until the next event).
-static double g_wake_at = 0;
+
 static void tip(const std::string& text);
 static void tip(const char* text) {
     static ImVec2 last_min(-1, -1), last_max(-1, -1);
@@ -1151,7 +1248,10 @@ static void upload_thumb(App& a) {
     if (!a.thumb_slot->ready) return;
     a.thumb_slot->ready = false;
     Thumb& t = a.thumb_slot->result;
-    if (t.id == a.thumb_id && !t.rgba.empty()) a.thumb.upload(t.rgba.data(), t.w, t.h);
+    if (t.id == a.thumb_id && !t.rgba.empty()) {
+        a.thumb.upload(t.rgba.data(), t.w, t.h);
+        a.thumb_shown_at = glfwGetTime();
+    }
     else if (t.id == a.thumb_id) a.thumb_failed = t.id;
     t.rgba.clear();
 }
@@ -1165,6 +1265,9 @@ static void viewer_load(App& a) {
     v.shown_stage = 0;
     v.zoom = 1;
     v.pan = ImVec2(0, 0);
+    v.dz.jump(1);
+    v.dx.jump(0);
+    v.dy.jump(0);
     a.viewer_tex.unload();
     if (!a.ui_db.load(id, v.p)) return;
     ThumbKey key{v.p.src_path, v.p.size, v.p.mtime};
@@ -1309,6 +1412,7 @@ static void draw_viewer(App& a) {
         std::lock_guard<std::mutex> l(v.slot->mu);
         if (v.slot->ready && v.slot->id == v.loaded_id && v.slot->stage > v.shown_stage) {
             a.viewer_tex.upload(v.slot->rgba.data(), v.slot->w, v.slot->h);
+            if (v.shown_stage == 0) v.shown_at = glfwGetTime();  // the sharper version replaces it in place, no fade
             v.shown_stage = v.slot->stage;
             v.slot->ready = false;
         }
@@ -1371,30 +1475,41 @@ static void draw_viewer(App& a) {
         ImGuiIO& io = ImGui::GetIO();
         auto zoom_at = [&](ImVec2 m, float z1) {
             z1 = std::clamp(z1, 1.0f, 8.0f);
-            float s0 = fit * v.zoom, s1 = fit * z1;
-            ImVec2 c(c0.x + v.pan.x, c0.y + v.pan.y);
+            // from what is on screen now (an animation may be under way), so the point under the pointer stays there
+            float s0 = fit * v.dz.value(), s1 = fit * z1;
+            ImVec2 c(c0.x + v.dx.value(), c0.y + v.dy.value());
             ImVec2 u((m.x - c.x) / s0, (m.y - c.y) / s0);  // image point under the pointer stays there
             v.pan = ImVec2(m.x - u.x * s1 - c0.x, m.y - u.y * s1 - c0.y);
             v.zoom = z1;
         };
         if (hov && io.MouseWheel != 0) zoom_at(io.MousePos, v.zoom * std::pow(1.2f, io.MouseWheel));
         if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) zoom_at(io.MousePos, v.zoom > 1.01f ? 1.0f : 2.0f);
-        if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 1) && v.zoom > 1) {
+        bool dragging = ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 1) && v.zoom > 1;
+        if (dragging) {  // the picture follows the pointer 1:1, no easing
             v.pan.x += io.MouseDelta.x;
             v.pan.y += io.MouseDelta.y;
         }
-        float sc = fit * v.zoom;
-        ImVec2 sz(a.viewer_tex.w * sc, a.viewer_tex.h * sc);
-        if (v.zoom <= 1.0f) v.pan = ImVec2(0, 0);
-        else {  // keep the picture on screen: no panning past its edges
-            float mx = std::max(0.0f, (sz.x - avail.x) / 2), my = std::max(0.0f, (sz.y - avail.y) / 2);
-            v.pan.x = std::clamp(v.pan.x, -mx, mx);
-            v.pan.y = std::clamp(v.pan.y, -my, my);
+        {
+            ImVec2 tsz(a.viewer_tex.w * fit * v.zoom, a.viewer_tex.h * fit * v.zoom);
+            if (v.zoom <= 1.0f) v.pan = ImVec2(0, 0);
+            else {  // keep the picture on screen: no panning past its edges
+                float mx = std::max(0.0f, (tsz.x - avail.x) / 2), my = std::max(0.0f, (tsz.y - avail.y) / 2);
+                v.pan.x = std::clamp(v.pan.x, -mx, mx);
+                v.pan.y = std::clamp(v.pan.y, -my, my);
+            }
         }
-        ImVec2 q0(c0.x + v.pan.x - sz.x / 2, c0.y + v.pan.y - sz.y / 2);
+        // Zoom (wheel, double-click) eases to the new size in 180 ms; a new step mid-way continues from where it is.
+        v.dz.set(v.zoom, dragging);
+        v.dx.set(v.pan.x, dragging);
+        v.dy.set(v.pan.y, dragging);
+        float sc = fit * v.dz.value();
+        ImVec2 sz(a.viewer_tex.w * sc, a.viewer_tex.h * sc);
+        ImVec2 q0(c0.x + v.dx.value() - sz.x / 2, c0.y + v.dy.value() - sz.y / 2);
         ImDrawList* dl = ImGui::GetWindowDrawList();
         dl->PushClipRect(p0, ImVec2(p0.x + avail.x, p0.y + avail.y), true);
-        dl->AddImage(ImTextureRef((ImTextureID)(intptr_t)a.viewer_tex.tex), q0, ImVec2(q0.x + sz.x, q0.y + sz.y));
+        float fade = anim::progress(v.shown_at, 0.15f);  // the first picture fades in instead of popping
+        dl->AddImage(ImTextureRef((ImTextureID)(intptr_t)a.viewer_tex.tex), q0, ImVec2(q0.x + sz.x, q0.y + sz.y), ImVec2(0, 0), ImVec2(1, 1),
+                     IM_COL32(255, 255, 255, int(255 * fade)));
         dl->PopClipRect();
         if (v.zoom > 1.01f) {
             std::string zl = util::fmt("%.0f%%", sc * 100 * a.viewer_tex.w / std::max(1, v.p.width ? v.p.width : a.viewer_tex.w));
@@ -1771,7 +1886,9 @@ static void draw_detail(App& a) {
     float avail = ImGui::GetContentRegionAvail().x;
     if (a.thumb.tex) {
         float s = std::min(avail / a.thumb.w, 300.0f / a.thumb.h);
-        ImGui::Image(ImTextureRef((ImTextureID)(intptr_t)a.thumb.tex), ImVec2(a.thumb.w * s, a.thumb.h * s));
+        float fade = anim::progress(a.thumb_shown_at, 0.15f);  // arrives without a pop
+        ImGui::ImageWithBg(ImTextureRef((ImTextureID)(intptr_t)a.thumb.tex), ImVec2(a.thumb.w * s, a.thumb.h * s), ImVec2(0, 0), ImVec2(1, 1),
+                           ImVec4(0, 0, 0, 0), ImVec4(1, 1, 1, fade));
     } else {
         ImVec2 c = ImGui::GetCursorPos();
         ImGui::Dummy(ImVec2(avail, 60));
@@ -2877,7 +2994,10 @@ static void grid_upload(App& a) {
         auto d = std::move(g->done.front());
         g->done.pop_front();
         g->pending.erase(d.id);
-        if (!d.t.rgba.empty()) g->tex[d.id].upload(d.t.rgba.data(), d.t.w, d.t.h);
+        if (!d.t.rgba.empty()) {
+            g->tex[d.id].upload(d.t.rgba.data(), d.t.w, d.t.h);
+            g->shown_at[d.id] = glfwGetTime();
+        }
         else g->failed.insert(d.id);
     }
     if (g->tex.size() > 400) {  // drop what has not been on screen for a while
@@ -3108,8 +3228,10 @@ static void draw_photo_grid(App& a) {
                 float s2 = std::min(img / t->w, img / t->h);
                 ImVec2 sz(t->w * s2, t->h * s2);
                 ImVec2 q0(p0.x + (cell - 8 - sz.x) / 2, p0.y + (img - sz.y) / 2);
+                auto sa = a.grid->shown_at.find(r.id);
+                float fade = sa == a.grid->shown_at.end() ? 1.0f : anim::progress(sa->second, 0.15f);
                 dl->AddImageRounded(ImTextureRef((ImTextureID)(intptr_t)t->tex), q0, ImVec2(q0.x + sz.x, q0.y + sz.y), ImVec2(0, 0), ImVec2(1, 1),
-                                    IM_COL32_WHITE, 4.0f);
+                                    IM_COL32(255, 255, 255, int(255 * fade)), 4.0f);
             }
             else {  // loading, or no preview possible
                 bool failed = false;
@@ -3608,7 +3730,7 @@ static bool seg(const char* id, int* v, const std::vector<std::string>& labels) 
     ImGuiStorage* st = ImGui::GetStateStorage();
     ImGuiID kx = ImGui::GetID("##pill_x"), kw = ImGui::GetID("##pill_w");
     float cx = st->GetFloat(kx, -1), cw = st->GetFloat(kw, -1);
-    if (cx < 0 || ImGui::IsWindowAppearing()) { cx = sel_x; cw = sel_w; }
+    if (cx < 0 || ImGui::IsWindowAppearing() || anim::g_reduce) { cx = sel_x; cw = sel_w; }
     float k = 1.0f - std::exp(-ImGui::GetIO().DeltaTime / 0.035f);  // ease-out, settles in ~150 ms
     cx += (sel_x - cx) * k;
     cw += (sel_w - cw) * k;
@@ -3737,6 +3859,9 @@ static void draw_settings(App& a) {
             if (std::fabs(c.font_size - sizes[i]) < std::fabs(c.font_size - sizes[si])) si = i;
         if (choice(tr("Text size"), tr("Everything in the window, larger; Ctrl+ Ctrl– Ctrl+0 too"), &si, {"100%", "110%", "125%", "150%"})) c.font_size = sizes[si];
     }
+    if (choice(tr("Motion"), tr("Short fades and slides; Reduced keeps only the fades (the system setting is followed by default)"), &c.motion,
+               {tr("System"), tr("Full"), tr("Reduced")}))
+        apply_motion(c);
     {
         int tb = c.system_titlebar ? 1 : 0;
         if (choice(tr("Title bar"), tr("The app's own top bar with window buttons, or the desktop's (after restart)"), &tb, {tr("App"), tr("System")}))
@@ -4960,7 +5085,7 @@ static void draw_activity_button(App& a) {
         if (down) ImGui::PopStyleColor();
         tip(tr("Activity: the last run, Undo, and whether image recognition, the language model and jev are up"));
     }
-    if (ImGui::BeginPopup("activity")) {
+    if (anim::begin_popup("activity")) {
         std::string summary;
         {
             std::lock_guard<std::mutex> l(p.mu);
@@ -4998,7 +5123,7 @@ static void draw_activity_button(App& a) {
         for (auto& l : a.log.tail(8)) ImGui::TextDisabled("%s %s", l.time.c_str(), l.text.substr(0, 110).c_str());
         if (ImGui::Button(tr("Open Activity"))) { set_section(a, SEC_ACTIVITY); ImGui::CloseCurrentPopup(); }
         tip(tr("The full log, what changed (with Undo), and the decisions jev made"));
-        ImGui::EndPopup();
+        anim::end_popup();
     }
 }
 
@@ -5021,7 +5146,7 @@ static void draw_topbar(App& a) {
     ImGui::SameLine(0, 6);
     if (ImGui::Button(ICON_ADJUSTMENTS_HORIZONTAL)) ImGui::OpenPopup("filters");
     tip(tr("Search options: which fields, a date range, regular expressions"));
-    if (ImGui::BeginPopup("filters")) {
+    if (anim::begin_popup("filters")) {
         ImGui::TextDisabled("%s", tr("Look for words in"));
         if (ImGui::Checkbox(tr("File and folder names"), &a.in_name)) a.rows_dirty = true;
         if (ImGui::Checkbox(tr("Descriptions and tags"), &a.in_desc)) a.rows_dirty = true;
@@ -5046,7 +5171,7 @@ static void draw_topbar(App& a) {
             a.rows_dirty = true;
         }
         tip(tr("Search everything, any date"));
-        ImGui::EndPopup();
+        anim::end_popup();
     }
     ImGui::SameLine(0, 6);
     if (ImGui::Button(a.photo_grid ? ICON_LIST : ICON_LAYOUT_GRID)) a.photo_grid = !a.photo_grid;
@@ -5074,7 +5199,7 @@ static void draw_topbar(App& a) {
     ImGui::SameLine(0, sp);
     if (ImGui::Button(ICON_CAMERA, ImVec2(bw, 0))) ImGui::OpenPopup("shotmenu");
     tip(tr("Screenshot of this window, or of an area you select (saved in Pictures/jev-photos)"));
-    if (ImGui::BeginPopup("shotmenu")) {
+    if (anim::begin_popup("shotmenu")) {
         if (ImGui::MenuItem((std::string(ICON_SCREENSHOT "  ") + tr("Whole window")).c_str())) { a.shot_mode = 1; a.shot_frames = 2; }
         tip(tr("The whole window, as it is now"));
         if (ImGui::MenuItem((std::string(ICON_CROP "  ") + tr("Select an area...")).c_str())) { a.shot_mode = 2; a.shot_a = a.shot_b = ImVec2(-1, -1); }
@@ -5082,7 +5207,7 @@ static void draw_topbar(App& a) {
         ImGui::BeginDisabled(a.shot_last.empty());
         if (ImGui::MenuItem((std::string(ICON_FOLDER "  ") + tr("Open the screenshots folder")).c_str())) util::open_path(util::dirname(a.shot_last));
         ImGui::EndDisabled();
-        ImGui::EndPopup();
+        anim::end_popup();
     }
     ImGui::SameLine(0, sp);
     if (ImGui::Button(ICON_HELP, ImVec2(bw, 0))) a.show_help = !a.show_help;
@@ -5457,10 +5582,20 @@ static void draw_shot_overlay(App& a) {
 }
 
 static void draw_undo_banner(App& a) {
-    if (a.undo_run.empty() || glfwGetTime() > a.undo_until || a.pipe->running()) return;
+    static std::string shown_run;
+    static double shown_at = 0;
+    if (a.undo_run.empty() || glfwGetTime() > a.undo_until || a.pipe->running()) { shown_run.clear(); return; }
+    if (shown_run != a.undo_run) { shown_run = a.undo_run; shown_at = glfwGetTime(); }
+    // State: slides up from the bottom edge and fades in (220 ms ease-out); leaves the way it came (160 ms).
+    float in = anim::progress(shown_at, 0.22f);
+    float left = float(a.undo_until - glfwGetTime());
+    float out = left < 0.16f ? anim::ease_out(1 - left / 0.16f) : 0.0f;
+    if (out > 0) anim::keep_drawing();
+    float dy = anim::g_reduce ? 0.0f : (1 - in) * 16 + out * 16;
     ImVec2 vs = ImGui::GetMainViewport()->Size, vp = ImGui::GetMainViewport()->Pos;
-    ImGui::SetNextWindowPos(ImVec2(vp.x + vs.x / 2, vp.y + vs.y - 24), 0, ImVec2(0.5f, 1));
+    ImGui::SetNextWindowPos(ImVec2(vp.x + vs.x / 2, vp.y + vs.y - 24 + dy), 0, ImVec2(0.5f, 1));
     ImGui::SetNextWindowBgAlpha(0.95f);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, std::max(0.01f, in * (1 - out)));
     ImGui::Begin("##undo", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
                                      ImGuiWindowFlags_NoFocusOnAppearing);
     ImGui::AlignTextToFramePadding();
@@ -5471,8 +5606,9 @@ static void draw_undo_banner(App& a) {
     if (ImGui::Button(util::fmt("%s %s", ICON_ARROW_BACK_UP, tr("Undo")).c_str())) start_undo(a, a.undo_run);
     tip(tr("Put it all back (Ctrl+Z). Later runs can be undone from Activity."));
     ImGui::SameLine();
-    if (ImGui::SmallButton(ICON_X)) a.undo_until = 0;
+    if (ImGui::SmallButton(ICON_X)) a.undo_until = std::min(a.undo_until, glfwGetTime() + 0.16);  // leave the way it came
     ImGui::End();
+    ImGui::PopStyleVar();
 }
 
 // ---- the window
@@ -5950,11 +6086,25 @@ static void draw_ui(App& a) {
         ImGui::End();
     }
     ImGui::Begin("jev-photos");
+    static double toast_in = -1, toast_prev_until = 0;
     if (glfwGetTime() < a.toast_until) {
-        ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - 20, vp->WorkPos.y + vp->WorkSize.y - 20), 0, ImVec2(1, 1));
+        // Feedback: rises 8 px and fades in (200 ms ease-out), leaves the same way (150 ms). A new message while one is
+        // showing only changes the text (no restart).
+        if (toast_in < 0 || glfwGetTime() > toast_prev_until) toast_in = glfwGetTime();
+        toast_prev_until = a.toast_until;
+        float in = anim::progress(toast_in, 0.20f);
+        float left = float(a.toast_until - glfwGetTime());
+        float out = left < 0.15f ? anim::ease_out(1 - left / 0.15f) : 0.0f;
+        if (out > 0) anim::keep_drawing();
+        float alpha = in * (1 - out), dy = anim::g_reduce ? 0.0f : (1 - in) * 8 + out * 8;
+        ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - 20, vp->WorkPos.y + vp->WorkSize.y - 20 + dy), 0, ImVec2(1, 1));
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, std::max(0.01f, alpha));
         ImGui::BeginTooltip();
         ImGui::TextUnformatted(a.toast.c_str());
         ImGui::EndTooltip();
+        ImGui::PopStyleVar();
+    } else {
+        toast_in = -1;
     }
     ImGui::End();
 }
@@ -6447,7 +6597,8 @@ int main(int argc, char** argv) {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
-    if (!app.cfg.first_run_done && !app.cfg.folders.empty()) app.cfg.first_run_done = true;  // set up before the welcome screen existed
+    if (!app.cfg.first_run_done && !app.cfg.folders.empty()) app.cfg.first_run_done = true;
+    apply_motion(app.cfg);  // set up before the welcome screen existed
     apply_style(app.cfg);
     build_fonts();
     ImGui_ImplGlfw_InitForOpenGL(app.win, true);

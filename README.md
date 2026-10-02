@@ -293,6 +293,16 @@ vision model and the decision-rule numbers are behind *Show advanced settings*.
 picked, and Backspace in an empty field removes the last one. A sentence of four words or more plus Enter asks the
 assistant (LLM + jev). The sliders button holds the fields to search, a date range and regular expressions.
 
+**Motion:** a few short animations with a purpose — the viewer's zoom eases to the pointer (180 ms), the first
+picture and grid thumbnails fade in as they arrive (150 ms), toasts and the Undo banner rise in and leave the way they
+came, click-opened popovers fade in, the segmented controls' pill slides. Keyboard actions and anything done many times
+a minute (the Ctrl+P palette, rename, delete confirmation, list navigation, pane toggles) never animate. Settings →
+*Motion*: System (default: GNOME's animations switch / Windows' animation setting), Full, or Reduced (fades only).
+
+**Languages:** English, 简体中文, 日本語 and 한국어 (Settings → Language, applied at once; the first run follows
+`LANG`). Every interface string is translated; Chinese, Japanese and Korean fonts are all merged, the interface
+language's first.
+
 **Themes:** Dark, Tokyo Night and Light (Settings → Preferences → Appearance, or Ctrl+,). Each theme brings its own accent colour,
 which you can change.
 
@@ -613,6 +623,7 @@ build/jev-photos --cli ~/Pictures/phone --stages tag --retag                 # r
 | `search_min_match`, `ask_judge` | 0.30, 3 | meaning-match threshold; Ask judge 0 LLM, 1 jev, 2 none, 3 LLM + jev close calls |
 | `review_below`, `jev_margin`, `jev_date_weight` | 0.55, 0.70, 0.30 | date decision knobs |
 | `loc_w_rules`, `loc_w_vl`, `loc_w_jev`, `loc_accept` | 0.25, 0.60, 0.15, 0.50 | location vote |
+| `motion` | 0 | 0 follow the system, 1 full, 2 reduced |
 | `theme`, `accent`, `font_size`, `system_titlebar` | 0, green, 16, 0 | 0 Dark, 1 Tokyo Night, 2 Light; accent RGB 0–1; text size; desktop title bar |
 | `watch_folders`, `first_run_done`, `goal` | 1, 0, 0 | rescan quietly every 10 min; welcome screen done; 0 browse, 1 copies, 2 rename |
 

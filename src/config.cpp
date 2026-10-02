@@ -82,6 +82,7 @@ void load_config(Config& c, const std::string& path_in) {
             else if (k == "goal") c.goal = atoi(v.c_str());
             else if (k == "watch_folders") c.watch_folders = v == "1";
             else if (k == "auto_meta") c.auto_meta = v == "1";
+            else if (k == "motion") c.motion = atoi(v.c_str());
             else if (k == "folder") c.folder = v;
             else if (k == "folder_item") { if (!v.empty()) add_folder(c, v); }
             else if (k == "view_all") c.view_all = v == "1";
@@ -164,7 +165,7 @@ void save_config(const Config& c, const std::string& path_in) {
     f << "lang=" << c.lang << "\nfont_size=" << c.font_size << "\naccent=" << c.accent[0] << "," << c.accent[1] << ","
       << c.accent[2] << "\n";
     f << "theme=" << c.theme << "\nsystem_titlebar=" << c.system_titlebar << "\n";
-    f << "first_run_done=" << c.first_run_done << "\ngoal=" << c.goal << "\nwatch_folders=" << c.watch_folders << "\nauto_meta=" << c.auto_meta << "\n";
+    f << "first_run_done=" << c.first_run_done << "\ngoal=" << c.goal << "\nwatch_folders=" << c.watch_folders << "\nauto_meta=" << c.auto_meta << "\nmotion=" << c.motion << "\n";
     f << "renderer=" << c.renderer << "\nfolder=" << c.folder << "\nview_all=" << c.view_all << "\n";
     for (auto& d : c.folders) f << "folder_item=" << d << "\n";
     for (auto& r : c.recent) f << "recent=" << r << "\n";

@@ -812,6 +812,10 @@ const std::unordered_map<std::string, const char*>& zh() {
         {"tag, e.g. golden retriever", "标签，例如 golden retriever"},
         {"tag: name: desc: prompt: exif: place: camera: model: lora: — one field", "tag: name: desc: prompt: exif: place: camera: model: lora: — 单个字段"},
         {"the question", "问题"},
+        {"Motion", "动效"},
+        {"Full", "完整"},
+        {"Reduced", "减少"},
+        {"Short fades and slides; Reduced keeps only the fades (the system setting is followed by default)", "短暂的淡入淡出和滑动；“减少”只保留淡入淡出（默认跟随系统设置）"},
     };
     return m;
 }
@@ -1928,6 +1932,10 @@ const std::unordered_map<std::string, const char*>& ja() {
         {"tag, e.g. golden retriever", "タグ、例：golden retriever"},
         {"tag: name: desc: prompt: exif: place: camera: model: lora: — one field", "tag: name: desc: prompt: exif: place: camera: model: lora: — 一つの項目"},
         {"the question", "質問"},
+        {"Motion", "モーション"},
+        {"Full", "フル"},
+        {"Reduced", "控えめ"},
+        {"Short fades and slides; Reduced keeps only the fades (the system setting is followed by default)", "短いフェードとスライド。「控えめ」はフェードだけ（既定はシステムの設定に従う）"},
     };
     return m;
 }
@@ -3042,6 +3050,10 @@ const std::unordered_map<std::string, const char*>& ko() {
         {"tag, e.g. golden retriever", "태그, 예: golden retriever"},
         {"tag: name: desc: prompt: exif: place: camera: model: lora: — one field", "tag: name: desc: prompt: exif: place: camera: model: lora: — 한 항목"},
         {"the question", "질문"},
+        {"Motion", "움직임"},
+        {"Full", "전체"},
+        {"Reduced", "줄임"},
+        {"Short fades and slides; Reduced keeps only the fades (the system setting is followed by default)", "짧은 페이드와 슬라이드. “줄임”은 페이드만 남김 (기본은 시스템 설정을 따름)"},
     };
     return m;
 }

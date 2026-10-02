@@ -167,6 +167,12 @@ void attach_console() {
     SetConsoleOutputCP(CP_UTF8);
 }
 
+bool system_reduce_motion() {
+    BOOL on = TRUE;
+    SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &on, 0);
+    return !on;
+}
+
 bool have_trash() { return true; }  // the Recycle Bin
 
 bool trash(const std::string& path) {
