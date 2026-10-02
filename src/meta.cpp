@@ -337,8 +337,7 @@ WriteResult write_meta(const std::string& image_path, const MetaMap& existing, c
     util::ProcResult pr = util::run({"exiv2", "-q", "-m", cmd_path, "--", r.target}, "", 120);
     unlink(cmd_path.c_str());
     if (have_times && embed) {  // metadata edits should not look like a new file version
-        struct timespec ts[2] = {before.st_atim, before.st_mtim};
-        utimensat(AT_FDCWD, r.target.c_str(), ts, 0);
+        util::set_file_times(r.target, ST_ATIME(before), ST_MTIME(before));
     }
     if (pr.rc != 0) {
         r.error = util::trim(pr.err).substr(0, 400);

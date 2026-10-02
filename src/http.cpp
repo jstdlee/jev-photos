@@ -1,9 +1,27 @@
 #include "http.h"
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <mutex>
+typedef SOCKET sock_t;
+#define poll WSAPoll
+#define sock_close closesocket
+#define sock_err() (WSAGetLastError())
+#define MSG_NOSIGNAL 0
+#define SOCK_CLOEXEC 0
+#else
 #include <netdb.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+typedef int sock_t;
+#define INVALID_SOCKET (-1)
+#define sock_close close
+#define sock_err() (errno)
+#endif
 
 #include <cerrno>
 #include <chrono>
@@ -60,25 +78,40 @@ std::string dechunk(const std::string& s) {
 
 HttpResponse plain_http(const std::string& method, const Url& u, const std::string& body, const std::string& bearer, int timeout_s) {
     HttpResponse r;
+#ifdef _WIN32
+    static std::once_flag wsa;
+    std::call_once(wsa, [] { WSADATA d; WSAStartup(MAKEWORD(2, 2), &d); });
+#endif
     struct addrinfo hints{}, *res = nullptr;
     hints.ai_socktype = SOCK_STREAM;
     if (int e = getaddrinfo(u.host.c_str(), u.port.c_str(), &hints, &res); e != 0) {
         r.error = std::string("resolve ") + u.host + ": " + gai_strerror(e);
         return r;
     }
-    int fd = -1;
+    sock_t fd = INVALID_SOCKET;
+    int cerr = 0;
     for (auto* a = res; a; a = a->ai_next) {
         fd = socket(a->ai_family, a->ai_socktype | SOCK_CLOEXEC, a->ai_protocol);
-        if (fd < 0) continue;
+        if (fd == INVALID_SOCKET) continue;
+#ifdef _WIN32
+        DWORD tv = DWORD(timeout_s) * 1000;
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof tv);
+#else
         struct timeval tv{timeout_s, 0};
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-        if (connect(fd, a->ai_addr, a->ai_addrlen) == 0) break;
-        close(fd);
-        fd = -1;
+#endif
+        if (connect(fd, a->ai_addr, (int)a->ai_addrlen) == 0) break;
+        cerr = sock_err();
+        sock_close(fd);
+        fd = INVALID_SOCKET;
     }
     freeaddrinfo(res);
-    if (fd < 0) {
-        r.error = "connect " + u.host + ":" + u.port + ": " + strerror(errno);
+    if (fd == INVALID_SOCKET) {
+#ifdef _WIN32
+        r.error = "connect " + u.host + ":" + u.port + ": " + (cerr == WSAECONNREFUSED ? "Connection refused" : "error " + std::to_string(cerr));
+#else
+        r.error = "connect " + u.host + ":" + u.port + ": " + strerror(cerr);
+#endif
         return r;
     }
     std::string req = method + " " + u.path + " HTTP/1.1\r\nHost: " + u.host + ":" + u.port +
@@ -87,8 +120,8 @@ HttpResponse plain_http(const std::string& method, const Url& u, const std::stri
     if (method != "GET") req += "Content-Type: application/json\r\nContent-Length: " + std::to_string(body.size()) + "\r\n";
     req += "\r\n" + body;
     for (size_t off = 0; off < req.size();) {
-        ssize_t w = send(fd, req.data() + off, req.size() - off, MSG_NOSIGNAL);
-        if (w <= 0) { r.error = std::string("send: ") + strerror(errno); close(fd); return r; }
+        auto w = send(fd, req.data() + off, (int)(req.size() - off), MSG_NOSIGNAL);
+        if (w <= 0) { r.error = "send failed (" + std::to_string(sock_err()) + ")"; sock_close(fd); return r; }
         off += size_t(w);
     }
     std::string raw;
@@ -96,17 +129,17 @@ HttpResponse plain_http(const std::string& method, const Url& u, const std::stri
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_s);
     for (;;) {
         int left = int(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count());
-        if (left <= 0) { r.error = "timed out"; close(fd); return r; }
+        if (left <= 0) { r.error = "timed out"; sock_close(fd); return r; }
         struct pollfd p{fd, POLLIN, 0};
         int pr = poll(&p, 1, left);
         if (pr < 0 && errno == EINTR) continue;
         if (pr <= 0) continue;
-        ssize_t n = recv(fd, buf, sizeof buf, 0);
+        auto n = recv(fd, buf, (int)sizeof buf, 0);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) break;
         raw.append(buf, size_t(n));
     }
-    close(fd);
+    sock_close(fd);
     size_t hdr_end = raw.find("\r\n\r\n");
     if (hdr_end == std::string::npos || raw.compare(0, 5, "HTTP/") != 0) { r.error = "bad HTTP response"; return r; }
     std::string head = util::lower(raw.substr(0, hdr_end));
@@ -131,8 +164,8 @@ HttpResponse curl_http(const std::string& method, const std::string& url, const 
     }
     util::write_file(cfg_path, cfg, 0600);
     util::ProcResult p = util::run({"curl", "-K", cfg_path}, "", timeout_s + 5);
-    unlink(cfg_path.c_str());
-    unlink(body_path.c_str());
+    remove(cfg_path.c_str());
+    remove(body_path.c_str());
     size_t nl = p.out.rfind('\n');
     if (p.rc != 0 || nl == std::string::npos) { r.error = "curl: " + util::trim(p.err); return r; }
     r.status = atoi(p.out.c_str() + nl + 1);

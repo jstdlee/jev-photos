@@ -11,10 +11,7 @@ std::string default_config_path() { return util::config_dir() + "/config.ini"; }
 
 std::string db_path(const Config& c) {
     if (!c.db_override.empty()) return c.db_override;
-    const char* xdg = getenv("XDG_DATA_HOME");
-    std::string d = (xdg && *xdg ? std::string(xdg) : util::home() + "/.local/share") + "/jev-photos";
-    util::mkdirs(d);
-    return d + "/catalog.sqlite";
+    return util::data_dir() + "/catalog.sqlite";
 }
 
 std::string output_dir(const Config& c) {

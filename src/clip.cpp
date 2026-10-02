@@ -163,8 +163,7 @@ std::vector<int64_t> ClipTokenizer::encode(const std::string& text_in, size_t ma
 // Models
 
 std::string models_dir() {
-    const char* xdg = getenv("XDG_DATA_HOME");
-    return (xdg && *xdg ? std::string(xdg) : util::home() + "/.local/share") + "/jev-photos/models";
+    return util::data_dir() + "/models";
 }
 
 // Full precision when downloaded (the int8 exports lose a lot of accuracy), else the quantized files.
@@ -241,10 +240,33 @@ ClipInfo clip_choose(const Config& c) {
     return b32;
 }
 
+bool clip_download(const std::string& which, std::string& err, const std::function<void(const std::string&)>& status) {
+    std::string repo = which == "l14" ? "Xenova/clip-vit-large-patch14" : "Xenova/clip-vit-base-patch32";
+    std::string dir = models_dir() + "/" + (which == "l14" ? "clip-vit-large-patch14" : "clip-vit-base-patch32");
+    if (!util::which("curl")) { err = "curl is needed to download the model"; return false; }
+    util::mkdirs(dir);
+    const char* files[] = {"vocab.json", "merges.txt", "onnx/text_model.onnx", "onnx/vision_model.onnx"};
+    int k = 0;
+    for (const char* f : files) {
+        k++;
+        std::string out = dir + "/" + util::basename(f), part = out + ".part";
+        if (util::file_exists(out)) continue;
+        status(util::fmt("%d/4  %s", k, util::basename(f).c_str()));
+        util::ProcResult r = util::run({"curl", "-fsSL", "--retry", "3", "-o", part, "https://huggingface.co/" + repo + "/resolve/main/" + f}, "", 3600);
+        if (r.rc != 0 || rename(part.c_str(), out.c_str()) != 0) {
+            remove(part.c_str());
+            err = std::string(f) + ": " + (r.rc == -2 ? "timed out" : util::trim(r.err).substr(0, 200));
+            return false;
+        }
+    }
+    status("done");
+    return true;
+}
+
 bool clip_status(const Config& c, std::string& detail) {
     ClipInfo info = clip_choose(c);
     if (!clip_files_present(info.dir)) {
-        detail = info.label + ": model files missing (run scripts/fetch-models.sh" + (info.id.find("large") != std::string::npos ? " l14" : "") + ")";
+        detail = info.label + ": model not downloaded yet (Settings > Image recognition > Download)";
         return false;
     }
     bool gpu = c.clip_device != 1 && cuda_available();
@@ -277,7 +299,7 @@ static std::string status_msg(OrtStatus* st) {
 bool ClipModel::load(const ClipInfo& info, int device, int threads, bool need_vision, bool need_text, std::string& err) {
     info_ = info;
     if (!clip_files_present(info.dir)) {
-        err = "model files missing in " + info.dir + " (run scripts/fetch-models.sh)";
+        err = "model files missing in " + info.dir + " (Settings > Image recognition > Download)";
         return false;
     }
     if (!ort_env()) { err = "cannot start ONNX Runtime"; return false; }
@@ -297,7 +319,12 @@ bool ClipModel::load(const ClipInfo& info, int device, int threads, bool need_vi
     }
     if (device == 2 && device_used_ == "CPU") device_used_ = "CPU (no GPU provider in this ONNX Runtime build)";
     auto open = [&](const char* f, OrtSession** s) {
-        if (OrtStatus* st = ort()->CreateSession(ort_env(), (info.dir + "/" + f).c_str(), so, s)) {
+#ifdef _WIN32
+        std::wstring model_path = util::widen(info.dir + "/" + f);  // ORTCHAR_T is wchar_t on Windows
+#else
+        std::string model_path = info.dir + "/" + f;
+#endif
+        if (OrtStatus* st = ort()->CreateSession(ort_env(), model_path.c_str(), so, s)) {
             err = std::string(f) + ": " + status_msg(st);
             return false;
         }

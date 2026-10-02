@@ -1,0 +1,222 @@
+name: build
+
+# Every push and pull request: build Linux (x86_64, aarch64) and Windows (x86_64), run the unit tests on each, and
+# smoke-test the real program: analyse a folder of generated photos from the command line, then open the window on
+# software OpenGL and save a screenshot. Every push to main (and every v* tag) then publishes a GitHub release with
+# the packages and the screenshots.
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  EXIV2_VER: 0.28.9
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then v="${GITHUB_REF_NAME#v}"
+          else v="$(tr -d '[:space:]' < VERSION).${{ github.run_number }}"; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "version: $v"
+
+  linux:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools, X11 / GL headers, exiv2, Xvfb and Mesa
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+            libgl-dev exiv2 xvfb xauth libgl1-mesa-dri fonts-dejavu-core fonts-noto-cjk
+      - uses: actions/cache@v4
+        with:
+          path: third_party
+          key: deps-linux-${{ matrix.arch }}-${{ hashFiles('scripts/fetch-deps.sh') }}
+      - name: Fetch dependencies
+        run: scripts/fetch-deps.sh
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DJEV_VERSION="$VERSION"
+          cmake --build build
+          ./build/jev-photos --version
+      - name: Unit tests
+        run: ./build/jev-photos-tests
+      - name: Smoke test (command line, then the window on Xvfb + software GL)
+        run: |
+          export HOME="$RUNNER_TEMP/home" XDG_CONFIG_HOME="$RUNNER_TEMP/home/.config" XDG_DATA_HOME="$RUNNER_TEMP/home/.local/share" \
+                 XDG_CACHE_HOME="$RUNNER_TEMP/home/.cache"
+          mkdir -p "$HOME"
+          python3 scripts/smoke-photos.py smoke-photos
+          ./build/jev-photos --cli smoke-photos --stages scan,dupes,decide,organize --dry-run --no-jev | tee smoke.txt
+          ./build/jev-photos --stats smoke-photos | tee -a smoke.txt
+          grep -q "^photos 7 " smoke.txt
+          xvfb-run -a -s "-screen 0 1440x900x24" env JEV_PHOTOS_NO_SUPERVISOR=1 LIBGL_ALWAYS_SOFTWARE=1 \
+            ./build/jev-photos smoke-photos --screenshot "screenshot-linux-${{ matrix.arch }}.png" --delay 5
+          test -s "screenshot-linux-${{ matrix.arch }}.png"
+      - name: Package
+        run: |
+          name="jev-photos-${VERSION}-linux-${{ matrix.arch }}"
+          cmake --install build --prefix "dist/$name"
+          mkdir -p "dist/$name/scripts" "dist/$name/assets"
+          cp README.md LICENSE jev-photos.desktop "dist/$name/"
+          cp scripts/install-desktop.sh scripts/fetch-models.sh "dist/$name/scripts/"
+          cp assets/jev-photos.svg assets/jev-photos-256.png "dist/$name/assets/"
+          "dist/$name/bin/jev-photos" --version
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          mv screenshot-linux-*.png dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jev-photos-linux-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.png
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            git curl unzip
+            mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja
+      - uses: actions/cache@v4
+        with:
+          path: third_party
+          key: deps-windows-${{ hashFiles('scripts/fetch-deps.sh') }}
+      - name: Fetch dependencies
+        shell: msys2 {0}
+        run: scripts/fetch-deps.sh windows
+      - name: Build
+        shell: msys2 {0}
+        run: |
+          cmake -S . -B build -G Ninja -DJEV_VERSION="$VERSION"
+          cmake --build build
+      - name: exiv2 (bundled next to the program)
+        shell: msys2 {0}
+        run: |
+          curl -fsSL -o exiv2.zip "https://github.com/Exiv2/exiv2/releases/download/v$EXIV2_VER/exiv2-$EXIV2_VER-2022msvc-AMD64.zip"
+          unzip -q exiv2.zip -d exiv2
+          cp exiv2/*/bin/exiv2.exe exiv2/*/bin/exiv2.dll build/
+      - name: Unit tests
+        shell: msys2 {0}
+        run: ./build/jev-photos-tests.exe
+      - name: Smoke test (command line, then the window on Mesa software OpenGL)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The runner has no GPU and Windows' own OpenGL is 1.1: Mesa's llvmpipe next to the program gives 4.5.
+          gh release download --repo pal1000/mesa-dist-win --pattern '*release-msvc.7z' --dir mesa
+          7z x (Get-ChildItem mesa\*.7z).FullName -omesa\x | Out-Null
+          New-Item -ItemType Directory app, home | Out-Null
+          Copy-Item build\jev-photos.exe, build\onnxruntime.dll, build\exiv2.exe, build\exiv2.dll app\
+          Copy-Item mesa\x\x64\*.dll app\
+          $env:APPDATA = "$PWD\home\Roaming"; $env:LOCALAPPDATA = "$PWD\home\Local"
+          python scripts/smoke-photos.py smoke-photos
+          $cli = Start-Process app\jev-photos.exe -ArgumentList '--cli','smoke-photos','--stages','scan,dupes,decide,organize','--dry-run','--no-jev' `
+                   -NoNewWindow -Wait -PassThru -RedirectStandardOutput smoke.txt -RedirectStandardError smoke-err.txt
+          Get-Content smoke.txt -Tail 20; Get-Content smoke-err.txt -Tail 20
+          if ($cli.ExitCode -ne 0) { exit 1 }
+          $st = Start-Process app\jev-photos.exe -ArgumentList '--stats','smoke-photos' -NoNewWindow -Wait -PassThru -RedirectStandardOutput stats.txt
+          Get-Content stats.txt
+          if (-not (Select-String -Path stats.txt -Pattern "^photos 7 ")) { exit 1 }
+          $gui = Start-Process app\jev-photos.exe -ArgumentList 'smoke-photos','--screenshot','screenshot-windows-x86_64.png','--delay','6' -PassThru
+          $gui | Wait-Process -Timeout 120
+          if (-not (Test-Path screenshot-windows-x86_64.png)) { exit 1 }
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "jev-photos-$env:VERSION-windows-x86_64"
+          New-Item -ItemType Directory "dist\$name" | Out-Null
+          Copy-Item build\jev-photos.exe, build\onnxruntime.dll, build\exiv2.exe, build\exiv2.dll, README.md, LICENSE, scripts\install-desktop.ps1 "dist\$name\"
+          # the Visual C++ runtime that ONNX Runtime and exiv2 need, so nothing has to be installed first
+          foreach ($d in 'msvcp140.dll', 'msvcp140_1.dll', 'vcruntime140.dll', 'vcruntime140_1.dll') {
+            Copy-Item "$env:WINDIR\System32\$d" "dist\$name\"
+          }
+          Compress-Archive -Path "dist\$name\*" -DestinationPath "dist\$name.zip"
+          Move-Item screenshot-windows-*.png dist\
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jev-photos-windows-x86_64
+          path: |
+            dist/*.zip
+            dist/*.png
+
+  release:
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    needs: [version, linux, windows]
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Release notes
+        run: |
+          tag="v$VERSION"
+          prev=$(git tag --list 'v*' --sort=-v:refname | grep -vx "$tag" | head -1)
+          {
+            echo "## jev photos $tag"
+            echo
+            echo "Organize, tag and search your photos: dates recovered from evidence, duplicates, CLIP tags and search by meaning."
+            echo
+            echo "| System | Download |"
+            echo "|---|---|"
+            for f in dist/*.tar.gz dist/*.zip; do
+              n=$(basename "$f")
+              echo "| ${n#jev-photos-$VERSION-} | [$n](https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/$n) |"
+            done
+            echo
+            echo "**Windows 10/11:** unzip and run \`jev-photos.exe\` (\`install-desktop.ps1\` adds Start-menu and Desktop shortcuts). exiv2 is included."
+            echo
+            echo "**Linux:** unpack, run \`bin/jev-photos\` (\`scripts/install-desktop.sh\` adds a menu entry). Needs \`exiv2\` (\`sudo apt install exiv2\`)."
+            echo
+            echo "Image recognition: Settings → Image recognition → *Get fast* or *Get best* downloads the CLIP model once."
+            echo
+            echo "### Changes"
+            if [ -n "$prev" ]; then git log --no-merges --format='- %s (%h)' "$prev..$GITHUB_SHA"
+            else git log --no-merges --format='- %s (%h)' -20 "$GITHUB_SHA"; fi
+            echo
+            echo "Screenshots from this build's smoke tests (software rendering, generated test images) are attached."
+          } > notes.md
+          cat notes.md
+      - name: Publish release
+        run: |
+          tag="v$VERSION"
+          gh release create "$tag" dist/*.tar.gz dist/*.zip dist/*.png --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "jev photos $tag" --notes-file notes.md --latest

@@ -12,8 +12,7 @@
 #include "xxhash/xxhash.h"
 
 std::string thumbs_dir() {
-    const char* xdg = getenv("XDG_CACHE_HOME");
-    return (xdg && *xdg ? std::string(xdg) : util::home() + "/.cache") + "/jev-photos/thumbs";
+    return util::cache_dir() + "/thumbs";
 }
 
 std::string thumb_path(const ThumbKey& k, int side) {

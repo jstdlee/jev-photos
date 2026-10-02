@@ -62,9 +62,9 @@ bool load_preview(const std::string& path, Pixels& px) {
     util::run({"exiv2", "-q", "-ep" + std::to_string(best), "-l", dir, "--", path}, "", 30);
     bool ok = false;
     std::error_code ec;
-    for (auto& e : fs::directory_iterator(dir, ec))
-        if (!ok) ok = load_stb(e.path().string(), px);
-    fs::remove_all(dir, ec);
+    for (auto& e : fs::directory_iterator(fs::u8path(dir), ec))
+        if (!ok) ok = load_stb(e.path().u8string(), px);
+    fs::remove_all(fs::u8path(dir), ec);
     return ok;
 }
 

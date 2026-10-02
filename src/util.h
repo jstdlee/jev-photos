@@ -1,6 +1,8 @@
 // Small shared helpers: strings, naive civil date-times, hashing, base64, processes, files.
 #pragma once
 
+#include "compat.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -61,7 +63,14 @@ bool dir_exists(const std::string& p);
 bool read_file(const std::string& p, std::string& out);
 bool write_file(const std::string& p, const std::string& data, int mode = 0644);
 std::string home();
-std::string config_dir();  // ~/.config/jev-photos (created)
+std::string config_dir();  // ~/.config/jev-photos, %APPDATA%\jev-photos (created)
+std::string data_dir();    // ~/.local/share/jev-photos, %LOCALAPPDATA%\jev-photos (created)
+std::string cache_dir();   // ~/.cache/jev-photos, %LOCALAPPDATA%\jev-photos\cache (created)
+// A path as this app stores it: forward slashes on every system (Windows accepts them), no trailing slash.
+std::string norm_path(const std::string& p);
+std::string canonical(const std::string& p);  // absolute, symlinks resolved where they exist, norm_path form
+// Keep a file's modification time (and access time) as they were, after rewriting it.
+void set_file_times(const std::string& p, int64_t atime, int64_t mtime);
 std::string basename(const std::string& p);
 std::string dirname(const std::string& p);
 std::string stem(const std::string& p);
@@ -76,6 +85,17 @@ struct ProcResult {
 };
 // Runs argv[0] with args directly (no shell), capturing stdout/stderr, optional stdin.
 ProcResult run(const std::vector<std::string>& argv, const std::string& stdin_data = "", int timeout_s = 120);
-bool which(const std::string& exe);
+bool which(const std::string& exe);  // on PATH (Windows: also next to the app, .exe added)
+
+// ---- desktop
+bool have_trash();                                              // a restorable Trash / Recycle Bin is available
+bool trash(const std::string& path);                            // move one file there
+void open_path(const std::string& path_or_url);                 // default app / file manager / browser (detached)
+std::string choose_folder(const std::string& title);           // folder dialog; "" when cancelled (blocking)
+#ifdef _WIN32
+std::wstring widen(const std::string& utf8);
+void attach_console();  // stdout/stderr to the parent's console, if there is one
+std::string narrow(const std::wstring& w);
+#endif
 
 }  // namespace util

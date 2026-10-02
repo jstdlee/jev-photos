@@ -1,13 +1,17 @@
 #include "util.h"
 
 #include <fcntl.h>
+#include <sys/stat.h>
+#ifdef _WIN32
+#include <sys/utime.h>
+#else
 #include <poll.h>
 #include <signal.h>
 #include <spawn.h>
-#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 #include <atomic>
 #include <cerrno>
@@ -18,12 +22,15 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <thread>
 
 #define XXH_INLINE_ALL
 #include "xxhash/xxhash.h"
 
 namespace fs = std::filesystem;
+#ifndef _WIN32
 extern char** environ;
+#endif
 
 namespace util {
 
@@ -317,7 +324,12 @@ std::string quick_hash(const std::string& path, int64_t size) {
     size_t n = 8;
     auto rd = [&](int64_t off, int64_t len) {
         while (len > 0) {
+#ifdef _WIN32
+            if (_lseeki64(fd, off, SEEK_SET) != off) return false;
+            int r = _read(fd, buf.data() + n, unsigned(len));
+#else
             ssize_t r = pread(fd, buf.data() + n, size_t(len), off);
+#endif
             if (r <= 0) return false;
             n += size_t(r); off += r; len -= r;
         }
@@ -332,13 +344,15 @@ std::string quick_hash(const std::string& path, int64_t size) {
 std::string content_hash(const std::string& path) {
     int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) return "";
+#ifndef _WIN32
     posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
     XXH3_state_t* st = XXH3_createState();
     XXH3_128bits_reset(st);
     std::vector<char> buf(1 << 20);
     bool ok = true;
     for (;;) {
-        ssize_t r = read(fd, buf.data(), buf.size());
+        auto r = read(fd, buf.data(), (unsigned)buf.size());
         if (r == 0) break;
         if (r < 0) { if (errno == EINTR) continue; ok = false; break; }
         XXH3_128bits_update(st, buf.data(), size_t(r));
@@ -356,11 +370,11 @@ bool files_equal(const std::string& a, const std::string& b) {
     if (eq) eq = fstat(fa, &sa) == 0 && fstat(fb, &sb) == 0 && sa.st_size == sb.st_size;
     std::vector<char> x(1 << 20), y(1 << 20);
     while (eq) {
-        ssize_t ra = read(fa, x.data(), x.size());
+        auto ra = read(fa, x.data(), (unsigned)x.size());
         if (ra <= 0) { eq = ra == 0; break; }
-        ssize_t got = 0;
+        decltype(ra) got = 0;
         while (got < ra) {
-            ssize_t rb = read(fb, y.data() + got, size_t(ra - got));
+            auto rb = read(fb, y.data() + got, (unsigned)(ra - got));
             if (rb <= 0) { eq = false; break; }
             got += rb;
         }
@@ -418,39 +432,89 @@ bool write_file(const std::string& p, const std::string& data, int mode) {
     if (fd < 0) return false;
     size_t off = 0;
     while (off < data.size()) {
-        ssize_t w = write(fd, data.data() + off, data.size() - off);
+        auto w = write(fd, data.data() + off, (unsigned)(data.size() - off));
         if (w <= 0) { close(fd); return false; }
         off += size_t(w);
     }
     return close(fd) == 0;
 }
 
-std::string home() {
-    const char* h = getenv("HOME");
-    return h && *h ? h : ".";
+static std::string env(const char* k) {
+    const char* v = getenv(k);
+    return v && *v ? norm_path(v) : "";
 }
 
-std::string config_dir() {
-    const char* xdg = getenv("XDG_CONFIG_HOME");
-    std::string d = (xdg && *xdg ? std::string(xdg) : home() + "/.config") + "/jev-photos";
+std::string home() {
+#ifdef _WIN32
+    std::string h = env("USERPROFILE");
+#else
+    std::string h = env("HOME");
+#endif
+    return h.empty() ? "." : h;
+}
+
+static std::string app_dir(const char* xdg, const char* xdg_default, const char* win_env, const char* win_sub) {
+#ifdef _WIN32
+    (void)xdg; (void)xdg_default;
+    std::string base = env(win_env);
+    std::string d = (base.empty() ? home() : base) + "/jev-photos" + win_sub;
+#else
+    (void)win_env; (void)win_sub;
+    std::string base = env(xdg);
+    std::string d = (base.empty() ? home() + xdg_default : base) + "/jev-photos";
+#endif
     mkdirs(d);
     return d;
 }
+std::string config_dir() { return app_dir("XDG_CONFIG_HOME", "/.config", "APPDATA", ""); }
+std::string data_dir() { return app_dir("XDG_DATA_HOME", "/.local/share", "LOCALAPPDATA", ""); }
+std::string cache_dir() { return app_dir("XDG_CACHE_HOME", "/.cache", "LOCALAPPDATA", "/cache"); }
 
-std::string basename(const std::string& p) { return fs::path(p).filename().string(); }
-std::string dirname(const std::string& p) { return fs::path(p).parent_path().string(); }
-std::string stem(const std::string& p) { return fs::path(p).stem().string(); }
+std::string norm_path(const std::string& p) {
+    std::string r = p;
+#ifdef _WIN32
+    for (auto& c : r)
+        if (c == '\\') c = '/';
+#endif
+    while (r.size() > 1 && r.back() == '/' && !(r.size() == 3 && r[1] == ':')) r.pop_back();
+    return r;
+}
+
+// fs::path from/to UTF-8 (on Windows a plain std::string would go through the ANSI code page).
+static fs::path upath(const std::string& p) { return fs::u8path(p); }
+static std::string ustr(const fs::path& p) { return norm_path(p.u8string()); }
+
+std::string canonical(const std::string& p) {
+    std::error_code ec;
+    fs::path c = fs::weakly_canonical(upath(p), ec);
+    return ec ? norm_path(p) : ustr(c);
+}
+
+std::string basename(const std::string& p) { return upath(p).filename().u8string(); }
+std::string dirname(const std::string& p) { return ustr(upath(p).parent_path()); }
+std::string stem(const std::string& p) { return upath(p).stem().u8string(); }
 std::string ext_lower(const std::string& p) {
-    std::string e = fs::path(p).extension().string();
+    std::string e = upath(p).extension().u8string();
     return lower(e.empty() ? e : e.substr(1));
 }
 
 bool mkdirs(const std::string& p) {
     std::error_code ec;
-    fs::create_directories(p, ec);
+    fs::create_directories(upath(p), ec);
     return dir_exists(p);
 }
 
+void set_file_times(const std::string& p, int64_t atime, int64_t mtime) {
+#ifdef _WIN32
+    struct __utimbuf64 t{atime, mtime};
+    _wutime64(widen(p).c_str(), &t);
+#else
+    struct timespec ts[2] = {{(time_t)atime, 0}, {(time_t)mtime, 0}};
+    utimensat(AT_FDCWD, p.c_str(), ts, 0);
+#endif
+}
+
+#ifndef _WIN32  // Windows: os_win.cpp
 bool copy_file_preserve(const std::string& from, const std::string& to, std::string& err) {
     int in = open(from.c_str(), O_RDONLY | O_CLOEXEC);
     if (in < 0) { err = fmt("open %s: %s", from.c_str(), strerror(errno)); return false; }
@@ -477,7 +541,7 @@ bool copy_file_preserve(const std::string& from, const std::string& to, std::str
     if (ok && fsync(out) != 0) ok = false;
     close(out);
     if (ok) {
-        struct timespec ts[2] = {st.st_atim, st.st_mtim};  // keep the source's times on the copy
+        struct timespec ts[2] = {st.st_atim, st.st_mtim};  // keep the source's times on the copy (nanoseconds too)
         utimensat(AT_FDCWD, part.c_str(), ts, 0);
         // link() fails if `to` appeared meanwhile, so we still never clobber anything.
         if (link(part.c_str(), to.c_str()) != 0) { ok = false; err = fmt("link %s: %s", to.c_str(), strerror(errno)); }
@@ -486,12 +550,21 @@ bool copy_file_preserve(const std::string& from, const std::string& to, std::str
     return ok;
 }
 
+#endif
+
 std::string temp_path(const std::string& tag) {
     static std::atomic<unsigned> seq{0};
-    const char* t = getenv("TMPDIR");
-    return fmt("%s/jev-photos-%d-%u-%s", t && *t ? t : "/tmp", (int)getpid(), seq++, tag.c_str());
+#ifdef _WIN32
+    std::string t = env("TEMP");
+    if (t.empty()) t = cache_dir();
+#else
+    std::string t = env("TMPDIR");
+    if (t.empty()) t = "/tmp";
+#endif
+    return fmt("%s/jev-photos-%d-%u-%s", t.c_str(), (int)getpid(), seq++, tag.c_str());
 }
 
+#ifndef _WIN32  // Windows: os_win.cpp
 // ---------------------------------------------------------------------------
 // processes
 
@@ -566,5 +639,22 @@ bool which(const std::string& exe) {
         if (!d.empty() && access((d + "/" + exe).c_str(), X_OK) == 0) return true;
     return false;
 }
+
+
+// ---------------------------------------------------------------------------
+// desktop
+
+bool have_trash() { return which("gio"); }
+bool trash(const std::string& path) { return run({"gio", "trash", "--", path}, "", 30).rc == 0; }
+void open_path(const std::string& p) {
+    std::string target = p;
+    std::thread([target] { run({"xdg-open", target}, "", 30); }).detach();
+}
+std::string choose_folder(const std::string& title) {
+    ProcResult r = run({"zenity", "--file-selection", "--directory", "--title=" + title}, "", 3600);
+    if (r.rc == 127) r = run({"kdialog", "--getexistingdirectory", home()}, "", 3600);
+    return r.rc == 0 ? norm_path(trim(r.out)) : "";
+}
+#endif
 
 }  // namespace util

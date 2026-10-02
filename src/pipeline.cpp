@@ -78,9 +78,14 @@ const std::set<std::string>& image_exts() {
 }
 
 int64_t birth_time(const std::string& path) {
+#ifdef _WIN32
+    struct stat st{};  // Windows keeps the creation time in st_ctime
+    return stat(path.c_str(), &st) == 0 ? (int64_t)st.st_ctime : 0;
+#else
     struct statx sx{};
     if (statx(AT_FDCWD, path.c_str(), 0, STATX_BTIME, &sx) == 0 && (sx.stx_mask & STATX_BTIME)) return sx.stx_btime.tv_sec;
     return 0;
+#endif
 }
 
 // File-name words (rules; long names are refined by the LLM later). Confidence 0.5 = rules, 1 = decided.
@@ -140,10 +145,10 @@ std::string meta_location(const MetaMap& m) {
 
 std::vector<std::string> rel_dirs(const std::string& src_root, const std::string& file) {
     std::vector<std::string> out;
-    fs::path root = fs::path(src_root).lexically_normal();
-    fs::path p = fs::path(file).parent_path().lexically_normal();
+    fs::path root = fs::u8path(src_root).lexically_normal();
+    fs::path p = fs::u8path(file).parent_path().lexically_normal();
     while (!p.empty()) {
-        out.push_back(p.filename().string());
+        out.push_back(p.filename().u8string());
         if (p == root || p == p.root_path()) break;
         p = p.parent_path();
     }
@@ -204,7 +209,7 @@ void Pipeline::run(Config cfg, RunOptions opt) {
             std::string canon;
             for (auto& sc : util::split(opt.scope, '\n')) {  // one folder per line
                 std::error_code ec;
-                if (!util::trim(sc).empty()) canon += (canon.empty() ? "" : "\n") + fs::weakly_canonical(util::trim(sc), ec).string();
+                if (!util::trim(sc).empty()) canon += (canon.empty() ? "" : "\n") + util::canonical(util::trim(sc));
             }
             opt.scope = canon;
             log_.add(0, "scope: " + util::replace_all(opt.scope, "\n", ", "));
@@ -247,12 +252,12 @@ void Pipeline::scan(const Config& c, const RunOptions& o) {
     std::vector<std::pair<std::string, std::string>> files;  // (root, path)
     // Organized-copy folders are never scanned: the shared output folder, and each folder's own jev-organized.
     std::set<std::string> libs;
-    if (!c.library.empty()) libs.insert(fs::weakly_canonical(c.library).string());
+    if (!c.library.empty()) libs.insert(util::canonical(c.library));
     for (auto& s : c.sources) {
         std::error_code ec;
-        libs.insert(library_for(c, fs::weakly_canonical(s, ec).string()));
+        libs.insert(library_for(c, util::canonical(s)));
     }
-    std::string lib = c.library.empty() ? "" : fs::weakly_canonical(c.library).string();
+    std::string lib = c.library.empty() ? "" : util::canonical(c.library);
     // (root used for folder-name evidence, folder actually walked)
     std::vector<std::pair<std::string, std::string>> walks;
     if (!o.scope.empty()) {
@@ -263,7 +268,7 @@ void Pipeline::scan(const Config& c, const RunOptions& o) {
             std::string root = sc;
             for (auto& s : c.sources) {
                 std::error_code ec;
-                std::string cs = fs::weakly_canonical(s, ec).string();
+                std::string cs = util::canonical(s);
                 if (path_under(sc, cs) && cs.size() < root.size()) root = cs;
             }
             walks.push_back({root, sc});
@@ -271,7 +276,7 @@ void Pipeline::scan(const Config& c, const RunOptions& o) {
     } else {
         for (auto& s : c.sources) {
             std::error_code ec;
-            std::string cs = fs::weakly_canonical(s, ec).string();
+            std::string cs = util::canonical(s);
             walks.push_back({cs, cs});
         }
     }
@@ -286,18 +291,18 @@ void Pipeline::scan(const Config& c, const RunOptions& o) {
             continue;
         }
         progress.set_current("listing " + walk);
-        auto it = fs::recursive_directory_iterator(walk, fs::directory_options::skip_permission_denied, ec);
+        auto it = fs::recursive_directory_iterator(fs::u8path(walk), fs::directory_options::skip_permission_denied, ec);
         for (; !ec && it != fs::recursive_directory_iterator() && !stop_; it.increment(ec)) {
-            const fs::path& p = it->path();
-            std::string name = p.filename().string();
+            const std::string ps = util::norm_path(it->path().u8string());  // UTF-8, forward slashes on every system
+            std::string name = it->path().filename().u8string();
             if (it->is_directory(ec)) {
                 // Skip hidden folders, the library itself and macOS/Synology thumbnail stores.
-                if ((!name.empty() && name[0] == '.') || name == "@eaDir" || libs.count(p.string()))
+                if ((!name.empty() && name[0] == '.') || name == "@eaDir" || libs.count(ps))
                     it.disable_recursion_pending();
                 continue;
             }
             if (!name.empty() && name[0] == '.') continue;
-            if (it->is_regular_file(ec) && image_exts().count(util::ext_lower(name))) files.push_back({root, p.string()});
+            if (it->is_regular_file(ec) && image_exts().count(util::ext_lower(name))) files.push_back({root, ps});
         }
     }
     progress.total = int(files.size());
@@ -311,13 +316,13 @@ void Pipeline::scan(const Config& c, const RunOptions& o) {
         const auto& [root, path] = files[size_t(i)];
         struct stat st{};
         if (stat(path.c_str(), &st) != 0) { progress.errors++; return; }
-        if (db_.known_unchanged(path, st.st_size, st.st_mtim.tv_sec)) { progress.skipped++; return; }
+        if (db_.known_unchanged(path, st.st_size, ST_MTIME(st))) { progress.skipped++; return; }
         progress.set_current(path);
         Photo p;
         p.src_path = path;
         p.src_root = root;
         p.size = st.st_size;
-        p.mtime = st.st_mtim.tv_sec;
+        p.mtime = ST_MTIME(st);
         p.btime = birth_time(path);
         p.ext = util::ext_lower(path);
         p.quick_hash = util::quick_hash(path, p.size);  // full hashes are computed later, only for size+quick collisions
@@ -1541,7 +1546,7 @@ void Pipeline::apply_item(const Config& c, PlanItem& it) {
         struct stat st{};
         std::string from = it.action == "refile" ? it.old_dest : it.src;
         if (stat(from.c_str(), &st) != 0) { it.result = "source missing: " + from; return; }
-        if (it.action != "refile" && (st.st_size != p.size || st.st_mtim.tv_sec != p.mtime)) { it.result = "source changed since scan; rescan"; return; }
+        if (it.action != "refile" && (st.st_size != p.size || ST_MTIME(st) != p.mtime)) { it.result = "source changed since scan; rescan"; return; }
         std::string dir = util::dirname(it.dest), err;
         if (!util::mkdirs(dir)) { it.result = "cannot create " + dir; return; }
         bool ok;
@@ -1598,7 +1603,7 @@ void Pipeline::apply_item(const Config& c, PlanItem& it) {
             // new version and re-decide everything.
             struct stat st{};
             if (stat(file.c_str(), &st) == 0)
-                db_.refresh_file(p.id, st.st_size, st.st_mtim.tv_sec, util::quick_hash(file, st.st_size), read_meta(file).to_json());
+                db_.refresh_file(p.id, st.st_size, ST_MTIME(st), util::quick_hash(file, st.st_size), read_meta(file).to_json());
         }
         if (p.dest_path.empty()) {  // not organized: nothing else to record
             it.result = w.ok ? "ok" : "metadata failed: " + w.error;
@@ -1659,7 +1664,7 @@ void Pipeline::organize(const Config& c, const RunOptions& o) {
     }
     log_.add(0, util::fmt("applied %d of %d planned changes", ok, total));
     if (ok) last_applied_run = run_id_;
-    for (auto& old : db_.journal_prune(10)) { std::error_code ec; fs::remove_all(undo_dir(c, old), ec); }  // keep the last 10 runs undoable
+    for (auto& old : db_.journal_prune(10)) { std::error_code ec; fs::remove_all(fs::u8path(undo_dir(c, old)), ec); }  // keep the last 10 runs undoable
     run_id_.clear();
 }
 
@@ -1732,16 +1737,16 @@ void Pipeline::undo(const Config& c, const std::string& run) {
                     struct stat st{};
                     Photo p;
                     if (db_.load(e.photo_id, p) && p.src_path == e.dst && stat(e.dst.c_str(), &st) == 0)
-                        db_.refresh_file(p.id, st.st_size, st.st_mtim.tv_sec, util::quick_hash(e.dst, st.st_size), read_meta(e.dst).to_json());
+                        db_.refresh_file(p.id, st.st_size, ST_MTIME(st), util::quick_hash(e.dst, st.st_size), read_meta(e.dst).to_json());
                 }
             } else {
                 err = "backup missing";
             }
         } else if (e.kind == "copy") {
-            done = !util::file_exists(e.dst) || util::run({"gio", "trash", "--", e.dst}, "", 30).rc == 0;
+            done = !util::file_exists(e.dst) || util::trash(e.dst);
             if (!done) err = "could not move the copy to the Trash";
             else {
-                if (util::file_exists(sidecar_path(e.dst))) util::run({"gio", "trash", "--", sidecar_path(e.dst)}, "", 30);
+                if (util::file_exists(sidecar_path(e.dst))) util::trash(sidecar_path(e.dst));
                 db_.clear_dest(e.photo_id, e.prev_dest);
             }
         } else {  // move | rename | refile: rename back

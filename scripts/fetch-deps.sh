@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 # Fetch pinned third-party sources into third_party/: Dear ImGui, GLFW, stb, SQLite, nlohmann/json, xxHash, ONNX Runtime.
+#   scripts/fetch-deps.sh            for this system
+#   scripts/fetch-deps.sh windows    also the Windows ONNX Runtime (cross builds, and MSYS2 on Windows)
 set -euo pipefail
+target="${1:-}"
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) target=windows ;; esac
+unzip_to() {  # zip dir
+    if command -v unzip >/dev/null; then unzip -q "$1" -d "$2"
+    else python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$1" "$2"; fi
+}
 tp="$(cd "$(dirname "$0")/.." && pwd)/third_party"
 mkdir -p "$tp"
 
@@ -30,7 +38,7 @@ done
 if [ ! -f "$tp/sqlite/sqlite3.c" ]; then
     tmp="$(mktemp -d)"
     curl -fsSL -o "$tmp/s.zip" "https://www.sqlite.org/$SQLITE_ZIP"
-    python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$tmp/s.zip" "$tmp"
+    unzip_to "$tmp/s.zip" "$tmp"
     mkdir -p "$tp/sqlite"
     cp "$tmp"/sqlite-amalgamation-*/sqlite3.[ch] "$tp/sqlite/"
     rm -rf "$tmp"
@@ -42,7 +50,16 @@ mkdir -p "$tp/nlohmann"
 mkdir -p "$tp/xxhash"
 [ -f "$tp/xxhash/xxhash.h" ] || curl -fsSL -o "$tp/xxhash/xxhash.h" \
     "https://raw.githubusercontent.com/Cyan4973/xxHash/$XXHASH_VER/xxhash.h"
-if [ ! -f "$tp/onnxruntime/lib/libonnxruntime.so" ]; then
+if [ "$target" = windows ]; then
+    if [ ! -f "$tp/onnxruntime-win/lib/onnxruntime.dll" ]; then
+        tmp="$(mktemp -d)"
+        curl -fsSL -o "$tmp/ort.zip" "https://github.com/microsoft/onnxruntime/releases/download/v$ORT_VER/onnxruntime-win-x64-$ORT_VER.zip"
+        unzip_to "$tmp/ort.zip" "$tmp"
+        rm -rf "$tp/onnxruntime-win" && mv "$tmp"/onnxruntime-win-x64-* "$tp/onnxruntime-win"
+        rm -rf "$tmp"
+    fi
+fi
+if [ "$(uname -s)" = Linux ] && [ ! -f "$tp/onnxruntime/lib/libonnxruntime.so" ]; then
     arch=$(uname -m); case "$arch" in aarch64) ortarch=aarch64 ;; x86_64) ortarch=x64 ;; *) echo "no ONNX Runtime build for $arch"; exit 1 ;; esac
     tmp="$(mktemp -d)"
     curl -fsSL -o "$tmp/ort.tgz" "https://github.com/microsoft/onnxruntime/releases/download/v$ORT_VER/onnxruntime-linux-$ortarch-$ORT_VER.tgz"
@@ -50,9 +67,9 @@ if [ ! -f "$tp/onnxruntime/lib/libonnxruntime.so" ]; then
     rm -rf "$tp/onnxruntime" && mv "$tmp"/onnxruntime-linux-* "$tp/onnxruntime"
     rm -rf "$tmp"
 fi
-echo "third_party ready"
 
 mkdir -p "$tp/tabler"
 for f in fonts/tabler-icons.ttf tabler-icons.css; do
     [ -f "$tp/tabler/$(basename $f)" ] || curl -fsSL -o "$tp/tabler/$(basename $f)" "https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@$TABLER_VER/dist/$f"
 done
+echo "third_party ready"

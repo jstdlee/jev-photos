@@ -7,6 +7,8 @@
 // product is the cosine similarity.
 #pragma once
 
+#include <functional>
+
 #include <map>
 #include <memory>
 #include <string>
@@ -43,6 +45,9 @@ std::string models_dir();
 // For the status dot: model files present (and which model / device would be used).
 bool clip_status(const Config& c, std::string& detail);
 bool clip_files_present(const std::string& dir);
+// Download a model's full-precision files from Hugging Face with curl (blocking; run it on a thread).
+// which: "b32" (~600 MB) or "l14" (~1.7 GB). status gets a line per file. Returns false with err on failure.
+bool clip_download(const std::string& which, std::string& err, const std::function<void(const std::string&)>& status);
 
 class ClipModel {
 public:

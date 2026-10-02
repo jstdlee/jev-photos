@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Install the jev photos launcher for this user: icon, application-menu entry and a desktop shortcut.
-#   scripts/install-desktop.sh            (after ./build.sh)
+#   scripts/install-desktop.sh            (after ./build.sh, or from an unpacked release)
 #   scripts/install-desktop.sh --remove
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -15,12 +15,14 @@ if [ "${1:-}" = "--remove" ]; then
     echo "removed"
     exit 0
 fi
-[ -x "$root/build/jev-photos" ] || { echo "build first: ./build.sh"; exit 1; }
+exe="$root/bin/jev-photos"                        # release package
+[ -x "$exe" ] || exe="$root/build/jev-photos"     # source checkout
+[ -x "$exe" ] || { echo "build first: ./build.sh"; exit 1; }
 
 mkdir -p "$apps" "$icons/scalable/apps" "$icons/256x256/apps"
 cp "$root/assets/jev-photos.svg" "$icons/scalable/apps/jev-photos.svg"
 cp "$root/assets/jev-photos-256.png" "$icons/256x256/apps/jev-photos.png"
-sed -e "s|^Exec=.*|Exec=$root/build/jev-photos %f|" -e "s|^Path=.*|Path=$root|" "$root/jev-photos.desktop" > "$apps/$entry"
+sed -e "s|^Exec=.*|Exec=$exe %f|" -e "s|^Path=.*|Path=$root|" "$root/jev-photos.desktop" > "$apps/$entry"
 chmod +x "$apps/$entry"
 if [ -d "$desktop_dir" ]; then
     cp "$apps/$entry" "$desktop_dir/$entry"

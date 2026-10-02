@@ -4,11 +4,13 @@
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 
+#include <sys/stat.h>
+#ifndef _WIN32
 #include <spawn.h>
 #include <sys/prctl.h>
-#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -84,7 +86,9 @@ struct FrameProf {
     }
 };
 static FrameProf g_prof;
+#ifndef _WIN32
 extern char** environ;
+#endif
 
 // ---------------------------------------------------------------------------
 // Fonts (as in gpu-hud): a Latin base plus the CJK face for the UI language, so Chinese paths render.
@@ -107,18 +111,31 @@ static FontFace fc_match(const char* pattern) {
 }
 
 // The Tabler icon font, linked into the binary.
-__asm__(".section .rodata\n.balign 16\n.global jev_icons_ttf\njev_icons_ttf:\n.incbin \"" ICON_TTF "\"\n"
-        ".global jev_icons_ttf_end\njev_icons_ttf_end:\n.previous\n");
+#ifdef _WIN32  // PE/COFF: read-only data section, and no .previous
+#define JEV_RODATA ".section .rdata,\"dr\"\n"
+#define JEV_BACK ".text\n"
+#else
+#define JEV_RODATA ".section .rodata\n"
+#define JEV_BACK ".previous\n"
+#endif
+__asm__(JEV_RODATA ".balign 16\n.global jev_icons_ttf\njev_icons_ttf:\n.incbin \"" ICON_TTF "\"\n"
+        ".global jev_icons_ttf_end\njev_icons_ttf_end:\n" JEV_BACK);
 extern "C" const unsigned char jev_icons_ttf[], jev_icons_ttf_end[];
 
 static void build_fonts() {
     ImGuiIO& io = ImGui::GetIO();
     io.Fonts->Clear();
     FontFace base;
+#ifdef _WIN32
+    std::string windir = getenv("WINDIR") ? util::norm_path(getenv("WINDIR")) : "C:/Windows";
+    for (const char* f : {"segoeui.ttf", "arial.ttf"})
+        if (util::file_exists(windir + "/Fonts/" + f)) { base.file = windir + "/Fonts/" + f; break; }
+#else
     for (const char* p : {"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/TTF/DejaVuSans.ttf",
                           "/usr/share/fonts/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"})
         if (util::file_exists(p)) { base.file = p; break; }
     if (base.file.empty()) base = fc_match("sans-serif:lang=en");
+#endif
     ImFontConfig cfg;
     cfg.OversampleH = 2;
     bool have = false;
@@ -128,8 +145,14 @@ static void build_fonts() {
     }
     if (!have) io.Fonts->AddFontDefault();
     // Always merge a CJK face: file and folder names are often Chinese/Japanese even in an English UI.
+#ifdef _WIN32
+    for (const char* f : {"msyh.ttc", "simsun.ttc", "YuGothM.ttc", "meiryo.ttc", "malgun.ttf"}) {
+        FontFace cjk;
+        if (util::file_exists(windir + "/Fonts/" + f)) cjk.file = windir + "/Fonts/" + f;
+#else
     for (const char* pat : {"sans-serif:lang=zh-cn", "sans-serif:lang=ja", "sans-serif:lang=ko"}) {
         FontFace cjk = fc_match(pat);
+#endif
         if (cjk.file.empty() || cjk.file == base.file) continue;
         ImFontConfig m;
         m.MergeMode = true;
@@ -481,9 +504,6 @@ struct Viewer {
     std::shared_ptr<ViewerSlot> slot = std::make_shared<ViewerSlot>();
 };
 
-static void run_detached(std::vector<std::string> argv) {
-    std::thread([argv] { util::run(argv, "", 30); }).detach();
-}
 
 struct App {
     GLFWwindow* win = nullptr;
@@ -813,11 +833,10 @@ static void start_dir_dialog(App& a, int target) {
     if (a.dlg_running.exchange(true)) return;
     a.dlg_target = target;
     std::thread([&a] {
-        util::ProcResult r = util::run({"zenity", "--file-selection", "--directory", "--title=Choose folder"}, "", 3600);
-        if (r.rc == 127) r = util::run({"kdialog", "--getexistingdirectory", util::home()}, "", 3600);
+        std::string chosen = util::choose_folder(tr("Choose folder"));
         {
             std::lock_guard<std::mutex> l(a.dlg_mu);
-            a.dlg_result = r.rc == 0 ? util::trim(r.out) : "";
+            a.dlg_result = chosen;
         }
         a.dlg_running = false;
         glfwPostEmptyEvent();
@@ -851,7 +870,7 @@ static void set_view_all(App& a, bool all) {
 
 static void set_folder(App& a, const std::string& f_in) {
     std::error_code ec;
-    std::string f = std::filesystem::weakly_canonical(util::trim(f_in), ec).string();
+    std::string f = util::canonical(util::trim(f_in));
     if (f.empty()) return;
     if (!util::dir_exists(f)) {
         a.log.add(2, "folder not found: " + f);
@@ -1261,10 +1280,10 @@ static void draw_viewer(App& a) {
                   st.FramePadding.x * 6 + st.ItemSpacing.x * 2 + st.WindowPadding.x;
         ImGui::SameLine(ImGui::GetWindowWidth() - w);
     }
-    if (ImGui::Button(tr("Open file"))) run_detached({"xdg-open", p.src_path});
+    if (ImGui::Button(tr("Open file"))) util::open_path(p.src_path);
     tip(tr("Open the photo in the default viewer"));
     ImGui::SameLine();
-    if (ImGui::Button(tr("Open folder"))) run_detached({"xdg-open", util::dirname(p.src_path)});
+    if (ImGui::Button(tr("Open folder"))) util::open_path(util::dirname(p.src_path));
     tip(tr("Open the folder that holds this photo"));
     ImGui::SameLine();
     if (ImGui::Button(tr("Close"))) v.open = false;
@@ -1326,7 +1345,7 @@ static void trash_files(App& a, const std::vector<std::pair<int64_t, std::vector
     a.trash_done = a.trash_failed = 0;
     std::vector<std::string> folders = a.cfg.folders;
     std::thread([&a, todo, folders, what] {
-        bool gio = util::which("gio");
+        bool gio = util::have_trash();
         std::vector<int64_t> gone;
         for (auto& [id, paths] : todo) {
           bool first_ok = false;
@@ -1334,7 +1353,7 @@ static void trash_files(App& a, const std::vector<std::pair<int64_t, std::vector
             const std::string& path = paths[pi];
             bool ok = false;
             if (!util::file_exists(path)) ok = true;
-            else if (gio) ok = util::run({"gio", "trash", "--", path}, "", 30).rc == 0;
+            else if (gio) ok = util::trash(path);
             else {
                 std::string folder = util::dirname(path);
                 for (auto& f : folders)
@@ -1370,7 +1389,7 @@ static void draw_trash_modal(App& a) {
     ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowSize(ImVec2(std::min(1100.0f, vp->WorkSize.x - 40), std::min(640.0f, vp->WorkSize.y - 40)), ImGuiCond_Appearing);
     if (!ImGui::BeginPopupModal((std::string(tr("Remove extra copies")) + "###trash").c_str(), nullptr, ImGuiWindowFlags_NoSavedSettings)) return;
-    bool gio = util::which("gio");
+    bool gio = util::have_trash();
     std::map<int64_t, const DupRow*> by;
     for (auto& r : a.dup_rows) by[r.id] = &r;
     std::map<int64_t, int> group_no;
@@ -1520,10 +1539,10 @@ static void draw_detail(App& a) {
     }
     tip(tr("Photos that look like this one (CLIP); also: like:#id or like:<file name> in the search box"));
     ImGui::SameLine();
-    if (ImGui::SmallButton(tr("Open file"))) run_detached({"xdg-open", open_target});
+    if (ImGui::SmallButton(tr("Open file"))) util::open_path(open_target);
     tip(tr("Open the photo in the default viewer"));
     ImGui::SameLine();
-    if (ImGui::SmallButton(tr("Open folder"))) run_detached({"xdg-open", util::dirname(open_target)});
+    if (ImGui::SmallButton(tr("Open folder"))) util::open_path(util::dirname(open_target));
     tip(tr("Open the folder that holds this photo"));
     ImGui::Separator();
 
@@ -2507,7 +2526,7 @@ static const Texture* grid_thumb(App& a, const PhotoRow& r) {
     g->pending.insert(r.id);
     ThumbKey key{r.src_path, r.size, r.mtime};  // the scanned mtime: a cached thumbnail still shows when the drive is away
     struct stat st{};
-    if (stat(r.src_path.c_str(), &st) == 0) key.mtime = st.st_mtim.tv_sec;
+    if (stat(r.src_path.c_str(), &st) == 0) key.mtime = ST_MTIME(st);
     int side = thumb_side_for(r.src_path, a.cfg.thumb_side, a.cfg.vl_max_side);
     int64_t id = r.id;
     std::thread([g, key, side, id] {
@@ -2589,7 +2608,7 @@ static void draw_photo_trash(App& a) {
     ImGui::Text("%zu %s · %s", sel.size(), tr("photos"), util::human_size(bytes).c_str());
     for (size_t i = 0; i < sel.size() && i < 8; i++) ImGui::BulletText("%s", rel_path(a.cfg, sel[i]->src_path).c_str());
     if (sel.size() > 8) ImGui::TextDisabled("... %s %zu %s", tr("and"), sel.size() - 8, tr("more"));
-    bool gio = util::which("gio");
+    bool gio = util::have_trash();
     ImGui::TextWrapped("%s", gio ? tr("They go to the desktop Trash and can be restored from there. They also leave the catalog.")
                                  : tr("No desktop Trash here: they are moved into a jev-duplicates folder inside their photo folder."));
     if (copies) {
@@ -2730,7 +2749,7 @@ static void draw_photo_grid(App& a) {
                     a.rows_dirty = true;
                 }
                 tip(tr("Photos that look like this one (CLIP); also like:#id in the search box"));
-                if (ImGui::MenuItem(tr("Open folder"))) run_detached({"xdg-open", util::dirname(r.dest_path.empty() ? r.src_path : r.dest_path)});
+                if (ImGui::MenuItem(tr("Open folder"))) util::open_path(util::dirname(r.dest_path.empty() ? r.src_path : r.dest_path));
                 tip(tr("Open the folder that holds this photo"));
                 if (ImGui::MenuItem(tr("Move to Trash..."))) {
                     if (!a.multi.count(r.id)) a.multi = {r.id};
@@ -3079,7 +3098,7 @@ static void draw_dupes(App& a) {
         ImGui::TextDisabled("%s · %d x %d · %s", util::human_size(p.size).c_str(), p.width, p.height, p.date_value.c_str());
         if (!p.content_hash.empty()) ImGui::TextDisabled("XXH3-128 %s", p.content_hash.c_str());
         else if (!p.quick_hash.empty()) ImGui::TextDisabled("quick %s", p.quick_hash.c_str());
-        if (ImGui::SmallButton(tr("Open folder"))) run_detached({"xdg-open", util::dirname(p.src_path)});
+        if (ImGui::SmallButton(tr("Open folder"))) util::open_path(util::dirname(p.src_path));
         tip(tr("Open the folder that holds this photo"));
     } else {
         ImGui::TextDisabled("%s", tr("Select a file to preview it."));
@@ -3400,6 +3419,63 @@ static void draw_settings(App& a) {
             c.clip_model = ci == 1 ? "b32" : ci == 2 ? "l14" : "auto";
     }
     choice(tr("Run on"), tr("The GPU needs an ONNX Runtime build with CUDA"), &c.clip_device, {tr("Auto"), tr("CPU"), tr("GPU")});
+    {
+        // The models are downloaded once from Hugging Face (curl; on Windows 10+ it is built in).
+        struct Dl {
+            std::mutex mu;
+            std::string status, err;
+            std::atomic<bool> busy{false};
+        };
+        static auto dl = std::make_shared<Dl>();
+        bool have_b32 = clip_files_present(models_dir() + "/clip-vit-base-patch32");
+        bool have_l14 = clip_files_present(models_dir() + "/clip-vit-large-patch14");
+        std::string st, er;
+        {
+            std::lock_guard<std::mutex> l(dl->mu);
+            st = dl->status;
+            er = dl->err;
+        }
+        std::string desc = dl->busy ? std::string(tr("Downloading")) + " " + st
+                         : !er.empty() ? std::string(tr("Download failed: ")) + er
+                                       : util::fmt("%s: %s  ·  %s: %s", tr("Fast"), have_b32 ? tr("ready") : tr("not downloaded"), tr("Best"),
+                                                   have_l14 ? tr("ready") : tr("not downloaded"));
+        float bw = 0;
+        std::vector<std::pair<const char*, const char*>> btns;
+        if (!have_b32) btns.push_back({"b32", tr("Get fast (600 MB)")});
+        if (!have_l14) btns.push_back({"l14", tr("Get best (1.7 GB)")});
+        for (auto& b : btns) bw += ImGui::CalcTextSize(b.second).x + 20;
+        ImVec2 top = row(tr("Models"), desc.c_str(), std::max(bw, 1.0f), dl->busy ? nullptr : tr("Saved in your app data folder; downloaded once"));
+        ImGui::BeginDisabled(dl->busy);
+        for (size_t i = 0; i < btns.size(); i++) {
+            if (i) ImGui::SameLine(0, 6);
+            if (ImGui::Button(btns[i].second)) {
+                std::string which = btns[i].first;
+                dl->busy = true;
+                {
+                    std::lock_guard<std::mutex> l(dl->mu);
+                    dl->err.clear();
+                    dl->status.clear();
+                }
+                std::thread([which, d = dl, &a] {
+                    std::string err;
+                    bool ok = clip_download(which, err, [d](const std::string& s2) {
+                        std::lock_guard<std::mutex> l(d->mu);
+                        d->status = s2;
+                        glfwPostEmptyEvent();
+                    });
+                    {
+                        std::lock_guard<std::mutex> l(d->mu);
+                        d->err = ok ? "" : err;
+                    }
+                    d->busy = false;
+                    a.health_at = -100;  // check again: recognition may be ready now
+                    glfwPostEmptyEvent();
+                }).detach();
+            }
+        }
+        ImGui::EndDisabled();
+        row_end(top, "x");
+    }
     slider_i(tr("CPU threads"), tr("More is faster but leaves less of the machine for other work"), &c.clip_threads, 1, 16);
     slider_i(tr("Tags per photo"), tr("At most this many tags per photo"), &c.clip_max_tags, 1, 15);
     slider_i(tr("Thumbnail size"), tr("Side of the cached thumbnails the analysis and the lists use (px)"), &c.thumb_side, 256, 1024);
@@ -3684,9 +3760,9 @@ static void draw_help(App& a) {
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem(tr("About"))) {
-            ImGui::Text("jev photos");
+            ImGui::Text("jev photos %s", JEV_VERSION);
             ImGui::TextDisabled("%s", tr("Organize, tag and search photos, with explainable decisions."));
-            if (ImGui::Button("github.com/jstdlee/jev-photos")) run_detached({"xdg-open", "https://github.com/jstdlee/jev-photos"});
+            if (ImGui::Button("github.com/jstdlee/jev-photos")) util::open_path("https://github.com/jstdlee/jev-photos");
             tip(tr("Open the project page in the browser"));
             ImGui::SeparatorText(tr("Credits"));
             const char* credits[] = {"Dear ImGui (Omar Cornut) · GLFW · OpenGL", "SQLite with FTS5 · nlohmann/json · xxHash · stb_image",
@@ -4225,7 +4301,7 @@ static void draw_sidebar(App& a) {
             set_section(a, SEC_FOLDER, f);
         if (!here) ImGui::PopStyleColor();
         if (ImGui::BeginPopupContextItem(("fold" + f).c_str())) {
-            if (ImGui::MenuItem(tr("Open in file manager"))) run_detached({"xdg-open", f});
+            if (ImGui::MenuItem(tr("Open in file manager"))) util::open_path(f);
             if (ImGui::MenuItem(tr("Remove from the list"))) {
                 remove_folder(a.cfg, f);
                 save_config(a.cfg, a.config_file);
@@ -5005,6 +5081,7 @@ static void save_screenshot(const std::string& path, int w, int h) {
 // nearly exhausted (e.g. a large model server holds most of the unified memory). That cannot be caught in-process,
 // so the window runs in a child: if it dies from a crash in its first 20 s, it is restarted once with Mesa software
 // rendering, which is plenty for this UI.
+#ifndef _WIN32
 static void set_software_gl() {
     setenv("__GLX_VENDOR_LIBRARY_NAME", "mesa", 1);
     setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
@@ -5052,6 +5129,8 @@ static int supervise(int argc, char** argv, int renderer) {
     }
     return rc;
 }
+
+#endif
 
 // --clip-test IMG...: load CLIP, print the tags it picks and the time it takes (for tuning the vocabulary).
 static int clip_test(const Config& c, const std::vector<std::string>& files) {
@@ -5124,8 +5203,8 @@ static void usage() {
 
 static int cli_explain(const Config& c, const std::string& file, const std::string& root_in) {
     if (!util::file_exists(file)) { fprintf(stderr, "no such file: %s\n", file.c_str()); return 1; }
-    std::string path = fs::weakly_canonical(file).string();
-    std::string root = root_in.empty() ? util::dirname(path) : fs::weakly_canonical(root_in).string();
+    std::string path = util::canonical(file);
+    std::string root = root_in.empty() ? util::dirname(path) : util::canonical(root_in);
     MetaMap m = read_meta(path);
     struct stat st{};
     stat(path.c_str(), &st);
@@ -5133,7 +5212,7 @@ static int cli_explain(const Config& c, const std::string& file, const std::stri
     in.filename = util::basename(path);
     in.dirs = rel_dirs(root, path);
     in.meta = &m;
-    in.mtime = st.st_mtim.tv_sec;
+    in.mtime = ST_MTIME(st);
     in.now = util::now_epoch();
     in.min_year = c.min_year;
     DateDecision d = decide_date(in, c.review_below);
@@ -5176,7 +5255,7 @@ static int run_cli(App& a, bool dry) {
     }
     if (!open_db(a)) return 2;
     a.log.echo = true;
-    a.opts.scope = a.opts.scope.empty() ? all_scope(a.cfg) : fs::weakly_canonical(a.opts.scope).string();
+    a.opts.scope = a.opts.scope.empty() ? all_scope(a.cfg) : util::canonical(a.opts.scope);
     a.opts.plan_only = dry;
     for (auto& f : a.cfg.folders) fprintf(stderr, "folder %s\norganized copies -> %s\n", f.c_str(), library_for(effective(a.cfg), f).c_str());
     a.pipe->start(effective(a.cfg), a.opts);
@@ -5214,7 +5293,12 @@ static int run_cli(App& a, bool dry) {
 }
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    util::attach_console();  // a GUI program: print to the terminal it was started from (CLI modes, --help)
+#endif
+#ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
+#endif
     App app;
     Pipeline pipe(app.db, app.log);
     app.pipe = &pipe;
@@ -5300,17 +5384,18 @@ int main(int argc, char** argv) {
         else if (a == "--clip-model" && i + 1 < argc) app.cfg.clip_model = argv[++i];
         else if (a == "--clip-test") { std::vector<std::string> fs; while (i + 1 < argc) fs.push_back(argv[++i]); glfwInit(); return clip_test(app.cfg, fs); }
         else if (a == "-h" || a == "--help") { usage(); return 0; }
+        else if (a == "--version") { printf("jev-photos %s\n", JEV_VERSION); return 0; }
         else if (!a.empty() && a[0] != '-') srcs.push_back(a);  // positional: the photo folder
         else { fprintf(stderr, "unknown option %s\n", a.c_str()); usage(); return 2; }
     }
     if (!srcs.empty()) {
         // Folders on the command line: the CLI works on exactly those (together); the GUI adds them to its list.
         if (cli) app.cfg.folders.clear();
-        for (auto& f : srcs) add_folder(app.cfg, fs::weakly_canonical(f).string());
-        app.cfg.folder = fs::weakly_canonical(srcs[0]).string();
+        for (auto& f : srcs) add_folder(app.cfg, util::canonical(f));
+        app.cfg.folder = util::canonical(srcs[0]);
         app.cfg.view_all = cli && srcs.size() > 1;
     }
-    if (!lib.empty()) app.cfg.output = fs::weakly_canonical(lib).string();
+    if (!lib.empty()) app.cfg.output = util::canonical(lib);
     if (save_cfg) save_config(app.cfg, app.config_file);
     signal(SIGINT, [](int) { g_quit = 1; });
     signal(SIGTERM, [](int) { g_quit = 1; });
@@ -5392,8 +5477,10 @@ int main(int argc, char** argv) {
     if (cli) return run_cli(app, app.cfg.dry_run);
 
     // ---------------- GUI
+#ifndef _WIN32  // (the NVIDIA-on-GB10 startup crash this guards against is Linux-only)
     if (!getenv("JEV_PHOTOS_CHILD") && !getenv("JEV_PHOTOS_NO_SUPERVISOR")) return supervise(argc, argv, app.cfg.renderer);
     if (getenv("JEV_PHOTOS_CHILD")) prctl(PR_SET_PDEATHSIG, SIGTERM);  // the window never outlives its supervisor
+#endif
     if (!app.cfg.lang.empty()) set_lang(lang_from_code(app.cfg.lang.c_str()));
     else {
         const char* l = getenv("LC_ALL");
@@ -5448,7 +5535,7 @@ int main(int argc, char** argv) {
     open_db(app);
     check_health(app);
     if (!startup_preview.empty()) {
-        std::string p = fs::weakly_canonical(startup_preview).string();
+        std::string p = util::canonical(startup_preview);
         set_folder(app, p);
         start_run(app, ST_SCAN | ST_DUPES | ST_DECIDE | ST_ORGANIZE, true);
     }

@@ -1,5 +1,6 @@
 // Unit tests for the decision model and metadata safety. Run: build/jev-photos-tests
 #include <sys/stat.h>
+#include <filesystem>
 #include <unistd.h>
 
 #include <algorithm>
@@ -53,6 +54,19 @@ static MetaMap meta_with(std::initializer_list<std::pair<const char*, const char
     MetaMap m;
     for (auto& [k, v] : kv) { m.kv[k].push_back(v); m.type[k] = "Ascii"; }
     return m;
+}
+
+static void rm_rf(const std::string& dir) {
+    std::error_code ec;
+    std::filesystem::remove_all(std::filesystem::u8path(dir), ec);
+}
+static void set_env(const char* k, const std::string& v) {
+#ifdef _WIN32
+    _putenv_s(k, v.c_str());  // "" removes it
+#else
+    if (v.empty()) unsetenv(k);
+    else setenv(k, v.c_str(), 1);
+#endif
 }
 
 static void test_civil() {
@@ -303,7 +317,7 @@ static void test_meta_roundtrip() {
     CHECK(kws.size() == 3);  // family (kept, not duplicated as "Family"), beach, "sunset  orange sky"
     struct stat st{};
     stat(img.c_str(), &st);
-    CHECK(st.st_mtim.tv_sec == before.st_mtim.tv_sec);  // file time preserved
+    CHECK(ST_MTIME(st) == ST_MTIME(before));  // file time preserved
 
     WriteResult again = write_meta(img, after, p, MetaTarget::Embed, false);
     CHECK(again.ok && again.added == 0);  // idempotent
@@ -345,7 +359,7 @@ static void test_meta_roundtrip() {
     CHECK(!util::copy_file_preserve(img2, img, err));
     CHECK(util::copy_file_preserve(img2, dir + "/c.jpg", err));
     CHECK_EQ(util::sha256_file(dir + "/c.jpg"), sha);
-    util::run({"rm", "-rf", dir});
+    rm_rf(dir);
 }
 
 static void test_sha() {
@@ -435,13 +449,22 @@ static void test_hashes_and_dupes() {
     c.id = 12; c.dhash = h2; c.width = W; c.height = H;
     auto links = similar_links({&a, &b, &c}, 6);
     CHECK(links.size() == 1 && links[0].id == 11 && links[0].to == 10);  // the larger original is the representative
-    util::run({"rm", "-rf", dir});
+    rm_rf(dir);
 }
 
 static void test_thumbs() {
     std::string dir = util::temp_path("thumbs");
     util::mkdirs(dir);
-    setenv("XDG_CACHE_HOME", dir.c_str(), 1);
+#ifdef _WIN32
+    const char* cache_var = "LOCALAPPDATA";
+    const std::string cache_sub = "/jev-photos/cache/thumbs/";
+    std::string saved_cache = getenv(cache_var) ? getenv(cache_var) : "";
+#else
+    const char* cache_var = "XDG_CACHE_HOME";
+    const std::string cache_sub = "/jev-photos/thumbs/";
+    std::string saved_cache = getenv(cache_var) ? getenv(cache_var) : "";
+#endif
+    set_env(cache_var, dir);
     CHECK(thumb_side_for("/p/IMG_1.JPG", 512, 1024) == 512);
     CHECK(thumb_side_for("/p/desktop__about.png", 512, 1024) == 1024);
     CHECK(thumb_side_for("/p/Screenshot_2021-11-02.jpg", 512, 1024) == 1024);
@@ -452,17 +475,21 @@ static void test_thumbs() {
     CHECK(stbi_write_jpg(img.c_str(), 3000, 2000, 3, px.data(), 80));
     ThumbKey k{img, 123, 456};
     std::string err, t1 = ensure_thumb(k, 6, 512, err);
-    CHECK(!t1.empty() && util::starts_with(t1, dir + "/jev-photos/thumbs/"));
+    CHECK(!t1.empty() && util::starts_with(t1, dir + cache_sub));
     int w = 0, h = 0, n = 0;
     CHECK(stbi_info(t1.c_str(), &w, &h, &n) && w == 341 && h == 512);
     struct stat a{}, b{};
     stat(t1.c_str(), &a);
     CHECK(ensure_thumb(k, 6, 512, err) == t1);  // cached: not rewritten
     stat(t1.c_str(), &b);
+#ifdef _WIN32
+    CHECK(ST_MTIME(a) == ST_MTIME(b) && a.st_size == b.st_size);
+#else
     CHECK(a.st_mtim.tv_nsec == b.st_mtim.tv_nsec && a.st_ino == b.st_ino);
+#endif
     CHECK(thumb_path({img, 123, 457}, 512) != t1);  // a changed file gets a new thumbnail
-    util::run({"rm", "-rf", dir});
-    unsetenv("XDG_CACHE_HOME");
+    rm_rf(dir);
+    set_env(cache_var, saved_cache);
 }
 
 static void test_date_ranges() {
@@ -575,7 +602,7 @@ static void test_genmeta() {
     CHECK(t.count("parameters") == 1);
     GenInfo pg = read_gen_info(png, MetaMap{});
     CHECK(pg.tool == "A1111" && pg.prompt == "a lighthouse at night" && pg.seed == "9");
-    util::run({"rm", "-rf", dir});
+    rm_rf(dir);
     // Midjourney: the description ending in Job ID
     MetaMap mj;
     mj.kv["Xmp.dc.description"] = {"lang=\"x-default\" a castle in the clouds --ar 16:9 Job ID: 1234-abcd"};
@@ -632,7 +659,7 @@ static void test_descriptions() {
     CHECK(w.desc_change == "replace");
     CHECK_EQ(meta_description(after), "Shows: dog, beach, sunset, sea.");
     CHECK_EQ(after.get("Xmp.jev.PreviousDescription"), "OLYMPUS DIGITAL CAMERA");  // backed up
-    util::run({"rm", "-rf", dir});
+    rm_rf(dir);
 }
 
 static void test_query_language() {
@@ -700,7 +727,7 @@ static void test_corrections() {
     CHECK(db.correction_rejected(id, "tag", "screenshot", ""));
     CHECK(db.corrections("", true).empty());
     db.close();
-    util::run({"rm", "-rf", dir});
+    rm_rf(dir);
 }
 
 static void test_search_filters() {
@@ -750,7 +777,7 @@ static void test_search_filters() {
     CHECK(n("~beech") == 1);  // a typo still finds beach
     CHECK(n("mp:>10") == 1);  // 12 MP yes, 6 MP no
     db.close();
-    util::run({"rm", "-rf", dir});
+    rm_rf(dir);
 }
 
 static void test_journal() {
