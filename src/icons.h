@@ -60,3 +60,4 @@
 #define ICON_COMMAND "\xEE\xA9\xB8"
 #define ICON_FLASK "\xEE\xAF\x92"
 #define ICON_CAPTURE "\xEE\xB0\xBC"
+#define ICON_PREVIEW_PANE "\xEE\xAB\x99"  // ti-layout-sidebar-right

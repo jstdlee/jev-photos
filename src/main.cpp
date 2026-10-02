@@ -470,7 +470,8 @@ struct ThumbSlot {
 enum NavKey { NK_NONE, NK_UP, NK_DOWN, NK_LEFT, NK_RIGHT, NK_ENTER, NK_SPACE, NK_ESC, NK_FAV };
 static NavKey nav_key(bool allowed) {
     if (!allowed || ImGui::GetIO().WantTextInput || ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId)) return NK_NONE;
-    auto p = [](ImGuiKey k) { return ImGui::IsKeyPressed(k, true); };
+    bool ctrl = ImGui::GetIO().KeyCtrl;
+    auto p = [ctrl](ImGuiKey k) { return ImGui::IsKeyPressed(k, true) && (!ctrl || k < ImGuiKey_A || k > ImGuiKey_Z); };
     if (p(ImGuiKey_DownArrow) || p(ImGuiKey_J)) return NK_DOWN;
     if (p(ImGuiKey_UpArrow) || p(ImGuiKey_K)) return NK_UP;
     if (p(ImGuiKey_LeftArrow) || p(ImGuiKey_H)) return NK_LEFT;
@@ -691,6 +692,7 @@ struct App {
     bool trash_confirm = false;
     std::atomic<bool> trash_busy{false};
     std::atomic<int> trash_done{0}, trash_failed{0};
+    std::string trash_what;
 };
 
 static ImVec4 g_accent(0.30f, 0.78f, 0.47f, 1);
@@ -1063,6 +1065,8 @@ namespace prefs {
 static bool seg(const char* id, int* v, const std::vector<std::string>& labels);
 }
 static void trash_selected(App& a);
+static void trash_selected_now(App& a);
+static void copy_paths(App& a);
 
 static std::string fmt_duration(double s) {
     if (s < 1) return "< 1 s";
@@ -1263,16 +1267,14 @@ static void draw_viewer(App& a) {
     bool dialog = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId);
     if (!dialog && v.idx >= 0 && v.idx < int(v.ids.size())) {
         if (ImGui::IsKeyPressed(ImGuiKey_F2, false)) begin_rename(a, v.ids[size_t(v.idx)]);
-        if (ImGui::IsKeyPressed(ImGuiKey_Delete, false) && util::have_trash() && !a.trash_busy) {  // trash this one, show the next
-            int64_t id = v.ids[size_t(v.idx)];
+        bool ctrl = ImGui::GetIO().KeyCtrl;
+        if ((ImGui::IsKeyPressed(ImGuiKey_Delete, false) || (!ctrl && ImGui::IsKeyPressed(ImGuiKey_D, false))) && !a.trash_busy) {
+            int64_t id = v.ids[size_t(v.idx)];  // asks first; then the viewer shows the next photo
             a.multi = {id};
             a.selected = id;
             trash_selected(a);
-            v.ids.erase(v.ids.begin() + v.idx);
-            if (v.ids.empty()) { v.open = false; return; }
-            v.idx = std::min(v.idx, int(v.ids.size()) - 1);
-            v.loaded_id = 0;
         }
+        if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_C, false)) copy_paths(a);
         if (ImGui::IsKeyPressed(ImGuiKey_0, false) && !ImGui::GetIO().KeyCtrl) { v.zoom = 1; v.pan = ImVec2(0, 0); }
     }
     switch (dialog ? NK_NONE : nav_key(ImGui::GetFrameCount() != v.opened_frame)) {
@@ -1323,7 +1325,7 @@ static void draw_viewer(App& a) {
         ImGui::SameLine(ImGui::GetWindowWidth() - w);
     }
     if (ImGui::Button(tr("Rename..."))) begin_rename(a, p.id);
-    tip(tr("Rename this file on disk (F2)"));
+    tip(tr("Rename this file on disk (F2)  ·  c copies its path, d moves it to the Trash, f stars it"));
     ImGui::SameLine();
     if (ImGui::Button(tr("Open file"))) util::open_path(p.src_path);
     tip(tr("Open the photo in the default viewer"));
@@ -1405,7 +1407,7 @@ static void draw_viewer(App& a) {
         ImGui::SetCursorPos(c);
         ImGui::Dummy(avail);
     }
-    ImGui::TextDisabled("%s", tr("Left/Right: previous/next  ·  wheel: zoom, drag: move, double-click or 0: fit  ·  F2: rename  ·  Del: Trash  ·  Esc: close"));
+    ImGui::TextDisabled("%s", tr("Left/Right: previous/next  ·  wheel: zoom, drag: move, double-click or 0: fit  ·  F2: rename  ·  c: copy path  ·  d / Del: Trash  ·  f: star  ·  Esc: close"));
     ImGui::End();
     ImGui::PopStyleColor();
 }
@@ -1426,6 +1428,7 @@ static void trash_files(App& a, const std::vector<std::pair<int64_t, std::vector
     std::string what = what_c;
     if (todo.empty() || a.trash_busy.exchange(true)) return;
     a.trash_done = a.trash_failed = 0;
+    a.trash_what = what;
     std::vector<std::string> folders = a.cfg.folders;
     std::thread([&a, todo, folders, what] {
         bool gio = util::have_trash();
@@ -1614,6 +1617,23 @@ static void remove_tag(App& a, Photo& p, const std::string& tag, bool block) {
 
 // ---- rename one photo's file, from anywhere a photo is shown (undoable from Activity)
 
+// c: the selected photos' paths to the clipboard, one per line (paste them into a file manager, a chat, a terminal).
+static void copy_paths(App& a) {
+    std::string out;
+    int n = 0;
+    if (a.viewer.open) { out = a.viewer.p.src_path; n = 1; }
+    else {
+        std::set<int64_t> ids = a.multi;
+        if (ids.empty() && a.selected) ids = {a.selected};
+        for (auto& r : a.rows)
+            if (ids.count(r.id)) { out += (out.empty() ? "" : "\n") + r.src_path; n++; }
+    }
+    if (!n) return;
+    glfwSetClipboardString(a.win, out.c_str());
+    a.toast = n == 1 ? std::string(tr("Copied: ")) + util::basename(out) : util::fmt("%d %s", n, tr("paths copied"));
+    a.toast_until = glfwGetTime() + 2.5;
+}
+
 static void begin_rename(App& a, int64_t id) {
     Photo p;
     if (!id || !a.ui_db.load(id, p)) return;
@@ -1686,10 +1706,22 @@ static void draw_rename_modal(App& a) {
 }
 
 // ---- Delete: straight to the Trash / Recycle Bin (restorable), then the next photo is selected
+// Delete / d: asks first (Enter confirms, Esc keeps them); the confirmation then calls trash_selected_now.
 static void trash_selected(App& a) {
     if (a.multi.empty() && a.selected) a.multi = {a.selected};
     if (a.multi.empty() || a.trash_busy || a.pipe->running()) return;
-    if (!util::have_trash()) { a.photo_trash_confirm = true; return; }  // no Trash: ask first (files are moved elsewhere)
+    a.photo_trash_confirm = true;
+}
+
+static void trash_selected_now(App& a) {
+    if (a.multi.empty() || a.trash_busy) return;
+    if (a.viewer.open) {  // the viewer goes on with the next photo
+        auto& ids = a.viewer.ids;
+        ids.erase(std::remove_if(ids.begin(), ids.end(), [&](int64_t id) { return a.multi.count(id) > 0; }), ids.end());
+        if (ids.empty()) a.viewer.open = false;
+        else a.viewer.idx = std::min(a.viewer.idx, int(ids.size()) - 1);
+        a.viewer.loaded_id = 0;
+    }
     std::vector<std::pair<int64_t, std::vector<std::string>>> items;
     int64_t next = 0;
     bool after = false;
@@ -1697,12 +1729,11 @@ static void trash_selected(App& a) {
         if (a.multi.count(r.id)) { items.push_back({r.id, {r.src_path}}); after = true; }
         else if (after && !next) next = r.id;
     }
+    if (items.empty() && a.multi.count(a.viewer.p.id)) items.push_back({a.viewer.p.id, {a.viewer.p.src_path}});
     if (!next)
         for (auto it = a.rows.rbegin(); it != a.rows.rend(); ++it)
             if (!a.multi.count(it->id)) { next = it->id; break; }
     trash_files(a, items, "photos");
-    a.toast = util::fmt("%zu %s", items.size(), tr("moved to the Trash (restorable)"));
-    a.toast_until = glfwGetTime() + 3;
     a.multi.clear();
     a.selected = next;
     if (next) a.multi = {next};
@@ -2874,6 +2905,15 @@ static void draw_photo_trash(App& a) {
     std::vector<const PhotoRow*> sel;
     for (auto& r : a.rows)
         if (a.multi.count(r.id)) sel.push_back(&r);
+    static PhotoRow viewer_row;  // a photo opened in the viewer from outside the current list
+    if (sel.empty() && a.viewer.open && a.multi.count(a.viewer.p.id)) {
+        viewer_row = PhotoRow();
+        viewer_row.id = a.viewer.p.id;
+        viewer_row.src_path = a.viewer.p.src_path;
+        viewer_row.dest_path = a.viewer.p.dest_path;
+        viewer_row.size = a.viewer.p.size;
+        sel.push_back(&viewer_row);
+    }
     int64_t bytes = 0;
     int copies = 0;
     for (auto* r : sel) { bytes += r->size; copies += !r->dest_path.empty() && r->dest_path != r->src_path; }
@@ -2888,16 +2928,22 @@ static void draw_photo_trash(App& a) {
         tip(tr("The copies jev-photos made in jev-organized go to the Trash too"));
     }
     ImGui::BeginDisabled(sel.empty() || a.trash_busy);
-    if (danger_button(util::fmt("%s (%zu)", tr("Move to Trash"), sel.size()).c_str(), tr("Moves these files to the Trash (restorable)"), ImVec2(200, 0))) {
+    bool enter = ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false);
+    if (danger_button(util::fmt("%s (%zu)  \xE2\x8F\x8E", tr("Move to Trash"), sel.size()).c_str(), tr("Moves these files to the Trash (restorable). Enter confirms, Esc keeps them."), ImVec2(220, 0)) ||
+        (enter && !sel.empty() && !a.trash_busy)) {
         std::vector<std::pair<int64_t, std::vector<std::string>>> items;
         for (auto* r : sel) {
             std::vector<std::string> paths{r->src_path};
             if (a.trash_with_copies && !r->dest_path.empty() && r->dest_path != r->src_path) paths.push_back(r->dest_path);
             items.push_back({r->id, paths});
         }
-        trash_files(a, items, "photos");
-        a.multi.clear();
-        a.selected = 0;
+        if (a.trash_with_copies || !util::have_trash()) {
+            trash_files(a, items, "photos");
+            a.multi.clear();
+            a.selected = 0;
+        } else {
+            trash_selected_now(a);  // also selects the next photo
+        }
         ImGui::CloseCurrentPopup();
     }
     ImGui::EndDisabled();
@@ -4081,8 +4127,9 @@ static void draw_help(App& a) {
                                      {"Enter, Space", "open the viewer / next photo"}, {"f", "star / unstar the photo"},
                                      {"Ctrl+click, Shift+click", "select several photos"},
                                      {"Esc, q", "close the viewer or a dialog"}, {"Ctrl+F", "search"}, {"Ctrl+I", "show / hide the inspector"},
-                                     {"Ctrl+,", "settings"}, {"Ctrl+Z", "undo what was just applied"}, {"F2", "rename the photo"}, {"Ctrl+K", "go to a page, a setting or an action by name"},
-                                     {"Delete", "move the selected photos to the Trash at once (restorable)"}, {"Ctrl+wheel", "thumbnail size in the grid"},
+                                     {"Ctrl+,", "settings"}, {"Ctrl+Z", "undo what was just applied"}, {"F2", "rename the photo"}, 
+                                     {"d, Delete", "move the selected photos to the Trash (asks; Enter confirms)"}, {"c", "copy the selected photos' paths"},
+                                     {"s", "go to the search box"}, {"Ctrl+P", "feature search: a page, a setting or an action"}, {"Ctrl+wheel", "thumbnail size in the grid"},
                                      {"Wheel / drag / 0", "viewer: zoom at the pointer / move / fit"}, {"Backspace", "in an empty search: remove the last filter chip"}, {"Right-click", "copy a label, or more actions on a photo"}};
             for (auto& k : keys) { ImGui::TextColored(g_accent, "%-26s", k[0]); ImGui::SameLine(220); ImGui::TextUnformatted(tr(k[1])); }
             ImGui::EndTabItem();
@@ -4988,9 +5035,9 @@ static void draw_topbar(App& a) {
     ImGui::SameLine(0, 2);
     bool insp = a.inspector_on;
     if (insp) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(g_accent.x, g_accent.y, g_accent.z, 0.30f));
-    if (ImGui::Button(ICON_INFO_CIRCLE)) a.inspector_on = !a.inspector_on;
+    if (ImGui::Button(ICON_PREVIEW_PANE)) a.inspector_on = !a.inspector_on;
     if (insp) ImGui::PopStyleColor();
-    tip(tr("Show or hide the inspector: date, place, tags and file info of the selected photo (Ctrl+I)"));
+    tip(tr("Show or hide the preview pane: the selected photo with its date, place, tags and file info (Ctrl+I)"));
     ImGui::SameLine(0, 10);
     draw_activity_button(a);
     ImGui::SameLine(0, 10);
@@ -5004,7 +5051,7 @@ static void draw_topbar(App& a) {
     float corner = bw * 4 + sp * 3 + (own ? gap + bw * 3 + sp * 2 : 0);
     ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 12, ImGui::GetWindowContentRegionMax().x - corner));
     if (ImGui::Button(ICON_COMMAND, ImVec2(bw, 0))) a.palette_open = true;
-    tip(tr("Go to a page, a setting or an action by name (Ctrl+K)"));
+    tip(tr("Find a feature: a page, a setting or an action by name (Ctrl+P)"));
     ImGui::SameLine(0, sp);
     if (ImGui::Button(ICON_CAMERA, ImVec2(bw, 0))) ImGui::OpenPopup("shotmenu");
     tip(tr("Screenshot of this window, or of an area you select (saved in Pictures/jev-photos)"));
@@ -5092,8 +5139,11 @@ static void draw_library_header(App& a) {
         ImGui::Text("%zu %s", a.multi.size(), tr("selected"));
     }
     if (!ImGui::GetIO().WantTextInput && !a.viewer.open && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId)) {
-        if (ImGui::IsKeyPressed(ImGuiKey_Delete, false)) trash_selected(a);  // fast: no dialog, restorable from the Trash
+        bool ctrl = ImGui::GetIO().KeyCtrl;
+        if (ImGui::IsKeyPressed(ImGuiKey_Delete, false) || (!ctrl && ImGui::IsKeyPressed(ImGuiKey_D, false))) trash_selected(a);  // asks first
         if (ImGui::IsKeyPressed(ImGuiKey_F2, false) && a.selected) begin_rename(a, a.selected);
+        if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_C, false)) copy_paths(a);
+        if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_S, false)) a.focus_search = true;
     }
     draw_fav_tag_chips(a);
     if (!a.search_error.empty()) ImGui::TextColored(g_err, "%s", a.search_error.c_str());
@@ -5623,7 +5673,7 @@ static std::vector<PalItem> palette_items(App& a) {
     v.push_back({ICON_FLASK, tr("Model tests"), act, [](App& x) { x.show_model_tests = true; }});
     v.push_back({ICON_HELP, tr("Help"), act, [](App& x) { x.show_help = true; }});
     v.push_back({ICON_SETTINGS, tr("Settings"), act, [](App& x) { x.show_settings = true; }});
-    v.push_back({ICON_INFO_CIRCLE, tr("Show / hide the inspector"), act, [](App& x) { x.inspector_on = !x.inspector_on; }});
+    v.push_back({ICON_PREVIEW_PANE, tr("Show / hide the preview pane"), act, [](App& x) { x.inspector_on = !x.inspector_on; }});
     v.push_back({ICON_MENU_2, tr("Show / hide the sidebar"), act, [](App& x) { x.sidebar_on = !x.sidebar_on; }});
     v.push_back({ICON_LAYOUT_GRID, tr("Grid / list"), act, [](App& x) { x.photo_grid = !x.photo_grid; }});
     v.push_back({ICON_ACTIVITY, tr("Log"), act, [](App& x) { x.show_log = true; }});
@@ -5797,7 +5847,7 @@ static void draw_ui(App& a) {
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_I, false)) a.inspector_on = !a.inspector_on;
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Comma, false)) a.show_settings = !a.show_settings;
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F, false)) a.focus_search = true;
-    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_K, false)) a.palette_open = true;  // go to a page, setting or action
+    if (io.KeyCtrl && (ImGui::IsKeyPressed(ImGuiKey_K, false) || ImGui::IsKeyPressed(ImGuiKey_P, false))) a.palette_open = true;  // feature search
     {  // Ctrl+ / Ctrl- / Ctrl+0: text size in the same steps as Settings (100, 110, 125, 150 %)
         static const float sizes[] = {16, 17.6f, 20, 24};
         int si = 0;
@@ -6492,7 +6542,10 @@ int main(int argc, char** argv) {
         static bool was_trashing = false;
         if (was_trashing && !app.trash_busy) {
             app.rows_dirty = app.dups_dirty = true;
-            app.toast = util::fmt("%d %s", app.trash_done.load(), tr("extra copies moved"));
+            app.toast = app.trash_what == "photos"
+                            ? util::fmt("%d %s", app.trash_done.load(), tr(app.trash_done == 1 ? "photo moved to the Trash" : "photos moved to the Trash"))
+                            : util::fmt("%d %s", app.trash_done.load(), tr("extra copies moved"));
+            if (app.trash_failed) app.toast += util::fmt("  ·  %d %s", app.trash_failed.load(), tr("could not be moved"));
             app.toast_until = glfwGetTime() + 3;
         }
         was_trashing = app.trash_busy;
@@ -6584,7 +6637,7 @@ int main(int argc, char** argv) {
                     else if (util::starts_with(t, "wait:")) next_t = glfwGetTime() + atoi(t.c_str() + 5) / 1000.0;
                     else {
                         static const std::map<std::string, ImGuiKey> keys = {
-                            {"j", ImGuiKey_J}, {"k", ImGuiKey_K}, {"h", ImGuiKey_H}, {"l", ImGuiKey_L}, {"q", ImGuiKey_Q}, {"f", ImGuiKey_F},
+                            {"j", ImGuiKey_J}, {"k", ImGuiKey_K}, {"h", ImGuiKey_H}, {"l", ImGuiKey_L}, {"q", ImGuiKey_Q}, {"f", ImGuiKey_F}, {"c", ImGuiKey_C}, {"d", ImGuiKey_D}, {"s", ImGuiKey_S}, {"Delete", ImGuiKey_Delete},
                             {"Up", ImGuiKey_UpArrow}, {"Down", ImGuiKey_DownArrow}, {"Left", ImGuiKey_LeftArrow},
                             {"Right", ImGuiKey_RightArrow}, {"Return", ImGuiKey_Enter}, {"Escape", ImGuiKey_Escape}, {"space", ImGuiKey_Space}};
                         auto k = keys.find(t);

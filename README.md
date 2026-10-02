@@ -260,11 +260,11 @@ The library is a grid of thumbnails with a heading per month (or a sortable list
 dragging moves the picture, and double-click or **0** fits it again.
 
 **Rename** (F2, the right-click menu in the grid and the list, the inspector and the viewer) renames the file on disk,
-keeps its extension and sidecar, refuses a name already taken, and can be undone from *Activity*. **Delete** moves the
-selected photos (or the one in the viewer) straight to the Trash / Recycle Bin, no dialog: they can be restored from
-there. *Move to Trash…* still lists them first.
+keeps its extension and sidecar, refuses a name already taken, and can be undone from *Activity*. **Delete** (or d) moves the
+selected photos (or the one in the viewer) to the Trash / Recycle Bin after a short confirmation (Enter confirms, Esc
+keeps them); they can be restored from there.
 
-**Go to** (Ctrl+K, the ⌘ button in the top bar, or just type in the search): find any page, setting or action by
+**Go to** (Ctrl+P or Ctrl+K, the ⌘ button in the top bar, or just type in the search): find any page, setting or action by
 name — "dedup", "theme", "screenshot", "timeout" — and go there; a setting opens Settings scrolled to its row, which
 flashes. **Screenshot** (camera button): the whole window, or drag over an area; saved in `Pictures/jev-photos`, path
 copied. **Model tests** (Settings → Advanced, or the activity popover; for development): send your own prompt to the
@@ -311,10 +311,12 @@ while nothing else runs, new or changed photos are picked up and analysed quietl
 | Ctrl+F | search |
 | Ctrl+I | show / hide the inspector |
 | Ctrl+, | settings |
-| Ctrl+K | go to a page, setting or action |
+| Ctrl+P (or Ctrl+K) | feature search: go to a page, setting or action |
 | Ctrl+Z | undo what was just applied |
 | F2 | rename the selected photo |
-| Delete | move the selected photos to the Trash (restorable), no dialog |
+| d / Delete | move the selected photos to the Trash (asks; Enter confirms; restorable) |
+| c | copy the selected photos' paths |
+| s | go to the search box |
 | Ctrl+wheel | thumbnail size |
 | Ctrl+ / Ctrl- / Ctrl+0 | text size |
 
@@ -561,7 +563,8 @@ and the copy that stays, then moves them to the desktop Trash, so they can be re
 | Enter | open viewer | |
 | Space | tick / untick (review lists) | next photo |
 | f | star / unstar | star / unstar |
-| Delete | move the selected photos to the Trash (restorable, no dialog) | move this photo to the Trash, show the next |
+| d / Delete | move the selected photos to the Trash (asks first; Enter confirms) | the same, then the next photo |
+| c | copy the paths | copy the path |
 | F2 | rename | rename |
 | wheel | scroll (Ctrl: thumbnail size) | zoom at the pointer; drag moves, double-click or 0 fits |
 | Esc / q | | close |
