@@ -110,7 +110,7 @@ static FontFace fc_match(const char* pattern) {
     return f;
 }
 
-// The Tabler icon font, linked into the binary.
+// The Font Awesome icon font, linked into the binary.
 #ifdef _WIN32  // PE/COFF: read-only data section, and no .previous
 #define JEV_RODATA ".section .rdata,\"dr\"\n"
 #define JEV_BACK ".text\n"
@@ -136,14 +136,28 @@ static void build_fonts() {
         if (util::file_exists(p)) { base.file = p; break; }
     if (base.file.empty()) base = fc_match("sans-serif:lang=en");
 #endif
+    // Private-use codepoints belong to the icon font: some text fonts put old ligatures there (DejaVu's U+F001/F002).
+    static const ImWchar no_private_use[] = {0xE000, 0xF8FF, 0};
     ImFontConfig cfg;
     cfg.OversampleH = 2;
+    cfg.GlyphExcludeRanges = no_private_use;
     bool have = false;
     if (!base.file.empty()) {
         cfg.FontNo = base.index;
         have = io.Fonts->AddFontFromFileTTF(base.file.c_str(), 0.0f, &cfg) != nullptr;
     }
     if (!have) io.Fonts->AddFontDefault();
+    // Font Awesome icons (private-use codepoints), merged right after the base font so they win over any private-use
+    // glyphs in the CJK fonts; a little smaller than the text, fixed width so labels line up, on the text baseline.
+    {
+        ImFontConfig ic;
+        ic.MergeMode = true;
+        ic.FontDataOwnedByAtlas = false;
+        ic.ExtraSizeScale = 0.86f;
+        ic.GlyphMinAdvanceX = 13.0f;
+        ic.GlyphOffset = ImVec2(0, 1);
+        io.Fonts->AddFontFromMemoryTTF((void*)jev_icons_ttf, int(jev_icons_ttf_end - jev_icons_ttf), 0.0f, &ic);
+    }
     // Always merge a CJK face: file and folder names are often Chinese/Japanese even in an English UI.
     // Chinese, Japanese and Korean all merged (names in any of them show up), the interface language's own face
     // first: the same character is drawn the Japanese way in Japanese, the Chinese way in Chinese.
@@ -174,16 +188,12 @@ static void build_fonts() {
             m.MergeMode = true;
             m.FontNo = cjk.index;
             m.ExtraSizeScale = 1.1f;  // CJK faces look smaller than Latin ones at the same pixel size
+            m.GlyphExcludeRanges = no_private_use;
             m.GlyphOffset = ImVec2(0, 1);
             io.Fonts->AddFontFromFileTTF(cjk.file.c_str(), 0.0f, &m);
             break;  // one face per language
         }
-    // Icons (private-use codepoints), merged into the same font and nudged down to sit on the text baseline.
-    ImFontConfig ic;
-    ic.MergeMode = true;
-    ic.FontDataOwnedByAtlas = false;
-    ic.GlyphOffset = ImVec2(0, 2);
-    io.Fonts->AddFontFromMemoryTTF((void*)jev_icons_ttf, int(jev_icons_ttf_end - jev_icons_ttf), 0.0f, &ic);
+
 }
 
 // ---------------------------------------------------------------------------
@@ -622,6 +632,22 @@ struct Viewer {
 };
 
 
+// ---- Tasks: long work waits in a queue and runs one at a time (the pipeline does one run at once).
+enum TaskState { TQ_QUEUED, TQ_RUNNING, TQ_PAUSED, TQ_DONE, TQ_STOPPED, TQ_FAILED };
+struct QTask {
+    int id = 0;
+    std::string name;
+    Config cfg;
+    RunOptions o;
+    int last_stages = 0, plan_op = -1;  // applied when it starts: which list the pipeline will hold
+    bool planned = false, show_plan = false;
+    bool resumable = true;  // analysis stages skip finished work, so a paused one picks up where it stopped
+    int state = TQ_QUEUED;
+    double t_start = 0, t_end = 0;
+    int done = 0, total = 0, errors = 0;
+    std::string note;
+};
+
 struct App {
     GLFWwindow* win = nullptr;
     Config cfg;
@@ -743,6 +769,8 @@ struct App {
     int sugg_tags_gen = -1;
     std::string undo_run, undo_text;  // the last applied run (Undo banner)
     bool focus_search = false;        // Ctrl+F: put the cursor in the search field
+    int help_tab = -1;                // open Help on this tab (Ctrl+/ -> shortcuts)
+    bool status_open_req = false;     // open the tasks and logs popover (Ctrl+J)
     // Rename (F2, context menus, inspector, viewer)
     int64_t rename_id = 0;
     bool rename_open = false;
@@ -789,6 +817,11 @@ struct App {
     int auto_meta_step = 0;  // Auto set meta after Analyze: 1 = list being built, 2 = being applied
     // Screenshot (top bar): 1 = whole window on the next frames, 2 = choosing an area, 3 = area chosen, capture next
     bool show_model_tests = false, palette_open = false;
+    std::deque<QTask> tasks;          // running (front), queued, paused
+    std::vector<QTask> task_done;     // finished, newest first
+    int next_task_id = 1, batch_total = 0, batch_done = 0;
+    int task_stop_as = -1;
+    double status_seen_at = 0;        // errors after this time put a red dot on the status button            // what the running task becomes when its stop request lands (TQ_PAUSED / TQ_STOPPED)
     int shot_mode = 0, shot_frames = 0;
     ImVec2 shot_a, shot_b;
     std::string shot_last;
@@ -842,10 +875,19 @@ static void theme_default_accent(int t, float* acc) {
     for (int k = 0; k < 3; k++) acc[k] = d[std::clamp(t, 0, 2)][k];
 }
 
+// The theme in effect: System follows the desktop (asked once per start, and when chosen again).
+static int g_system_dark = -1;
+static int theme_kind(const Config& c) {
+    if (c.theme != THEME_SYSTEM) return std::clamp(c.theme, 0, 2);
+    if (g_system_dark < 0) g_system_dark = util::system_dark_mode() ? 1 : 0;
+    return g_system_dark ? THEME_DARK : THEME_LIGHT;
+}
+
 static void apply_style(const Config& c) {
     ImGuiStyle& st = ImGui::GetStyle();
-    ThemeColors th = theme_colors(c.theme);
-    if (c.theme == THEME_LIGHT) ImGui::StyleColorsLight(&st);
+    int tk = theme_kind(c);
+    ThemeColors th = theme_colors(tk);
+    if (tk == THEME_LIGHT) ImGui::StyleColorsLight(&st);
     else ImGui::StyleColorsDark(&st);
     st.WindowRounding = 8.0f;
     st.FrameRounding = 6.0f;
@@ -870,7 +912,7 @@ static void apply_style(const Config& c) {
     k[ImGuiCol_PopupBg] = th.popup;
     k[ImGuiCol_Text] = th.text;
     k[ImGuiCol_TextDisabled] = th.dim;
-    k[ImGuiCol_Border] = c.theme == THEME_LIGHT ? ImVec4(0, 0, 0, 0.18f) : th.border;  // white on white needs a visible edge
+    k[ImGuiCol_Border] = tk == THEME_LIGHT ? ImVec4(0, 0, 0, 0.18f) : th.border;  // white on white needs a visible edge
     k[ImGuiCol_Separator] = th.border;
     k[ImGuiCol_CheckMark] = acc;
     k[ImGuiCol_SliderGrab] = acc;
@@ -897,7 +939,7 @@ static void apply_style(const Config& c) {
     k[ImGuiCol_ScrollbarBg] = ImVec4(0, 0, 0, 0);
     k[ImGuiCol_NavCursor] = A(0.6f);  // keyboard focus ring
     k[ImGuiCol_TextSelectedBg] = A(0.35f);
-    k[ImGuiCol_ModalWindowDimBg] = ImVec4(0, 0, 0, c.theme == THEME_LIGHT ? 0.25f : 0.55f);
+    k[ImGuiCol_ModalWindowDimBg] = ImVec4(0, 0, 0, tk == THEME_LIGHT ? 0.25f : 0.55f);
     g_accent = acc;
     kDanger = th.danger;
     g_warn = th.warn;
@@ -909,8 +951,8 @@ static void apply_style(const Config& c) {
     g_text_dim = th.dim;
     g_sidebar = th.sidebar;
     g_panel = th.panel;
-    g_seg_on = c.theme == THEME_LIGHT ? ImVec4(1, 1, 1, 1) : th.frame_hover;
-    g_seg_shadow = c.theme == THEME_LIGHT;
+    g_seg_on = tk == THEME_LIGHT ? ImVec4(1, 1, 1, 1) : th.frame_hover;
+    g_seg_shadow = tk == THEME_LIGHT;
 }
 
 static std::string fmt_eta(double s) {
@@ -1023,6 +1065,120 @@ static void set_folder(App& a, const std::string& f_in) {
 
 // op >= 0: build the organize list with this file operation (Metadata's "write into files" uses OP_METADATA without
 // changing the Organization choice).
+static void launch_task(App& a, QTask& t) {
+    a.last_stages = t.last_stages;
+    a.last_run_planned = t.planned;
+    if (t.plan_op >= 0) a.plan_op = t.plan_op;
+    if (t.show_plan) a.show_plan_tab = true;
+    if (!t.o.undo_run.empty()) a.undo_until = 0;
+    t.state = TQ_RUNNING;
+    t.t_start = glfwGetTime();
+    a.task_stop_as = -1;
+    a.pipe->start(t.cfg, t.o);
+    a.log.add(0, "task started: " + t.name);
+}
+
+// Start the next queued task when the pipeline is free (paused ones wait for Resume).
+static void start_next_task(App& a) {
+    if (a.pipe->running()) return;
+    for (auto& t : a.tasks)
+        if (t.state == TQ_RUNNING) return;
+    for (auto& t : a.tasks)
+        if (t.state == TQ_QUEUED) { launch_task(a, t); return; }
+}
+
+// Every long run goes through here: now when nothing runs, else after what is queued.
+static void submit_task(App& a, const std::string& name, const Config& cfg, const RunOptions& o, int last_stages, bool planned, int plan_op, bool show_plan) {
+    QTask t;
+    t.id = a.next_task_id++;
+    t.name = name;
+    t.cfg = cfg;
+    t.o = o;
+    t.last_stages = last_stages;
+    t.planned = planned;
+    t.plan_op = plan_op;
+    t.show_plan = show_plan;
+    t.resumable = !o.apply_plan && o.undo_run.empty() && o.reanalyse_ids.empty() && o.retag_ids.empty();
+    bool idle = a.tasks.empty();
+    if (idle) a.batch_total = a.batch_done = 0;
+    a.batch_total++;
+    a.tasks.push_back(t);
+    if (!idle || a.pipe->running()) {
+        a.toast = std::string(tr("Queued: ")) + tr(name.c_str());
+        a.toast_until = glfwGetTime() + 2.5;
+    }
+    start_next_task(a);
+}
+
+// The pipeline finished a run: record it on the running task, then go on with the queue.
+static void task_finished(App& a) {
+    for (auto it = a.tasks.begin(); it != a.tasks.end(); ++it) {
+        if (it->state != TQ_RUNNING) continue;
+        QTask t = *it;
+        t.done = a.pipe->progress.done;
+        t.total = a.pipe->progress.total;
+        t.errors = a.pipe->progress.errors;
+        t.t_end = glfwGetTime();
+        if (a.task_stop_as == TQ_PAUSED && t.resumable) {  // stays in the queue, waiting for Resume
+            it->state = TQ_PAUSED;
+            it->note = util::fmt("%d / %d", t.done, t.total);
+            break;
+        }
+        t.state = a.task_stop_as == TQ_STOPPED ? TQ_STOPPED : TQ_DONE;
+        if (t.errors) t.note = util::fmt("%d %s", t.errors, tr("errors"));
+        a.tasks.erase(it);
+        a.task_done.insert(a.task_done.begin(), t);
+        if (a.task_done.size() > 30) a.task_done.pop_back();
+        a.batch_done++;
+        break;
+    }
+    a.task_stop_as = -1;
+    start_next_task(a);
+}
+
+// Waiting work survives a restart: resumable tasks come back paused.
+static std::string queue_path() { return util::data_dir() + "/queue.json"; }
+static void save_queue(App& a) {
+    json arr = json::array();
+    for (auto& t : a.tasks) {
+        if (!t.resumable) continue;
+        arr.push_back({{"name", t.name}, {"stages", t.o.stages}, {"last_stages", t.last_stages}, {"planned", t.planned}, {"plan_op", t.plan_op},
+                       {"plan_only", t.o.plan_only}, {"redecide_all", t.o.redecide_all}, {"retag_all", t.o.retag_all}, {"recheck_all", t.o.recheck_all},
+                       {"clip_mode", t.o.clip_mode}, {"tag_mode", t.o.tag_mode}, {"file_op", t.cfg.file_op}});
+    }
+    if (arr.empty()) remove(queue_path().c_str());
+    else util::write_file(queue_path(), arr.dump(1));
+}
+static void load_queue(App& a) {
+    std::string s;
+    if (!util::read_file(queue_path(), s)) return;
+    json arr = json::parse(s, nullptr, false);
+    if (!arr.is_array()) return;
+    for (auto& j : arr) {
+        QTask t;
+        t.id = a.next_task_id++;
+        t.name = j.value("name", "Run");
+        t.cfg = effective(a.cfg);
+        t.cfg.file_op = j.value("file_op", t.cfg.file_op);
+        t.o = a.opts;
+        t.o.stages = j.value("stages", 0);
+        t.o.scope = all_scope(a.cfg);
+        t.o.plan_only = j.value("plan_only", false);
+        t.o.redecide_all = j.value("redecide_all", false);
+        t.o.retag_all = j.value("retag_all", false);
+        t.o.recheck_all = j.value("recheck_all", false);
+        t.o.clip_mode = j.value("clip_mode", 0);
+        t.o.tag_mode = j.value("tag_mode", 0);
+        t.last_stages = j.value("last_stages", 0);
+        t.planned = j.value("planned", false);
+        t.plan_op = j.value("plan_op", -1);
+        t.state = TQ_PAUSED;
+        t.note = tr("from the last session");
+        a.tasks.push_back(t);
+        a.batch_total++;
+    }
+}
+
 static void start_run(App& a, int stages, bool force_preview = false, int op = -1) {
     if (a.cfg.folders.empty()) {  // nothing chosen yet: ask for the folder first
         start_dir_dialog(a, 3);
@@ -1035,12 +1191,14 @@ static void start_run(App& a, int stages, bool force_preview = false, int op = -
     o.stages = stages;
     o.scope = all_scope(a.cfg);  // every folder in the list, together
     o.plan_only = (stages & ST_ORGANIZE) && (a.cfg.preview_first || force_preview || a.cfg.dry_run);
-    a.last_run_planned = o.plan_only;
-    a.last_stages = stages;
     Config run = effective(a.cfg);
     if (op >= 0) run.file_op = op;
-    if (stages & ST_ORGANIZE) a.plan_op = run.file_op;  // which list the pipeline will hold
-    a.pipe->start(run, o);
+    const char* name = (stages & ST_SCAN) && (stages & ST_DECIDE) ? "Analyze"
+                     : stages == ST_ORGANIZE ? (run.file_op == OP_METADATA ? "List what to write into files" : "Build the organize list")
+                     : stages == ST_SCAN ? "Scan for new or changed files" : stages == ST_DUPES ? "Find duplicates"
+                     : stages == ST_DECIDE ? "Work out dates and places" : stages == ST_TAG ? "Image recognition"
+                     : stages == ST_VISION ? "Describe with the vision model" : stages == ST_FIX ? "Check tags" : "Run";
+    submit_task(a, name, run, o, stages, o.plan_only, (stages & ST_ORGANIZE) ? run.file_op : -1, false);
 }
 
 static int analyze_stages(const Config& c) {
@@ -1053,10 +1211,7 @@ static void apply_plan(App& a) {
     o.stages = ST_ORGANIZE;
     o.apply_plan = true;
     o.scope = all_scope(a.cfg);  // every folder in the list, together
-    a.last_run_planned = false;
-    a.last_stages = ST_ORGANIZE;
-    a.show_plan_tab = true;
-    a.pipe->start(effective(a.cfg), o);
+    submit_task(a, a.plan_op == OP_METADATA ? "Write info into files" : "Apply the organize list", effective(a.cfg), o, ST_ORGANIZE, false, -1, true);
 }
 
 // ---------------------------------------------------------------------------
@@ -1068,53 +1223,101 @@ static void apply_plan(App& a) {
 // (it otherwise sleeps until the next event).
 
 static void tip(const std::string& text);
-static void tip(const char* text) {
+// The hover delay before a tooltip shows (one constant); after one has shown, the next shows at once for 0.5 s
+// ("warm"), so moving along a toolbar reads every button without waiting again.
+static const double kTooltipDelay = 2.0;
+static double g_tip_warm_until = 0;
+
+// Keyboard keys as small chips: "Ctrl+P" -> [Ctrl] [P]
+static void key_chips(const char* keys) {
+    if (!keys || !*keys) return;
+    std::string k = keys;
+    std::vector<std::string> parts;
+    size_t st = 0;
+    for (size_t i = 1; i <= k.size(); i++)  // split on '+' but keep a key that is itself '+' ("Ctrl++")
+        if (i == k.size() || (k[i] == '+' && i > st)) { parts.push_back(k.substr(st, i - st)); st = i + 1; }
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    for (size_t i = 0; i < parts.size(); i++) {
+        ImGui::SameLine(0, i ? 3.0f : 10.0f);
+        ImVec2 ts = ImGui::CalcTextSize(parts[i].c_str());
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        ImVec2 q(p.x + ts.x + 10, p.y + ts.y + 2);
+        dl->AddRectFilled(ImVec2(p.x, p.y - 1), q, ImGui::GetColorU32(ImGuiCol_FrameBg), 4.0f);
+        dl->AddRect(ImVec2(p.x, p.y - 1), q, ImGui::GetColorU32(ImGuiCol_Border), 4.0f);
+        dl->AddText(ImVec2(p.x + 5, p.y), ImGui::GetColorU32(ImGuiCol_Text), parts[i].c_str());
+        ImGui::Dummy(ImVec2(ts.x + 10, ts.y));
+    }
+}
+
+static void tip_impl(const char* text, const char* keys) {
     static ImVec2 last_min(-1, -1), last_max(-1, -1);
     static double since = 0;
     if (!ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) return;
+    if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) return;  // hides on press
     ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
     double now = glfwGetTime();  // same clock as the main loop's wake-up
     if (mn.x != last_min.x || mn.y != last_min.y || mx.x != last_max.x || mx.y != last_max.y) {
         last_min = mn;
         last_max = mx;
-        since = now;
+        since = now < g_tip_warm_until ? now - kTooltipDelay : now;  // warm: show at once
     }
-    if (now - since < 2.0) {
-        g_wake_at = since + 2.02;
+    if (now - since < kTooltipDelay) {
+        g_wake_at = since + kTooltipDelay + 0.02;
         return;
     }
-    {
-        ImGui::BeginTooltip();
-        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 32);
-        ImGui::TextUnformatted(text);
-        ImGui::PopTextWrapPos();
-        ImGui::EndTooltip();
-    }
+    g_tip_warm_until = now + 0.5;
+    ImGui::BeginTooltip();
+    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 24);
+    ImGui::TextUnformatted(text);
+    ImGui::PopTextWrapPos();
+    key_chips(keys);
+    ImGui::EndTooltip();
 }
+static void tip(const char* text) { tip_impl(text, nullptr); }
+// A tooltip that names the action and shows its keys as chips.
+static void tipk(const char* text, const char* keys) { tip_impl(text, keys); }
 static void tip(const std::string& text) { tip(text.c_str()); }
 
 // Splitters: a thin bar between two panes that can be dragged. vsplit sits between a left and a right pane
 // (call it after the left one, then SameLine); hsplit between a top and a bottom pane. `size` is the size of the
 // pane the bar resizes; `grow_right` = the pane is on the right/bottom side (dragging right makes it smaller).
-static void vsplit(const char* id, float& size, float min, float max, bool grow_right) {
+// Splitters: follow the pointer 1:1 from where it was grabbed, clamp to the panes' limits, accent line while hot,
+// double-click restores the default size, and (when `collapsed` is given) dragging 40 px past the minimum collapses
+// the pane.
+static void split_drag(ImGuiID id, float& size, float min, float max, float delta_sign, float axis_delta, float def, bool* collapsed) {
+    static ImGuiID active = 0;
+    static float start = 0, moved = 0;
+    if (ImGui::IsItemActivated()) { active = id; start = size; moved = 0; }
+    if (ImGui::IsItemActive() && active == id) {
+        moved += delta_sign * axis_delta;
+        float want = start + moved;
+        if (collapsed && want < min - 40) { *collapsed = true; size = start; return; }
+        size = std::clamp(want, min, max);
+    }
+    if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && def > 0) size = def;
+}
+static void vsplit(const char* id, float& size, float min, float max, bool grow_right, float def = 0, bool* collapsed = nullptr) {
     ImGui::SameLine(0, 0);
-    ImGui::InvisibleButton(id, ImVec2(8, std::max(1.0f, ImGui::GetContentRegionAvail().y)));
+    ImGui::InvisibleButton(id, ImVec2(7, std::max(1.0f, ImGui::GetContentRegionAvail().y)));
     bool hot = ImGui::IsItemHovered() || ImGui::IsItemActive();
     if (hot) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
-    if (ImGui::IsItemActive()) size = std::clamp(size + (grow_right ? -1 : 1) * ImGui::GetIO().MouseDelta.x, min, max);
+    split_drag(ImGui::GetItemID(), size, min, max, grow_right ? -1.0f : 1.0f, ImGui::GetIO().MouseDelta.x, def, collapsed);
+    if (hot) tip(def > 0 ? tr("Drag to resize; double-click for the default size") : tr("Drag to resize"));
     ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
-    float x = (a.x + b.x) / 2;
-    ImGui::GetWindowDrawList()->AddLine(ImVec2(x, a.y + 2), ImVec2(x, b.y - 2), hot ? IM_COL32(120, 200, 140, 255) : IM_COL32(90, 95, 105, 160), hot ? 3.0f : 1.0f);
+    float x = std::floor((a.x + b.x) / 2) + 0.5f;
+    ImGui::GetWindowDrawList()->AddLine(ImVec2(x, a.y + 2), ImVec2(x, b.y - 2), ImGui::GetColorU32(hot ? g_accent : ImGui::GetStyleColorVec4(ImGuiCol_Border)),
+                                        hot ? 2.0f : 1.0f);
     ImGui::SameLine(0, 0);
 }
-static void hsplit(const char* id, float& size, float min, float max, bool grow_down) {
-    ImGui::InvisibleButton(id, ImVec2(std::max(1.0f, ImGui::GetContentRegionAvail().x), 8));
+static void hsplit(const char* id, float& size, float min, float max, bool grow_down, float def = 0) {
+    ImGui::InvisibleButton(id, ImVec2(std::max(1.0f, ImGui::GetContentRegionAvail().x), 7));
     bool hot = ImGui::IsItemHovered() || ImGui::IsItemActive();
     if (hot) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
-    if (ImGui::IsItemActive()) size = std::clamp(size + (grow_down ? -1 : 1) * ImGui::GetIO().MouseDelta.y, min, max);
+    split_drag(ImGui::GetItemID(), size, min, max, grow_down ? -1.0f : 1.0f, ImGui::GetIO().MouseDelta.y, def, nullptr);
     ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
-    float y = (a.y + b.y) / 2;
-    ImGui::GetWindowDrawList()->AddLine(ImVec2(a.x + 2, y), ImVec2(b.x - 2, y), hot ? IM_COL32(120, 200, 140, 255) : IM_COL32(90, 95, 105, 160), hot ? 3.0f : 1.0f);
+    float y = std::floor((a.y + b.y) / 2) + 0.5f;
+    ImGui::GetWindowDrawList()->AddLine(ImVec2(a.x + 2, y), ImVec2(b.x - 2, y), ImGui::GetColorU32(hot ? g_accent : ImGui::GetStyleColorVec4(ImGuiCol_Border)),
+                                        hot ? 2.0f : 1.0f);
 }
 
 static bool styled_button(const char* label, const ImVec4& col, const ImVec2& size, const char* tip_text) {
@@ -1176,6 +1379,7 @@ static std::string compose_query(const App& a) {
 static void select_photo(App& a, int idx);
 static void draw_date_actions(App& a, Photo& p);
 static void begin_rename(App& a, int64_t id);
+static void apply_theme(App& a, int t);
 namespace prefs {
 static bool seg(const char* id, int* v, const std::vector<std::string>& labels);
 }
@@ -2647,8 +2851,7 @@ static void draw_tags(App& a) {
         o.stages = ST_TAG;
         o.scope = all_scope(c);
         o.clip_mode = o.tag_mode = 0;
-        a.last_stages = ST_TAG;
-        a.pipe->start(effective(c), o);
+        submit_task(a, "Fill in missing tags", effective(c), o, ST_TAG, false, -1, false);
     }
     tip(tr("Tag photos that have no tags yet, and refresh tags made with an older tag list"));
     ImGui::SameLine();
@@ -3832,10 +4035,16 @@ static void draw_settings(App& a) {
 
     section(tr("Preferences"));
     card_begin();
-    if (choice(tr("Appearance"), tr("Dark, Tokyo Night (deep blue with soft neon colours) or Light"), &c.theme,
-               {tr("Dark"), tr("Tokyo Night"), tr("Light")})) {
-        theme_default_accent(c.theme, c.accent);  // each theme brings its own accent
-        apply_style(c);
+    {
+        static const int order[] = {THEME_SYSTEM, THEME_DARK, THEME_TOKYO, THEME_LIGHT};
+        int sel = c.theme == THEME_SYSTEM ? 0 : c.theme == THEME_DARK ? 1 : c.theme == THEME_TOKYO ? 2 : 3;
+        if (choice(tr("Appearance"), tr("System (as the desktop is), Dark, Tokyo Night (deep blue with soft neon colours) or Light; Ctrl+Shift+T switches"),
+                   &sel, {tr("System"), tr("Dark"), tr("Tokyo Night"), tr("Light")})) {
+            c.theme = order[sel];
+            if (c.theme == THEME_SYSTEM) g_system_dark = -1;
+            theme_default_accent(theme_kind(c), c.accent);  // each theme brings its own accent
+            apply_style(c);
+        }
     }
     {
         ImVec2 top = row(tr("Accent colour"), tr("The main buttons and highlights; each theme sets its own first"), ImGui::GetFrameHeight());
@@ -4219,92 +4428,38 @@ static void window_chrome(App& a, float bar_bottom) {
         glfwSetWindowPos(a.win, start_x + int(gx - start_gx), start_y + int(gy - start_gy));
     }
     if (sizing) glfwSetWindowSize(a.win, std::max(900, start_w + int(gx - start_gx)), std::max(560, start_h + int(gy - start_gy)));
+    // The other edges and corners resize too (5 px bands, not while maximized or full screen).
+    static int edge = 0;  // bits: 1 left, 2 right, 4 top, 8 bottom
+    static int e_x, e_y, e_w, e_h;
+    bool maxed = glfwGetWindowAttrib(a.win, GLFW_MAXIMIZED) || glfwGetWindowMonitor(a.win);
+    if (!maxed && !moving && !sizing) {
+        const float band = 5;
+        int hover = 0;
+        if (io.MousePos.x >= 0 && io.MousePos.x < band) hover |= 1;
+        if (io.MousePos.x > vs.x - band && io.MousePos.x <= vs.x) hover |= 2;
+        if (io.MousePos.y >= 0 && io.MousePos.y < band) hover |= 4;
+        if (io.MousePos.y > vs.y - band && io.MousePos.y <= vs.y) hover |= 8;
+        if (edge == 0 && hover && !ImGui::IsAnyItemActive()) {
+            ImGui::SetMouseCursor((hover & 3) && (hover & 12) ? ((hover == 5 || hover == 10) ? ImGuiMouseCursor_ResizeNWSE : ImGuiMouseCursor_ResizeNESW)
+                                  : (hover & 3) ? ImGuiMouseCursor_ResizeEW : ImGuiMouseCursor_ResizeNS);
+            if (ImGui::IsMouseClicked(0)) { edge = hover; e_x = wx; e_y = wy; e_w = ww; e_h = wh; start_gx = gx; start_gy = gy; }
+        }
+    }
+    if (edge) {
+        if (!ImGui::IsMouseDown(0)) edge = 0;
+        else {
+            int dx = int(gx - start_gx), dy = int(gy - start_gy), x = e_x, y = e_y, w = e_w, h = e_h;
+            if (edge & 1) { w = std::max(900, e_w - dx); x = e_x + e_w - w; }
+            if (edge & 2) w = std::max(900, e_w + dx);
+            if (edge & 4) { h = std::max(560, e_h - dy); y = e_y + e_h - h; }
+            if (edge & 8) h = std::max(560, e_h + dy);
+            glfwSetWindowPos(a.win, x, y);
+            glfwSetWindowSize(a.win, w, h);
+        }
+    }
 }
 
 // Help: what each kind of data is, keys, search syntax, credits.
-static void draw_help(App& a) {
-    if (!a.show_help) return;
-    ImGui::SetNextWindowSize(ImVec2(760, 560), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowPos(ImVec2(ImGui::GetMainViewport()->Size.x - 790, 60), ImGuiCond_FirstUseEver);
-    if (!ImGui::Begin(tr("Help###help"), &a.show_help)) { ImGui::End(); return; }
-    if (ImGui::BeginTabBar("helptabs")) {
-        if (ImGui::BeginTabItem(tr("What is what"))) {
-            struct C { const char* name; const char* text; };
-            const C cs[] = {
-                {"Sidebar", "Library: everything, favorites, years, places, AI images, one folder. Tools, with what needs you counted: Deduplicate, Fix dates, Set tags, Organize path, Auto set meta, Image recognition, Activity."},
-                {"Go to", "Ctrl+K (or the command button in the top bar, or just typing in the search) finds a page, a setting or an action by name and takes you there."},
-                {"Screenshot", "The camera in the top bar saves the whole window or an area you drag (Pictures/jev-photos); the path is copied."},
-                {"Model tests", "For development (Settings > Advanced, or the activity popover): send your own input to the language, vision, recognition and jev models."},
-                {"Blocked tags", "A tag you delete (tag list, or the x next to a photo's tag) is blocked: never recognised, suggested or written into files again. Unblock it in the tag list."},
-                {"Photo folders", "The folders you add (sidebar > Folders). Analyze scans them all together; click one to see only its photos."},
-                {"File name", "The name on disk. Organize gives photos date names (20190512_00001.jpg), optionally keeping the original name in front."},
-                {"Tags", "Words for what the picture shows: proposed by CLIP with a confidence, or your own. Searchable."},
-                {"Image recognition", "CLIP: the image analysis that reads each picture once (slow) and keeps the result, so tags and meaning search are fast afterwards."},
-                {"Keywords", "Tags written into the file (XMP dc:subject) so other apps see them. Only added; the file's own keywords stay."},
-                {"Description", "A sentence written into the file (XMP dc:description): the AI prompt for generated images, plus \"Shows: tags\". An existing description is only changed as you decide."},
-                {"EXIF / XMP", "The metadata inside the file. Camera, lens, dates, GPS and AI prompts are the file's own and are never changed."},
-                {"AI prompt", "What an AI image was generated from (ComfyUI, A1111, Civitai downloads...). Read-only; searchable."},
-                {"Set tags > Suggestions", "Fixes of generated tags and names, proposed with a confidence and applied only when you tick them."},
-                {"Auto set meta", "All in one go: writes missing dates, keywords, descriptions and places into the files where they are, after you review the list."},
-                {"Undo", "Every applied change is recorded: Activity lists the last 10 runs, each with Undo (Ctrl+Z right after applying)."},
-                {"Assistant", "The robot in the top bar: green when image recognition, the language model and jev are all up. Features that need a helper that is down are greyed out."},
-                {"jev", "The decision model that settles close calls: dates, places, search results, and cross-checks of the LLM."},
-                {"LLM", "The language model (local server) that reads prompts, picks keywords and judges search results."},
-                {"Red buttons", "They change or remove your original files (move, rename, write into them, move to Trash, replace a description)."},
-            };
-            if (ImGui::BeginTable("glossary", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
-                ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 130);
-                ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthStretch);
-                for (auto& c : cs) {
-                    ImGui::TableNextRow();
-                    ImGui::TableNextColumn();
-                    ImGui::TextColored(g_accent, "%s", tr(c.name));
-                    ImGui::TableNextColumn();
-                    ImGui::TextWrapped("%s", tr(c.text));
-                }
-                ImGui::EndTable();
-            }
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem(tr("Keys"))) {
-            const char* keys[][2] = {{"j / k, Down / Up", "next / previous row or photo"}, {"h / l, Left / Right", "previous / next month, page, or grid column"},
-                                     {"Enter, Space", "open the viewer / next photo"}, {"f", "star / unstar the photo"},
-                                     {"Ctrl+click, Shift+click", "select several photos"},
-                                     {"Esc, q", "close the viewer or a dialog"}, {"Ctrl+F", "search"}, {"Ctrl+I", "show / hide the inspector"},
-                                     {"Ctrl+,", "settings"}, {"Ctrl+Z", "undo what was just applied"}, {"F2", "rename the photo"}, 
-                                     {"d, Delete", "move the selected photos to the Trash (asks; Enter confirms)"}, {"c", "copy the selected photos' paths"},
-                                     {"s", "go to the search box"}, {"Ctrl+P", "feature search: a page, a setting or an action"}, {"Ctrl+wheel", "thumbnail size in the grid"},
-                                     {"Wheel / drag / 0", "viewer: zoom at the pointer / move / fit"}, {"Backspace", "in an empty search: remove the last filter chip"}, {"Right-click", "copy a label, or more actions on a photo"}};
-            for (auto& k : keys) { ImGui::TextColored(g_accent, "%-26s", k[0]); ImGui::SameLine(220); ImGui::TextUnformatted(tr(k[1])); }
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem(tr("Search"))) {
-            ImGui::TextWrapped("%s", tr("beach sunset (both) · beach | sea, OR (either) · -night, NOT (without) · ( ) grouping · \"a phrase\" · ~typo"));
-            ImGui::TextWrapped("%s", tr("tag: name: desc: prompt: exif: place: camera: model: lora: — one field"));
-            ImGui::TextWrapped("%s", tr("date:2019 date:2019-05..2019-08 date:>2020 year:2018..2020 · size:>2mb w:>3000 mp:>12 ext:raw"));
-            ImGui::TextWrapped("%s", tr("is:fav is:ai is:untagged is:uncertain is:portrait · has:gps has:prompt has:desc · like:#123 (looks like)"));
-            ImGui::TextWrapped("%s", tr("Chinese, Japanese and Korean words also find English tags, and the other way round."));
-            ImGui::TextWrapped("%s", tr("Pick a suggestion while typing to add it as a filter chip. A sentence (four words or more) + Enter asks the assistant."));
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem(tr("About"))) {
-            ImGui::Text("jev photos %s", JEV_VERSION);
-            ImGui::TextDisabled("%s", tr("Organize, tag and search photos, with explainable decisions."));
-            if (ImGui::Button("github.com/jstdlee/jev-photos")) util::open_path("https://github.com/jstdlee/jev-photos");
-            tip(tr("Open the project page in the browser"));
-            ImGui::SeparatorText(tr("Credits"));
-            const char* credits[] = {"Dear ImGui (Omar Cornut) · GLFW · OpenGL", "SQLite with FTS5 · nlohmann/json · xxHash · stb_image",
-                                     "ONNX Runtime · CLIP (OpenAI), ONNX exports by Xenova", "Tabler Icons (MIT) · Tokyo Night colours (enkia, MIT)", "exiv2 (metadata) · ffmpeg (video frames)",
-                                     "jev / Julia decision API · Qwen3 language model (local)", "Built with Claude Code"};
-            for (auto* c : credits) ImGui::BulletText("%s", c);
-            ImGui::SeparatorText(tr("License"));
-            ImGui::TextDisabled("GPL-3.0 (see LICENSE)");
-            ImGui::EndTabItem();
-        }
-        ImGui::EndTabBar();
-    }
-    ImGui::End();
-}
 
 // The tag list CLIP chooses from: a paged, searchable table with add / edit / delete, saved to tags.txt.
 static void draw_tag_editor(App& a) {
@@ -4464,8 +4619,7 @@ static void draw_tag_editor(App& a) {
             o.stages = ST_TAG;
             o.scope = all_scope(a.cfg);
             o.clip_mode = o.tag_mode = 0;  // the new list makes every photo's tags outdated: all are re-tagged
-            a.last_stages = ST_TAG;
-            a.pipe->start(effective(a.cfg), o);
+            submit_task(a, "Re-tag with the new tag list", effective(a.cfg), o, ST_TAG, false, -1, false);
             a.toast = tr("Tag list saved; re-tagging the photos");
             a.toast_until = glfwGetTime() + 3;
             ImGui::CloseCurrentPopup();
@@ -4488,8 +4642,7 @@ static void run_tag(App& a, int clip_mode, int tag_mode) {
     o.scope = all_scope(a.cfg);
     o.clip_mode = clip_mode;
     o.tag_mode = tag_mode;
-    a.last_stages = ST_TAG;
-    a.pipe->start(effective(a.cfg), o);
+    submit_task(a, "Image recognition", effective(a.cfg), o, ST_TAG, false, -1, false);
 }
 
 static void start_smart(App& a) {
@@ -4618,8 +4771,7 @@ static void draw_smart_modal(App& a) {
             o.scope = all_scope(a.cfg);
             for (auto& it : st->items)
                 if (it.tick) (it.action == "reanalyse" ? o.reanalyse_ids : o.retag_ids).push_back(it.id);
-            a.last_stages = ST_TAG;
-            a.pipe->start(effective(a.cfg), o);
+            submit_task(a, "Smart update", effective(a.cfg), o, ST_TAG, false, -1, false);
             ImGui::CloseCurrentPopup();
         }
         ImGui::EndDisabled();
@@ -4703,10 +4855,9 @@ static void draw_corr_confirm(App& a) {
         o.stages = ST_FIX;
         o.scope = all_scope(a.cfg);
         o.recheck_all = true;
-        a.last_stages = ST_FIX;
         Config run = effective(a.cfg);
         if (!llm) run.llm_enabled = false;
-        a.pipe->start(run, o);
+        submit_task(a, "Check tags", run, o, ST_FIX, false, -1, false);
         ImGui::CloseCurrentPopup();
     }
     ImGui::SameLine();
@@ -5062,67 +5213,251 @@ static void draw_search(App& a, float width) {
 
 // ---- top bar
 
-static void draw_activity_button(App& a) {
-    bool busy = a.pipe->running();
+// ---- Status · tasks · logs: the second button of the top-right cluster (Ctrl+J). The ring around it is the real
+// overall progress of the queue, the badge counts waiting work; amber when paused, a red dot after errors.
+static const char* stage_label(int stage) {
+    static const int order[] = {ST_SCAN, ST_DUPES, ST_DECIDE, ST_TAG, ST_VISION, ST_FIX, ST_ORGANIZE};
+    static const char* names[] = {"Scanning", "Duplicates", "Dates and places", "Recognising", "Describing", "Checking tags", "Organizing"};
+    for (int k = 0; k < 7; k++)
+        if (stage == order[k]) return names[k];
+    return "Working";
+}
+
+static void draw_task_row(App& a, QTask& t, int idx, bool& changed) {
     Progress& p = a.pipe->progress;
-    if (busy) {
+    ImGui::PushID(t.id);
+    const char* icon = t.state == TQ_RUNNING ? ICON_PLAY : t.state == TQ_PAUSED ? ICON_PAUSE : t.state == TQ_QUEUED ? ICON_CLOCK
+                     : t.state == TQ_STOPPED ? ICON_PLAYER_STOP : t.errors ? ICON_ALERT_TRIANGLE : ICON_CIRCLE_CHECK;
+    ImVec4 col = t.state == TQ_RUNNING ? g_accent : t.state == TQ_PAUSED ? g_warn : t.errors ? g_warn : t.state == TQ_DONE ? g_ok : g_text_dim;
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(col, "%s", icon);
+    ImGui::SameLine();
+    ImGui::TextUnformatted(tr(t.name.c_str()));
+    float right = ImGui::GetContentRegionMax().x;
+    auto act = [&](const char* ic, const char* tipt, float& x) {  // icon buttons from the right edge
+        float w = ImGui::GetFrameHeight();
+        x -= w + 2;
+        ImGui::SameLine(x);
+        bool r = ImGui::Button(ic, ImVec2(w, 0));
+        tip(tipt);
+        return r;
+    };
+    float x = right;
+    if (t.state == TQ_RUNNING) {
+        if (act(ICON_PLAYER_STOP, tr("Stop after the current photo; what is done is kept"), x)) { a.task_stop_as = TQ_STOPPED; a.pipe->stop(); }
+        if (t.resumable && act(ICON_PAUSE, tr("Pause: stops now and waits in the queue; Resume continues where it stopped"), x)) { a.task_stop_as = TQ_PAUSED; a.pipe->stop(); }
+    } else if (t.state == TQ_QUEUED || t.state == TQ_PAUSED) {
+        if (act(ICON_X, tr("Cancel: take it out of the queue"), x)) { a.tasks.erase(a.tasks.begin() + idx); changed = true; ImGui::PopID(); return; }
+        if (t.state == TQ_PAUSED && act(ICON_PLAY, tr("Resume"), x)) { t.state = TQ_QUEUED; changed = true; }
+        if (t.state == TQ_QUEUED && t.resumable && act(ICON_PAUSE, tr("Hold: it waits until you resume it"), x)) t.state = TQ_PAUSED;
+        if (idx + 1 < int(a.tasks.size()) && act(ICON_ARROW_DOWN, tr("Move down"), x)) { std::swap(a.tasks[size_t(idx)], a.tasks[size_t(idx + 1)]); ImGui::PopID(); return; }
+        if (idx > 0 && a.tasks[size_t(idx - 1)].state != TQ_RUNNING && act(ICON_ARROW_UP, tr("Move up"), x)) {
+            std::swap(a.tasks[size_t(idx)], a.tasks[size_t(idx - 1)]);
+            ImGui::PopID();
+            return;
+        }
+    }
+    // second line: progress bar (running), or the state and numbers
+    if (t.state == TQ_RUNNING) {
         int done = p.done, total = p.total;
         float frac = total > 0 ? float(done) / float(total) : 0.0f;
-        static const int order[] = {ST_SCAN, ST_DUPES, ST_DECIDE, ST_TAG, ST_VISION, ST_FIX, ST_ORGANIZE};
-        static const char* names[] = {"Scanning", "Duplicates", "Dates and places", "Recognising", "Describing", "Checking tags", "Organizing"};
-        const char* name = "Working";
-        for (int k = 0; k < 7; k++)
-            if (p.stage == order[k]) name = names[k];
+        double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - p.stage_start).count();
+        double eta = done > 0 && total > done ? el / done * (total - done) : -1;
         ImGui::PushStyleColor(ImGuiCol_PlotHistogram, g_accent);
-        ImGui::ProgressBar(frac, ImVec2(170, 0), util::fmt("%s %d/%d", tr(name), done, total).c_str());
+        ImGui::ProgressBar(total > 0 ? frac : -1.0f * float(ImGui::GetTime()), ImVec2(-1, 6), "");
         ImGui::PopStyleColor();
-        if (ImGui::IsItemClicked()) ImGui::OpenPopup("activity");
-        tip(tr("Click for details, or to stop"));
+        ImGui::TextDisabled("%s  ·  %d / %d  ·  %.0f%%%s", tr(stage_label(p.stage)), done, total, frac * 100,
+                            eta >= 0 ? (std::string("  ·  ") + fmt_eta(eta) + " " + tr("remaining")).c_str() : "");
     } else {
-        bool down = (a.cfg.clip_enabled && a.clip_ok == 0) || (a.cfg.llm_enabled && a.llm_ok == 0) || (a.cfg.jev_enabled && a.jev_ok == 0);
-        if (down) ImGui::PushStyleColor(ImGuiCol_Text, g_warn);  // a helper is down: details in the popover
-        if (ImGui::Button(ICON_ACTIVITY)) ImGui::OpenPopup("activity");
-        if (down) ImGui::PopStyleColor();
-        tip(tr("Activity: the last run, Undo, and whether image recognition, the language model and jev are up"));
+        const char* st = t.state == TQ_QUEUED ? tr("queued") : t.state == TQ_PAUSED ? tr("paused") : t.state == TQ_STOPPED ? tr("stopped")
+                                                                                                   : t.errors ? tr("done with errors") : tr("done");
+        std::string extra = t.total ? util::fmt("  ·  %d / %d", t.done, t.total) : "";
+        if (t.t_end > 0) extra += "  ·  " + fmt_duration(t.t_end - t.t_start);
+        if (!t.note.empty()) extra += "  ·  " + t.note;
+        ImGui::TextDisabled("%s%s", st, extra.c_str());
     }
-    if (anim::begin_popup("activity")) {
-        std::string summary;
-        {
-            std::lock_guard<std::mutex> l(p.mu);
-            summary = p.summary;
+    ImGui::PopID();
+}
+
+static void draw_status_popover(App& a) {
+    static int tab = 0;
+    static bool lv[3] = {true, true, true};  // info, warning, error
+    static char lq[96] = "";
+    Progress& p = a.pipe->progress;
+    // header: the app's state in one sentence
+    int running = 0, queued = 0, paused = 0;
+    for (auto& t : a.tasks) (t.state == TQ_RUNNING ? running : t.state == TQ_PAUSED ? paused : queued)++;
+    std::string head = running ? util::fmt("%s %s", tr("Running:"), tr(a.tasks.front().name.c_str()))
+                     : paused && !queued ? std::string(tr("Paused"))
+                                         : std::string(tr("Ready"));
+    if (queued) head += util::fmt("  ·  %d %s", queued, tr("queued"));
+    if (paused) head += util::fmt("  ·  %d %s", paused, tr("paused"));
+    ImGui::TextUnformatted(head.c_str());
+    prefs::seg("statustab", &tab, {tr("Tasks"), tr("Logs")});
+    ImGui::Separator();
+    if (tab == 0) {
+        ImGui::BeginDisabled(a.tasks.empty());
+        if (ImGui::SmallButton((std::string(ICON_PAUSE " ") + tr("Pause all")).c_str())) {
+            for (auto& t : a.tasks)
+                if (t.state == TQ_QUEUED && t.resumable) t.state = TQ_PAUSED;
+            if (a.pipe->running() && !a.tasks.empty() && a.tasks.front().resumable) { a.task_stop_as = TQ_PAUSED; a.pipe->stop(); }
         }
-        if (busy) {
-            ImGui::Text("%s", p.get_current().c_str());
-            if (danger_button(tr("Stop"), tr("Stop after the current photo; everything done so far is kept"))) a.pipe->stop();
-        } else {
-            ImGui::TextWrapped("%s", summary.empty() ? tr("Nothing has run yet.") : summary.c_str());
+        tip(tr("Pause the running task and hold the queue"));
+        ImGui::SameLine();
+        if (ImGui::SmallButton((std::string(ICON_PLAY " ") + tr("Resume all")).c_str())) {
+            for (auto& t : a.tasks)
+                if (t.state == TQ_PAUSED) t.state = TQ_QUEUED;
+            start_next_task(a);
         }
+        ImGui::SameLine();
+        if (ImGui::SmallButton((std::string(ICON_X " ") + tr("Cancel all")).c_str())) {
+            a.tasks.erase(std::remove_if(a.tasks.begin(), a.tasks.end(), [](const QTask& t) { return t.state != TQ_RUNNING; }), a.tasks.end());
+            if (a.pipe->running()) { a.task_stop_as = TQ_STOPPED; a.pipe->stop(); }
+        }
+        tip(tr("Empty the queue and stop the running task (what is done is kept)"));
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(a.task_done.empty());
+        if (ImGui::SmallButton(tr("Clear done"))) a.task_done.clear();
+        ImGui::EndDisabled();
+        ImGui::BeginChild("tasklist", ImVec2(0, std::min(360.0f, ImGui::GetTextLineHeightWithSpacing() * 2.6f * float(a.tasks.size() + a.task_done.size() + 1))));
+        bool changed = false;
+        if (a.tasks.empty() && a.task_done.empty()) ImGui::TextDisabled("%s", tr("Nothing has run yet."));
+        for (int i = 0; i < int(a.tasks.size()); i++) draw_task_row(a, a.tasks[size_t(i)], i, changed);
+        if (!a.task_done.empty()) ImGui::SeparatorText(tr("Done"));
+        for (int i = 0; i < int(a.task_done.size()); i++) {
+            QTask& t = a.task_done[size_t(i)];
+            ImGui::PushID(1000000 + t.id);
+            draw_task_row(a, t, -1, changed);
+            ImGui::SameLine(ImGui::GetContentRegionMax().x - ImGui::GetFrameHeight() * 2 - 4);
+            if (ImGui::Button(ICON_RETRY, ImVec2(ImGui::GetFrameHeight(), 0))) {
+                QTask copy = t;
+                submit_task(a, copy.name, copy.cfg, copy.o, copy.last_stages, copy.planned, copy.plan_op, copy.show_plan);
+            }
+            tip(tr("Run it again"));
+            ImGui::SameLine(0, 2);
+            bool rm = ImGui::Button(ICON_X, ImVec2(ImGui::GetFrameHeight(), 0));
+            tip(tr("Remove from the list"));
+            ImGui::PopID();
+            if (rm) { a.task_done.erase(a.task_done.begin() + i); break; }
+        }
+        if (changed) start_next_task(a);
+        ImGui::EndChild();
+        // helpers
         ImGui::SeparatorText(tr("Helpers"));
+        std::string cd, ld, jd;
+        {
+            std::lock_guard<std::mutex> l(a.health_mu);
+            cd = a.clip_detail;
+            ld = a.llm_detail;
+            jd = a.jev_detail;
+        }
+        auto hrow = [](int v, bool on, const char* name, const std::string& detail) {
+            ImVec4 col = !on ? g_text_dim : v == 1 ? g_ok : v == 0 ? g_warn : g_text_dim;
+            ImGui::TextColored(col, "%s", v == 1 && on ? ICON_CIRCLE_CHECK : ICON_CIRCLE_X);
+            ImGui::SameLine();
+            ImGui::Text("%s: %s", name, !on ? tr("off") : v == 1 ? tr("ready") : v == 0 ? tr("down") : tr("checking"));
+            if (!detail.empty()) tip(detail.c_str());
+        };
+        hrow(a.clip_ok, a.cfg.clip_enabled, tr("Image recognition"), cd);
+        hrow(a.llm_ok, a.cfg.llm_enabled, tr("Language model"), a.cfg.llm_url + "  " + ld);
+        hrow(a.jev_ok, a.cfg.jev_enabled, tr("jev decisions"), a.cfg.jev_url + "  " + jd);
         if (ImGui::SmallButton((std::string(ICON_FLASK " ") + tr("Model tests...")).c_str())) { a.show_model_tests = true; ImGui::CloseCurrentPopup(); }
         tip(tr("Send your own input to each model and see the answer and how long it took"));
-        {
-            std::string cd, ld, jd;
-            {
-                std::lock_guard<std::mutex> l(a.health_mu);
-                cd = a.clip_detail;
-                ld = a.llm_detail;
-                jd = a.jev_detail;
-            }
-            auto row = [](int v, bool on, const char* name, const std::string& detail) {
-                ImVec4 col = !on ? g_text_dim : v == 1 ? g_ok : v == 0 ? g_warn : g_text_dim;
-                ImGui::TextColored(col, "%s", v == 1 && on ? ICON_CIRCLE_CHECK : ICON_CIRCLE_X);
-                ImGui::SameLine();
-                ImGui::Text("%s: %s", name, !on ? tr("off") : v == 1 ? tr("ready") : v == 0 ? tr("down") : tr("checking"));
-                if (!detail.empty()) tip(detail.c_str());
-            };
-            row(a.clip_ok, a.cfg.clip_enabled, tr("Image recognition"), cd);
-            row(a.llm_ok, a.cfg.llm_enabled, tr("Language model"), a.cfg.llm_url + "  " + ld);
-            row(a.jev_ok, a.cfg.jev_enabled, tr("jev decisions"), a.cfg.jev_url + "  " + jd);
-        }
-        ImGui::Separator();
-        for (auto& l : a.log.tail(8)) ImGui::TextDisabled("%s %s", l.time.c_str(), l.text.substr(0, 110).c_str());
-        if (ImGui::Button(tr("Open Activity"))) { set_section(a, SEC_ACTIVITY); ImGui::CloseCurrentPopup(); }
+        ImGui::SameLine();
+        if (ImGui::SmallButton((std::string(ICON_HISTORY " ") + tr("Open Activity")).c_str())) { set_section(a, SEC_ACTIVITY); ImGui::CloseCurrentPopup(); }
         tip(tr("The full log, what changed (with Undo), and the decisions jev made"));
+    } else {
+        const char* names[3] = {tr("Info"), tr("Warning"), tr("Error")};
+        ImVec4 cols[3] = {ImGui::GetStyleColorVec4(ImGuiCol_Text), g_warn, g_err};
+        for (int k = 2; k >= 0; k--) {  // level filter chips
+            if (k != 2) ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Button, lv[k] ? ImVec4(g_accent.x, g_accent.y, g_accent.z, 0.25f) : ImGui::GetStyleColorVec4(ImGuiCol_FrameBg));
+            if (ImGui::SmallButton(names[k])) lv[k] = !lv[k];
+            ImGui::PopStyleColor();
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(160);
+        ImGui::InputTextWithHint("##lq", tr("filter"), lq, sizeof lq);
+        std::vector<LogLine> lines = a.log.tail(2000);
+        std::string ql = util::lower(lq), text;
+        std::vector<const LogLine*> shown;
+        for (auto it = lines.rbegin(); it != lines.rend(); ++it)  // newest first
+            if (lv[std::clamp(it->level, 0, 2)] && (ql.empty() || util::lower(it->text).find(ql) != std::string::npos)) shown.push_back(&*it);
+        ImGui::SameLine();
+        if (ImGui::SmallButton(ICON_COPY)) {
+            for (auto* l : shown) text += l->time + "  " + l->text + "\n";
+            ImGui::SetClipboardText(text.c_str());
+        }
+        tip(tr("Copy these lines"));
+        ImGui::SameLine();
+        if (ImGui::SmallButton(ICON_FOLDER)) util::open_path(util::dirname(a.log.file.empty() ? util::data_dir() + "/x" : a.log.file));
+        tip(tr("Open the folder with the log file"));
+        ImGui::BeginChild("loglines", ImVec2(0, 340), ImGuiChildFlags_Borders);
+        ImGuiListClipper clip;
+        clip.Begin(int(shown.size()));
+        while (clip.Step())
+            for (int i = clip.DisplayStart; i < clip.DisplayEnd; i++) {
+                const LogLine& l = *shown[size_t(i)];
+                int lvl = std::clamp(l.level, 0, 2);
+                ImGui::TextColored(cols[lvl], "%s", lvl == 2 ? ICON_CIRCLE_X : lvl == 1 ? ICON_ALERT_TRIANGLE : ICON_INFO_CIRCLE);
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", l.time.c_str());
+                ImGui::SameLine();
+                ImGui::TextUnformatted(l.text.substr(0, 160).c_str());
+                if (l.text.size() > 160 || ImGui::IsItemHovered()) tip(l.text.c_str());
+            }
+        ImGui::EndChild();
+    }
+    (void)p;
+}
+
+static void draw_status_button(App& a, float bw) {
+    int active = int(a.tasks.size());
+    bool paused_only = active > 0 && !a.pipe->running();
+    bool errors = false;
+    for (auto& t : a.task_done) errors |= t.errors > 0 && t.t_end > a.status_seen_at;
+    if (ImGui::Button(ICON_LIST_CHECK "##status", ImVec2(bw, 0)) || a.status_open_req) {
+        ImGui::OpenPopup("status");
+        a.status_open_req = false;
+        a.status_seen_at = glfwGetTime();
+    }
+    ImVec2 b0 = ImGui::GetItemRectMin(), b1 = ImGui::GetItemRectMax();
+    {
+        std::string t = active ? util::fmt("%s: %d", tr("Tasks"), active) : std::string(tr("Tasks and logs"));
+        tipk(t.c_str(), "Ctrl+J");
+    }
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 c((b0.x + b1.x) / 2, (b0.y + b1.y) / 2);
+    float r = (b1.y - b0.y) / 2 + 1;
+    if (active) {  // the ring: overall progress of the queue (real numbers, no endless spinner)
+        Progress& p = a.pipe->progress;
+        float cur = a.pipe->running() && p.total > 0 ? float(p.done) / float(p.total) : 0.0f;
+        float overall = std::clamp((float(a.batch_done) + cur) / float(std::max(1, a.batch_total)), 0.0f, 1.0f);
+        dl->PathArcTo(c, r, 0, 6.2832f, 40);
+        dl->PathStroke(ImGui::GetColorU32(ImGuiCol_FrameBg), ImDrawFlags_Closed, 2.0f);
+        if (overall > 0.001f) {
+            dl->PathArcTo(c, r, -1.5708f, -1.5708f + 6.2832f * overall, 40);
+            dl->PathStroke(ImGui::GetColorU32(paused_only ? g_warn : g_accent), 0, 2.0f);
+        }
+        std::string n = std::to_string(active);  // badge
+        ImVec2 ts = ImGui::CalcTextSize(n.c_str());
+        ImVec2 bc(b1.x - 2, b0.y + 2);
+        float br = std::max(ts.x, ts.y) * 0.5f + 2;
+        dl->AddCircleFilled(bc, br, ImGui::GetColorU32(paused_only ? g_warn : g_accent));
+        ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 0.72f);
+        ImVec2 ts2 = ImGui::CalcTextSize(n.c_str());
+        dl->AddText(ImVec2(bc.x - ts2.x / 2, bc.y - ts2.y / 2), IM_COL32(255, 255, 255, 255), n.c_str());
+        ImGui::PopFont();
+    }
+    if (errors) dl->AddCircleFilled(ImVec2(b0.x + 4, b0.y + 4), 3.5f, ImGui::GetColorU32(kDanger));
+    if (ImGui::IsPopupOpen("status")) {  // only then: SetNextWindow* would otherwise move the next window drawn (the sidebar)
+        ImGui::SetNextWindowPos(ImVec2(b1.x, b1.y + 6), ImGuiCond_Always, ImVec2(1, 0));
+        ImGui::SetNextWindowSize(ImVec2(480, 0));
+    }
+    if (anim::begin_popup("status")) {
+        draw_status_popover(a);
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) ImGui::CloseCurrentPopup();
         anim::end_popup();
     }
 }
@@ -5182,21 +5517,27 @@ static void draw_topbar(App& a) {
     if (ImGui::Button(ICON_PREVIEW_PANE)) a.inspector_on = !a.inspector_on;
     if (insp) ImGui::PopStyleColor();
     tip(tr("Show or hide the preview pane: the selected photo with its date, place, tags and file info (Ctrl+I)"));
-    ImGui::SameLine(0, 10);
-    draw_activity_button(a);
-    ImGui::SameLine(0, 10);
-    ImGui::BeginDisabled(busy);
-    if (primary_button(tr("Analyze"), tr("Scan your folders for new or changed photos and update dates, tags and the lists to review. Nothing in your files changes.")))
-        request_analyze(a);
-    ImGui::EndDisabled();
+    ImGui::SameLine(0, 12);
+    {  // The feature button: its own icon, accent-tinted, one per view
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(g_accent.x, g_accent.y, g_accent.z, 0.16f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(g_accent.x, g_accent.y, g_accent.z, 0.28f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(g_accent.x, g_accent.y, g_accent.z, 0.40f));
+        ImGui::PushStyleColor(ImGuiCol_Text, g_accent);
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(g_accent.x, g_accent.y, g_accent.z, 0.55f));
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
+        if (ImGui::Button((std::string(ICON_FEATURE "  ") + tr("Analyze")).c_str())) request_analyze(a);
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(5);
+        tipk(busy ? tr("Scan your folders again when the running task is done (queued)")
+                  : tr("Scan your folders for new or changed photos and update dates, tags and the lists to review. Nothing in your files changes."),
+             "F5");
+    }
     // The top-right corner: help and settings, then the window buttons at the very edge.
     float bw = ImGui::GetFrameHeight() * 1.3f, sp = 2, gap = 14;
     bool own = !a.cfg.system_titlebar;
-    float corner = bw * 4 + sp * 3 + (own ? gap + bw * 3 + sp * 2 : 0);
+    // Top right, the same in every view: [camera] | search · status/tasks/logs · help · settings | window buttons
+    float corner = bw * 5 + sp * 4 + 10 + (own ? gap + bw * 3 + sp * 2 : 0);
     ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 12, ImGui::GetWindowContentRegionMax().x - corner));
-    if (ImGui::Button(ICON_COMMAND, ImVec2(bw, 0))) a.palette_open = true;
-    tip(tr("Find a feature: a page, a setting or an action by name (Ctrl+P)"));
-    ImGui::SameLine(0, sp);
     if (ImGui::Button(ICON_CAMERA, ImVec2(bw, 0))) ImGui::OpenPopup("shotmenu");
     tip(tr("Screenshot of this window, or of an area you select (saved in Pictures/jev-photos)"));
     if (anim::begin_popup("shotmenu")) {
@@ -5209,14 +5550,24 @@ static void draw_topbar(App& a) {
         ImGui::EndDisabled();
         anim::end_popup();
     }
+    ImGui::SameLine(0, 10);
+    if (ImGui::Button(ICON_SEARCH "##palette", ImVec2(bw, 0))) a.palette_open = true;
+    tipk(tr("Search: pages, settings, actions, help"), "Ctrl+P");
+    ImGui::SameLine(0, sp);
+    draw_status_button(a, bw);
     ImGui::SameLine(0, sp);
     if (ImGui::Button(ICON_HELP, ImVec2(bw, 0))) a.show_help = !a.show_help;
-    tip(tr("Help: what is what, keys, search syntax, credits"));
+    tipk(tr("Help: concepts, glossary, shortcuts"), "F1");
     ImGui::SameLine(0, sp);
     if (ImGui::Button(ICON_SETTINGS, ImVec2(bw, 0))) a.show_settings = !a.show_settings;
-    tip(tr("Settings (Ctrl+,)"));
+    tipk(tr("Settings"), "Ctrl+,");
     if (own) {
-        ImGui::SameLine(0, gap);
+        ImGui::SameLine(0, gap / 2);
+        {  // 1 px divider between the cluster and the window buttons
+            ImVec2 p = ImGui::GetCursorScreenPos();
+            ImGui::GetWindowDrawList()->AddLine(ImVec2(p.x, p.y + 4), ImVec2(p.x, p.y + ImGui::GetFrameHeight() - 4), ImGui::GetColorU32(ImGuiCol_Border));
+        }
+        ImGui::SameLine(0, gap / 2);
         if (ImGui::Button(ICON_MINUS, ImVec2(bw, 0))) glfwIconifyWindow(a.win);
         tip(tr("Minimise"));
         ImGui::SameLine(0, 2);
@@ -5480,14 +5831,11 @@ static void draw_activity(App& a) {
 // ---- Undo: every applied run is journaled; undo puts it back, newest change first
 
 static void start_undo(App& a, const std::string& run) {
-    if (a.pipe->running()) return;
     RunOptions o = a.opts;
     o.stages = 0;
     o.undo_run = run;
-    a.last_run_planned = false;
-    a.last_stages = 0;
     a.undo_until = 0;
-    a.pipe->start(effective(a.cfg), o);
+    submit_task(a, "Undo", effective(a.cfg), o, 0, false, -1, false);
     a.log.add(0, "undo of the run applied " + run);
 }
 
@@ -5794,7 +6142,8 @@ static void draw_model_tests(App& a) {
 
 static void apply_theme(App& a, int t) {
     a.cfg.theme = t;
-    theme_default_accent(t, a.cfg.accent);
+    if (t == THEME_SYSTEM) g_system_dark = -1;  // look again
+    theme_default_accent(theme_kind(a.cfg), a.cfg.accent);
     apply_style(a.cfg);
     save_config(a.cfg, a.config_file);
 }
@@ -5832,8 +6181,8 @@ static std::vector<PalItem> palette_items(App& a) {
     v.push_back({ICON_MENU_2, tr("Show / hide the sidebar"), act, [](App& x) { x.sidebar_on = !x.sidebar_on; }});
     v.push_back({ICON_LAYOUT_GRID, tr("Grid / list"), act, [](App& x) { x.photo_grid = !x.photo_grid; }});
     v.push_back({ICON_ACTIVITY, tr("Log"), act, [](App& x) { x.show_log = true; }});
-    const char* th[] = {tr("Dark"), tr("Tokyo Night"), tr("Light")};
-    for (int t = 0; t < 3; t++) v.push_back({ICON_EYE, std::string(tr("Theme")) + ": " + th[t], act, [t](App& x) { apply_theme(x, t); }});
+    const char* th[] = {tr("Dark"), tr("Tokyo Night"), tr("Light"), tr("System")};
+    for (int t = 0; t < 4; t++) v.push_back({ICON_EYE, std::string(tr("Theme")) + ": " + th[t], act, [t](App& x) { apply_theme(x, t); }});
     // every row of Settings, found where it is drawn
     for (auto& [section, title] : prefs::g_index) {
         std::string key = section + "\x1f" + title;
@@ -5933,6 +6282,211 @@ static void draw_palette(App& a) {
     ImGui::EndPopup();
 }
 
+// ---- Keyboard: one list, read by Help > Shortcuts, the palette and the tooltips
+struct KeyDef {
+    const char* group;
+    const char* keys;
+    const char* action;
+};
+static const KeyDef kKeys[] = {
+    {"General", "Ctrl+P", "Find a page, a setting or an action (also Ctrl+K)"},
+    {"General", "F5", "Analyze the folders"},
+    {"General", "Ctrl+J", "Tasks and logs"},
+    {"General", "F1", "Help (Ctrl+/ opens the shortcuts)"},
+    {"General", "Ctrl+,", "Settings"},
+    {"General", "Ctrl+Shift+T", "Switch theme"},
+    {"General", "Ctrl+Z", "Undo what was just applied"},
+    {"General", "Esc", "Close a dialog, the palette or the viewer"},
+#ifdef _WIN32
+    {"General", "Alt+F4", "Quit"},
+#else
+    {"General", "Ctrl+Q", "Quit"},
+#endif
+    {"View", "Ctrl+B", "Show / hide the sidebar"},
+    {"View", "Ctrl+I", "Show / hide the preview pane"},
+    {"View", "Ctrl+= / Ctrl+- / Ctrl+0", "Text size: larger / smaller / normal"},
+    {"View", "F11", "Full screen"},
+    {"View", "Ctrl+wheel", "Thumbnail size in the grid"},
+    {"Photos", "Arrows, h j k l", "Move between photos (and months in the list)"},
+    {"Photos", "Enter, Space", "Open the viewer"},
+    {"Photos", "Ctrl+click, Shift+click", "Select several photos"},
+    {"Photos", "f", "Star / unstar"},
+    {"Photos", "c", "Copy the paths"},
+    {"Photos", "d, Delete", "Move to the Trash (asks; Enter confirms)"},
+    {"Photos", "F2", "Rename"},
+    {"Photos", "s, Ctrl+F", "Go to the search box"},
+    {"Photos", "Backspace", "In an empty search: remove the last filter"},
+    {"Viewer", "Left, Right", "Previous / next photo"},
+    {"Viewer", "Wheel", "Zoom at the pointer"},
+    {"Viewer", "Drag", "Move the zoomed picture"},
+    {"Viewer", "Double-click, 0", "Fit / zoom in"},
+    {"Viewer", "Esc, q", "Close"},
+};
+
+static bool help_match(const std::string& q, std::initializer_list<const char*> fields) {
+    if (q.empty()) return true;
+    for (auto* f : fields)  // the translated text and the English one: people type English in any language
+        if (util::lower(tr(f)).find(q) != std::string::npos || util::lower(f).find(q) != std::string::npos) return true;
+    return false;
+}
+
+static void draw_help(App& a) {
+    if (!a.show_help) return;
+    static char q[96] = "";
+    ImGui::SetNextWindowSize(ImVec2(780, 600), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(ImGui::GetMainViewport()->Size.x - 810, 60), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin(tr("Help###help"), &a.show_help)) { ImGui::End(); return; }
+    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && !ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+        a.show_help = false;
+    ImGui::SetNextItemWidth(-1);
+    ImGui::InputTextWithHint("##hq", (std::string(ICON_SEARCH "  ") + tr("Search help: a word, a feature, a key")).c_str(), q, sizeof q);
+    std::string query = util::lower(util::trim(q));
+    int want = a.help_tab;
+    a.help_tab = -1;
+    if (ImGui::BeginTabBar("helptabs")) {
+        auto tab = [&](const char* label, int idx) {
+            return ImGui::BeginTabItem(label, nullptr, want == idx ? ImGuiTabItemFlags_SetSelected : 0);
+        };
+        // 1. Concepts, in the order you meet them
+        if (tab((std::string(ICON_LIGHTBULB " ") + tr("Concepts")).c_str(), 0)) {
+            struct Card { const char* icon; const char* title; const char* text; const char* where; int section; };
+            static const Card cards[] = {
+                {ICON_FOLDER, "Folders and the library", "Add the folders where your photos are. jev photos keeps a catalog of them; your files only change when you apply something.", "Sidebar > Library, Folders", SEC_ALL},
+                {ICON_FEATURE, "Analyze", "Reads new and changed photos: dates, places, duplicates and what each picture shows. Nothing in your files changes.", "Top bar > Analyze (F5)", -1},
+                {ICON_LIST_CHECK, "Tools", "Each tool lists what needs you, with a count: deduplicate, fix dates, set tags, organize path, auto set meta.", "Sidebar > Tools", SEC_DUPES},
+                {ICON_HISTORY, "Tasks and Undo", "Long work runs in the background as tasks you can pause, stop and resume. Every change to your files can be undone.", "Top right > Tasks (Ctrl+J), Sidebar > Activity", SEC_ACTIVITY},
+                {ICON_SEARCH, "Search and Go to", "Search photos by words, by what they show, or with a sentence. Ctrl+P finds any page, setting or action.", "Top bar > search box, Ctrl+P", -2},
+            };
+            for (auto& c : cards) {
+                if (!help_match(query, {c.title, c.text, c.where})) continue;
+                ImGui::PushID(c.title);
+                ImGui::BeginGroup();
+                ImGui::TextColored(g_accent, "%s", c.icon);
+                ImGui::SameLine();
+                ImGui::TextUnformatted(tr(c.title));
+                ImGui::Indent(ImGui::GetFontSize() * 1.6f);
+                ImGui::TextWrapped("%s", tr(c.text));
+                ImGui::TextDisabled("%s %s", tr("Where you see it:"), tr(c.where));
+                if (c.section != -1 && ImGui::SmallButton(tr("Show me"))) {
+                    if (c.section == -2) a.focus_search = true;
+                    else set_section(a, c.section);
+                    if (c.section == SEC_ACTIVITY) a.status_open_req = true;
+                }
+                ImGui::Unindent(ImGui::GetFontSize() * 1.6f);
+                ImGui::EndGroup();
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+                ImGui::PopID();
+            }
+            ImGui::EndTabItem();
+        }
+        // 2. Glossary, A-Z in the current language
+        if (tab((std::string(ICON_BOOK " ") + tr("Glossary")).c_str(), 1)) {
+            struct C { const char* name; const char* text; };
+            static const C cs[] = {
+                {"AIGC", "AI-generated images: pictures whose file carries generation data (prompt, model, LoRAs). Sidebar > Library > AIGC."},
+                {"AI prompt", "What an AI image was generated from (ComfyUI, A1111, Civitai downloads...). Read-only; searchable."},
+                {"Auto set meta", "All in one go: writes missing dates, keywords, descriptions and places into the files where they are, after you review the list."},
+                {"Blocked tags", "A tag you delete (tag list, or the x next to a photo's tag) is blocked: never recognised, suggested or written into files again. Unblock it in the tag list."},
+                {"Deduplicate", "Identical copies of the same photo, found by size, hash and a byte comparison. One stays; the others can go to the Trash."},
+                {"Description", "A sentence written into the file (XMP dc:description): the AI prompt for generated images, plus \"Shows: tags\". An existing description is only changed as you decide."},
+                {"EXIF / XMP", "The metadata inside the file. Camera, lens, dates, GPS and AI prompts are the file's own and are never changed."},
+                {"File name", "The name on disk. Organize gives photos date names (20190512_00001.jpg), optionally keeping the original name in front."},
+                {"Fix dates", "Photos whose date is a guess or missing. Accept the best guesses, or confirm or pick a date in the preview pane."},
+                {"Go to", "Ctrl+P (or the search icon at the top right, or typing in the search box) finds a page, a setting or an action by name and takes you there."},
+                {"Image recognition", "CLIP: the image analysis that reads each picture once (slow) and keeps the result, so tags and meaning search are fast afterwards."},
+                {"jev", "The decision model that settles close calls: dates, places, search results, and cross-checks of the LLM."},
+                {"Keywords", "Tags written into the file (XMP dc:subject) so other apps see them. Only added; the file's own keywords stay."},
+                {"LLM", "The language model (local server) that reads prompts, picks keywords and judges search results."},
+                {"Model tests", "For development (Settings > Advanced, or the tasks popover): send your own input to the language, vision, recognition and jev models."},
+                {"Organize path", "Renames photos to date names where they are (the default), or copies / moves them into month folders. Listed first, then applied; undoable."},
+                {"Photo folders", "The folders you add (sidebar > Folders). Analyze scans them all together; click one to see only its photos."},
+                {"Preview pane", "The right-hand pane: the selected photo with its date, place, tags, file info and why the app decided what it did (Ctrl+I)."},
+                {"Red buttons", "They change or remove your original files (move, rename, write into them, move to Trash, replace a description)."},
+                {"Screenshot", "The camera at the top right saves the whole window or an area you drag (Pictures/jev-photos); the path is copied."},
+                {"Set tags > Suggestions", "Fixes of generated tags and names, proposed with a confidence and applied only when you tick them."},
+                {"Tags", "Words for what the picture shows: proposed by CLIP with a confidence, or your own. Searchable."},
+                {"Tasks", "Long work (analysing, applying, undoing) waits in a queue and runs one at a time. Pause, resume, stop, retry and reorder them at the top right (Ctrl+J)."},
+                {"Undo", "Every applied change is recorded: Activity lists the last 10 runs, each with Undo (Ctrl+Z right after applying)."},
+            };
+            std::vector<const C*> sorted;
+            for (auto& c : cs)
+                if (help_match(query, {c.name, c.text})) sorted.push_back(&c);
+            std::sort(sorted.begin(), sorted.end(), [](const C* x, const C* y) { return util::lower(tr(x->name)) < util::lower(tr(y->name)); });
+            static std::vector<PalItem> items;
+            if (items.empty() || ImGui::IsWindowAppearing()) items = palette_items(a);
+            if (ImGui::BeginTable("glossary", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
+                ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 150);
+                ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 80);
+                for (auto* c : sorted) {
+                    ImGui::TableNextRow();
+                    ImGui::PushID(c->name);
+                    ImGui::TableNextColumn();
+                    ImGui::TextColored(g_accent, "%s", tr(c->name));
+                    ImGui::TableNextColumn();
+                    ImGui::TextWrapped("%s", tr(c->text));
+                    ImGui::TableNextColumn();
+                    auto m = palette_match(items, c->name, 1);  // the feature it names, if there is one
+                    if (!m.empty() && ImGui::SmallButton(tr("Show me"))) m[0]->go(a);
+                    ImGui::PopID();
+                }
+                ImGui::EndTable();
+            }
+            ImGui::EndTabItem();
+        }
+        // 3. Shortcuts, from the key list
+        if (tab((std::string(ICON_KEYBOARD " ") + tr("Shortcuts")).c_str(), 2)) {
+            if (ImGui::SmallButton(tr("Copy"))) {
+                std::string all;
+                for (auto& k : kKeys) all += std::string(tr(k.group)) + "\t" + k.keys + "\t" + tr(k.action) + "\n";
+                ImGui::SetClipboardText(all.c_str());
+            }
+            tip(tr("Copy every shortcut as text"));
+            const char* group = "";
+            for (auto& k : kKeys) {
+                if (!help_match(query, {k.action, k.group}) && util::lower(k.keys).find(query) == std::string::npos) continue;
+                if (strcmp(group, k.group) != 0) {
+                    group = k.group;
+                    ImGui::SeparatorText(tr(group));
+                }
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted(tr(k.action));
+                ImGui::SameLine(ImGui::GetFontSize() * 22);
+                ImGui::Dummy(ImVec2(0, 0));
+                key_chips(k.keys);
+            }
+            ImGui::EndTabItem();
+        }
+        if (tab((std::string(ICON_FILTER " ") + tr("Search syntax")).c_str(), 3)) {
+            ImGui::TextWrapped("%s", tr("beach sunset (both) · beach | sea, OR (either) · -night, NOT (without) · ( ) grouping · \"a phrase\" · ~typo"));
+            ImGui::TextWrapped("%s", tr("tag: name: desc: prompt: exif: place: camera: model: lora: — one field"));
+            ImGui::TextWrapped("%s", tr("date:2019 date:2019-05..2019-08 date:>2020 year:2018..2020 · size:>2mb w:>3000 mp:>12 ext:raw"));
+            ImGui::TextWrapped("%s", tr("is:fav is:ai is:untagged is:uncertain is:portrait · has:gps has:prompt has:desc · like:#123 (looks like)"));
+            ImGui::TextWrapped("%s", tr("Chinese, Japanese and Korean words also find English tags, and the other way round."));
+            ImGui::TextWrapped("%s", tr("Pick a suggestion while typing to add it as a filter chip. A sentence (four words or more) + Enter asks the assistant."));
+            ImGui::EndTabItem();
+        }
+        if (tab((std::string(ICON_INFO_CIRCLE " ") + tr("About")).c_str(), 4)) {
+            ImGui::Text("jev photos %s", JEV_VERSION);
+            ImGui::TextDisabled("%s", tr("Organize, tag and search photos, with explainable decisions."));
+            if (ImGui::Button("github.com/jstdlee/jev-photos")) util::open_path("https://github.com/jstdlee/jev-photos");
+            tip(tr("Open the project page in the browser"));
+            ImGui::SeparatorText(tr("Credits"));
+            const char* credits[] = {"Dear ImGui (Omar Cornut) · GLFW · OpenGL", "SQLite with FTS5 · nlohmann/json · xxHash · stb_image",
+                                     "ONNX Runtime · CLIP (OpenAI), ONNX exports by Xenova", "Font Awesome Free 6 (fonts OFL 1.1, icons CC BY 4.0) · Tokyo Night colours (enkia, MIT)", "exiv2 (metadata) · ffmpeg (video frames)",
+                                     "jev / Julia decision API · Qwen3 language model (local)", "Built with Claude Code"};
+            for (auto* c : credits) ImGui::BulletText("%s", c);
+            ImGui::SeparatorText(tr("License"));
+            ImGui::TextDisabled("GPL-3.0 (see LICENSE)");
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+    ImGui::End();
+}
+
 static void open_start_tab(App& a) {
     // Older entry points (--tab, ui scripts, buttons) name a tab; map it onto the sidebar.
     if (a.show_plan_tab) { set_section(a, a.plan_op == OP_METADATA ? SEC_SAVE : SEC_ORGANIZE); a.show_plan_tab = false; }
@@ -6003,6 +6557,38 @@ static void draw_ui(App& a) {
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Comma, false)) a.show_settings = !a.show_settings;
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F, false)) a.focus_search = true;
     if (io.KeyCtrl && (ImGui::IsKeyPressed(ImGuiKey_K, false) || ImGui::IsKeyPressed(ImGuiKey_P, false))) a.palette_open = true;  // feature search
+    if (ImGui::IsKeyPressed(ImGuiKey_F1, false)) a.show_help = !a.show_help;
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Slash, false)) { a.show_help = true; a.help_tab = 2; }  // shortcuts
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_J, false)) a.status_open_req = true;
+    if (io.KeyCtrl && !io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_B, false)) a.sidebar_on = !a.sidebar_on;
+    if (io.KeyCtrl && io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_T, false)) {  // Dark -> Tokyo Night -> Light -> System
+        static const int next[] = {THEME_TOKYO, THEME_LIGHT, THEME_SYSTEM, THEME_DARK};
+        apply_theme(a, next[std::clamp(a.cfg.theme, 0, 3)]);
+        a.toast = std::string(tr("Theme")) + ": " + tr(a.cfg.theme == THEME_DARK ? "Dark" : a.cfg.theme == THEME_TOKYO ? "Tokyo Night" : a.cfg.theme == THEME_LIGHT ? "Light" : "System");
+        a.toast_until = glfwGetTime() + 1.5;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_F5, false)) request_analyze(a);
+    if (ImGui::IsKeyPressed(ImGuiKey_F11, false)) {  // full screen on the monitor the window is on
+        static int wx, wy, ww, wh;
+        if (glfwGetWindowMonitor(a.win)) glfwSetWindowMonitor(a.win, nullptr, wx, wy, ww, wh, 0);
+        else {
+            glfwGetWindowPos(a.win, &wx, &wy);
+            glfwGetWindowSize(a.win, &ww, &wh);
+            GLFWmonitor* mon = glfwGetPrimaryMonitor();
+            int mc = 0;
+            GLFWmonitor** mons = glfwGetMonitors(&mc);
+            for (int i = 0; i < mc; i++) {  // the monitor holding the window's centre
+                int mx, my;
+                const GLFWvidmode* vm = glfwGetVideoMode(mons[i]);
+                glfwGetMonitorPos(mons[i], &mx, &my);
+                if (vm && wx + ww / 2 >= mx && wx + ww / 2 < mx + vm->width && wy + wh / 2 >= my && wy + wh / 2 < my + vm->height) mon = mons[i];
+            }
+            if (const GLFWvidmode* vm = glfwGetVideoMode(mon)) glfwSetWindowMonitor(a.win, mon, 0, 0, vm->width, vm->height, vm->refreshRate);
+        }
+    }
+#ifndef _WIN32
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Q, false)) glfwSetWindowShouldClose(a.win, GLFW_TRUE);
+#endif
     {  // Ctrl+ / Ctrl- / Ctrl+0: text size in the same steps as Settings (100, 110, 125, 150 %)
         static const float sizes[] = {16, 17.6f, 20, 24};
         int si = 0;
@@ -6044,7 +6630,10 @@ static void draw_ui(App& a) {
             ImGui::EndChild();
             ImGui::PopStyleVar();
             ImGui::PopStyleColor();
-            vsplit("##split_side", a.sidebar_w, 160, 420, false);
+            bool collapse = false;
+            vsplit("##split_side", a.sidebar_w, 160, 420, false, 220, &collapse);
+            if (collapse) a.sidebar_on = false;  // dragged away: Ctrl+B or the menu button brings it back
+            a.cfg.sidebar_w = a.sidebar_w;
         }
         bool insp = a.inspector_on && library_section(a.section);
         float avail = ImGui::GetContentRegionAvail().x;
@@ -6054,7 +6643,8 @@ static void draw_ui(App& a) {
         draw_content(a);
         ImGui::EndChild();
         if (insp) {
-            vsplit("##split_insp", a.inspector_w, 260, 2000, true);
+            vsplit("##split_insp", a.inspector_w, 260, 2000, true, 340);
+            a.cfg.inspector_w = a.inspector_w;
             ImGui::BeginChild("inspector", ImVec2(0, 0), ImGuiChildFlags_AlwaysUseWindowPadding);
             if (!a.selected) ImGui::TextDisabled("%s", tr("Select a photo to see its date, place, tags and file info."));
             else {
@@ -6548,6 +7138,8 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (cli) return run_cli(app, app.cfg.dry_run);
+    // GUI only: the log also goes to a file; waiting tasks from the last session come back paused
+    // (loaded after the catalog opens, below).
 
     // ---------------- GUI
 #ifndef _WIN32  // (the NVIDIA-on-GB10 startup crash this guards against is Linux-only)
@@ -6596,9 +7188,18 @@ int main(int argc, char** argv) {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
-    io.IniFilename = nullptr;
+    // Floating windows (Settings, Help, Model tests, Log) reopen where you left them.
+    static std::string layout_ini = util::config_dir() + "/window-layout.ini";
+    io.IniFilename = getenv("JEV_PHOTOS_NO_LAYOUT") || !ui_script.empty() || !shot.empty() ? nullptr : layout_ini.c_str();
     if (!app.cfg.first_run_done && !app.cfg.folders.empty()) app.cfg.first_run_done = true;
-    apply_motion(app.cfg);  // set up before the welcome screen existed
+    apply_motion(app.cfg);
+    if (!cli) app.log.file = util::data_dir() + "/jev-photos.log";
+    {  // keep the log file small: start a new one past 2 MB
+        struct stat st{};
+        if (stat(app.log.file.c_str(), &st) == 0 && st.st_size > 2 * 1024 * 1024) rename(app.log.file.c_str(), (app.log.file + ".1").c_str());
+    }
+    app.sidebar_w = std::clamp(app.cfg.sidebar_w, 160.0f, 420.0f);
+    app.inspector_w = std::clamp(app.cfg.inspector_w, 260.0f, 2000.0f);  // set up before the welcome screen existed
     apply_style(app.cfg);
     build_fonts();
     ImGui_ImplGlfw_InitForOpenGL(app.win, true);
@@ -6615,6 +7216,7 @@ int main(int argc, char** argv) {
     }
     app.log.add(0, exiv2_available() ? "exiv2 found" : "exiv2 NOT found: install it to read/write metadata");
     if (view_id) open_viewer(app, {view_id}, 0);
+    if (ui_script.empty() && shot.empty()) load_queue(app);  // waiting tasks from the last session, paused
     if (const GLubyte* r = glGetString(GL_RENDERER)) app.gl_renderer = reinterpret_cast<const char*>(r);
     if (getenv("JEV_PHOTOS_SOFTWARE") && app.cfg.renderer == 0)
         app.log.add(1, "the GPU driver crashed at startup, so this window uses software rendering (" + app.gl_renderer +
@@ -6727,7 +7329,7 @@ int main(int argc, char** argv) {
         // new pictures are analysed). Nothing in the files changes, and no list to apply is built.
         {
             static double last_busy = glfwGetTime();
-            if (app.pipe->running() || app.view.loading()) last_busy = glfwGetTime();
+            if (app.pipe->running() || app.view.loading() || !app.tasks.empty()) last_busy = glfwGetTime();
             else if (app.cfg.watch_folders && app.cfg.first_run_done && !app.cfg.folders.empty() && !ui_test && ui_script.empty() &&
                      shot.empty() && glfwGetTime() - last_busy > 600) {
                 last_busy = glfwGetTime();
@@ -6775,6 +7377,7 @@ int main(int argc, char** argv) {
                     app.undo_text += std::string("  ·  ") + tr("in jev-organized; your originals keep their names");
                 app.undo_until = glfwGetTime() + 30;
             }
+            task_finished(app);  // last: the next queued task may change the current list
         }
         if (!app.dlg_running) {
             std::lock_guard<std::mutex> l(app.dlg_mu);
@@ -6826,6 +7429,8 @@ int main(int argc, char** argv) {
                         else if (t == "find") app.focus_search = true;
                         else if (t == "rename") { if (app.selected) begin_rename(app, app.selected); }
                         else if (t == "palette") app.palette_open = true;
+                        else if (t == "status") app.status_open_req = true;
+                        else if (util::starts_with(t, "helptab:")) { app.show_help = true; app.help_tab = atoi(t.substr(8).c_str()); }
                         else if (util::starts_with(t, "lang:")) { set_lang(lang_from_code(t.substr(5).c_str())); app.cfg.lang = t.substr(5); app.want_font_rebuild = true; }
                         else if (t == "modeltests") app.show_model_tests = true;
                         else if (t == "shotarea") { app.shot_mode = 2; app.shot_a = app.shot_b = ImVec2(-1, -1); }
@@ -6910,6 +7515,7 @@ int main(int argc, char** argv) {
         }
     }
     if (frame_stats) fprintf(stderr, "frames during run: %d, longest frame gap: %.0f ms\n", busy_frames, worst_gap * 1000);
+    save_queue(app);
     save_config(app.cfg, app.config_file);
     app.pipe->stop();
     // A model call in flight can take its full timeout; do not hold the closed window hostage for it.

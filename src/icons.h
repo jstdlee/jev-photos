@@ -1,63 +1,77 @@
-// Tabler icons (MIT, tabler.io): codepoints used by the UI, as UTF-8 strings. Generated from tabler-icons.css.
+// Font Awesome 6 Free (Solid) glyphs used by jev-photos, as UTF-8 strings (generated from fontawesome-free 6.7.2 css).
+// Fonts: SIL OFL 1.1; icons: CC BY 4.0 (https://fontawesome.com/license/free).
 #pragma once
-#define ICON_PHOTO "\xEE\xAC\x8A"
-#define ICON_STAR "\xEE\xAC\xAE"
-#define ICON_CALENDAR "\xEE\xA9\x93"
-#define ICON_MAP_PIN "\xEE\xAB\xA8"
-#define ICON_SPARKLES "\xEF\x9B\x97"
-#define ICON_COPY "\xEE\xA9\xBA"
-#define ICON_CALENDAR_QUESTION "\xEF\xA0\xAD"
-#define ICON_TAGS "\xEE\xBE\x86"
-#define ICON_FOLDERS "\xEE\xAA\xAE"
-#define ICON_FILE_EXPORT "\xEE\xB7\xA9"
-#define ICON_FOLDER "\xEE\xAA\xAD"
-#define ICON_FOLDER_PLUS "\xEE\xAA\xAB"
-#define ICON_PLUS "\xEE\xAC\x8B"
-#define ICON_SEARCH "\xEE\xAC\x9C"
-#define ICON_X "\xEE\xAD\x95"
-#define ICON_LAYOUT_GRID "\xEE\xB6\xBA"
-#define ICON_LIST "\xEE\xAD\xAB"
-#define ICON_INFO_CIRCLE "\xEE\xAB\x85"
-#define ICON_SETTINGS "\xEE\xAC\xA0"
-#define ICON_HELP "\xEE\xAA\xBF"
-#define ICON_PLAYER_PLAY "\xEE\xB5\x86"
-#define ICON_PLAYER_PAUSE "\xEE\xB5\x85"
-#define ICON_PLAYER_STOP "\xEE\xB5\x8A"
-#define ICON_ARROW_BACK_UP "\xEE\xAD\xB7"
-#define ICON_TRASH "\xEE\xAD\x81"
-#define ICON_ADJUSTMENTS_HORIZONTAL "\xEE\xB0\xB8"
-#define ICON_MENU_2 "\xEE\xB1\x82"
-#define ICON_CHEVRON_DOWN "\xEE\xA9\x9F"
-#define ICON_CHEVRON_RIGHT "\xEE\xA9\xA1"
-#define ICON_CHECK "\xEE\xA9\x9E"
-#define ICON_ALERT_TRIANGLE "\xEE\xA8\x86"
-#define ICON_EYE "\xEE\xAA\x9A"
-#define ICON_HISTORY "\xEE\xAF\xAA"
-#define ICON_ROBOT "\xEF\x80\x8B"
-#define ICON_ACTIVITY "\xEE\xB4\xA3"
-#define ICON_BRAIN "\xEF\x96\x9F"
-#define ICON_TAG "\xEE\xAA\xBC"  // ti-hash (ti-tag is outside the BMP)
-#define ICON_EDIT "\xEE\xAA\x98"
-#define ICON_REFRESH "\xEE\xAC\x93"
-#define ICON_DEVICE_FLOPPY "\xEE\xAD\xA2"
-#define ICON_FILTER "\xEE\xAA\xA5"
-#define ICON_WORLD "\xEE\xAD\x94"
-#define ICON_CLOCK "\xEE\xA9\xB0"
-#define ICON_CIRCLE_CHECK "\xEE\xA9\xA7"
-#define ICON_CIRCLE_X "\xEE\xA9\xAA"
-#define ICON_MINUS "\xEE\xAB\xB2"
-#define ICON_SQUARE_ROUNDED "\xEF\x96\x9A"
-#define ICON_WINDOW_MAXIMIZE "\xEF\x87\xB1"
-#define ICON_WINDOW_MINIMIZE "\xEF\x87\xB2"
-#define ICON_PHOTO_SEARCH "\xEF\x8D\xA4"
-#define ICON_WAND "\xEE\xAF\x8B"
-#define ICON_HEART "\xEE\xAA\xBE"
-#define ICON_FILE_DESCRIPTION "\xEF\x80\xA8"
-#define ICON_SQUARE "\xEE\xAC\xAC"
-#define ICON_CAMERA "\xEE\xA9\x94"
-#define ICON_SCREENSHOT "\xEF\x88\x81"
-#define ICON_CROP "\xEE\xAA\x85"
-#define ICON_COMMAND "\xEE\xA9\xB8"
-#define ICON_FLASK "\xEE\xAF\x92"
-#define ICON_CAPTURE "\xEE\xB0\xBC"
-#define ICON_PREVIEW_PANE "\xEE\xAB\x99"  // ti-layout-sidebar-right
+
+#define ICON_PHOTO                    "\xEF\x80\xBE"  // fa-image
+#define ICON_STAR                     "\xEF\x80\x85"  // fa-star
+#define ICON_CALENDAR                 "\xEF\x81\xB3"  // fa-calendar-days
+#define ICON_MAP_PIN                  "\xEF\x8F\x85"  // fa-location-dot
+#define ICON_SPARKLES                 "\xEF\x95\x84"  // fa-robot
+#define ICON_COPY                     "\xEF\x83\x85"  // fa-copy
+#define ICON_CALENDAR_QUESTION        "\xEF\x9E\x83"  // fa-calendar-day
+#define ICON_TAGS                     "\xEF\x80\xAC"  // fa-tags
+#define ICON_FOLDERS                  "\xEF\xA0\x82"  // fa-folder-tree
+#define ICON_FOLDER                   "\xEF\x81\xBB"  // fa-folder
+#define ICON_FOLDER_PLUS              "\xEF\x99\x9E"  // fa-folder-plus
+#define ICON_PLUS                     "\xEF\x81\x95"  // fa-circle-plus
+#define ICON_SEARCH                   "\xEF\x80\x82"  // fa-magnifying-glass
+#define ICON_X                        "\xEF\x80\x8D"  // fa-xmark
+#define ICON_LAYOUT_GRID              "\xEF\x80\x8A"  // fa-table-cells
+#define ICON_LIST                     "\xEF\x80\xBA"  // fa-list
+#define ICON_INFO_CIRCLE              "\xEF\x81\x9A"  // fa-circle-info
+#define ICON_SETTINGS                 "\xEF\x80\x93"  // fa-gear
+#define ICON_HELP                     "\xEF\x81\x99"  // fa-circle-question
+#define ICON_PLAYER_STOP              "\xEF\x81\x8D"  // fa-stop
+#define ICON_ARROW_BACK_UP            "\xEF\x8B\xAA"  // fa-rotate-left
+#define ICON_TRASH                    "\xEF\x8B\xAD"  // fa-trash-can
+#define ICON_ADJUSTMENTS_HORIZONTAL   "\xEF\x87\x9E"  // fa-sliders
+#define ICON_MENU_2                   "\xEF\x83\x89"  // fa-bars
+#define ICON_CHEVRON_DOWN             "\xEF\x81\xB8"  // fa-chevron-down
+#define ICON_CHEVRON_RIGHT            "\xEF\x81\x94"  // fa-chevron-right
+#define ICON_CHECK                    "\xEF\x80\x8C"  // fa-check
+#define ICON_ALERT_TRIANGLE           "\xEF\x81\xB1"  // fa-triangle-exclamation
+#define ICON_HISTORY                  "\xEF\x87\x9A"  // fa-clock-rotate-left
+#define ICON_ROBOT                    "\xEF\x95\x84"  // fa-robot
+#define ICON_ACTIVITY                 "\xEF\x82\xAE"  // fa-list-check
+#define ICON_BRAIN                    "\xEF\x97\x9C"  // fa-brain
+#define ICON_TAG                      "\xEF\x80\xAB"  // fa-tag
+#define ICON_EDIT                     "\xEF\x8C\x84"  // fa-pen
+#define ICON_REFRESH                  "\xEF\x8B\xB1"  // fa-rotate
+#define ICON_DEVICE_FLOPPY            "\xEF\x83\x87"  // fa-floppy-disk
+#define ICON_FILTER                   "\xEF\x82\xB0"  // fa-filter
+#define ICON_WORLD                    "\xEF\x82\xAC"  // fa-globe
+#define ICON_CLOCK                    "\xEF\x80\x97"  // fa-clock
+#define ICON_CIRCLE_CHECK             "\xEF\x81\x98"  // fa-circle-check
+#define ICON_CIRCLE_X                 "\xEF\x81\x97"  // fa-circle-xmark
+#define ICON_MINUS                    "\xEF\x81\xA8"  // fa-minus
+#define ICON_SQUARE_ROUNDED           "\xEF\x83\x88"  // fa-square
+#define ICON_WINDOW_MAXIMIZE          "\xEF\x8B\x90"  // fa-window-maximize
+#define ICON_WINDOW_MINIMIZE          "\xEF\x8B\x92"  // fa-window-restore
+#define ICON_SQUARE                   "\xEF\x8B\x90"  // fa-window-maximize
+#define ICON_PHOTO_SEARCH             "\xEF\x80\x8E"  // fa-magnifying-glass-plus
+#define ICON_WAND                     "\xEE\x8B\x8A"  // fa-wand-magic-sparkles
+#define ICON_HEART                    "\xEF\x80\x84"  // fa-heart
+#define ICON_FILE_DESCRIPTION         "\xEF\x85\x9C"  // fa-file-lines
+#define ICON_FILE_EXPORT              "\xEF\x95\xAE"  // fa-file-export
+#define ICON_EYE                      "\xEF\x81\xAE"  // fa-eye
+#define ICON_CAMERA                   "\xEF\x80\xB0"  // fa-camera
+#define ICON_SCREENSHOT               "\xEE\x85\xA3"  // fa-display
+#define ICON_CROP                     "\xEF\x95\xA5"  // fa-crop-simple
+#define ICON_COMMAND                  "\xEF\x80\x82"  // fa-magnifying-glass
+#define ICON_FLASK                    "\xEF\x83\x83"  // fa-flask
+#define ICON_CAPTURE                  "\xEF\x80\xB0"  // fa-camera
+#define ICON_PREVIEW_PANE             "\xEF\x83\x9B"  // fa-table-columns
+#define ICON_LIST_CHECK               "\xEF\x82\xAE"  // fa-list-check
+#define ICON_TERMINAL                 "\xEF\x84\xA0"  // fa-terminal
+#define ICON_PAUSE                    "\xEF\x81\x8C"  // fa-pause
+#define ICON_PLAY                     "\xEF\x81\x8B"  // fa-play
+#define ICON_RETRY                    "\xEF\x8B\xB9"  // fa-rotate-right
+#define ICON_KEYBOARD                 "\xEF\x84\x9C"  // fa-keyboard
+#define ICON_BOOK                     "\xEF\x80\xAD"  // fa-book
+#define ICON_LIGHTBULB                "\xEF\x83\xAB"  // fa-lightbulb
+#define ICON_ARROW_UP                 "\xEF\x81\xA2"  // fa-arrow-up
+#define ICON_ARROW_DOWN               "\xEF\x81\xA3"  // fa-arrow-down
+#define ICON_THEME                    "\xEF\x81\x82"  // fa-circle-half-stroke
+#define ICON_LANGUAGE                 "\xEF\x86\xAB"  // fa-language
+#define ICON_FULLSCREEN               "\xEF\x81\xA5"  // fa-expand
+#define ICON_FEATURE                  "\xEE\x8B\x8A"  // fa-wand-magic-sparkles

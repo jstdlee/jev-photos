@@ -89,7 +89,8 @@ ProcResult run(const std::vector<std::string>& argv, const std::string& stdin_da
 bool which(const std::string& exe);  // on PATH (Windows: also next to the app, .exe added)
 
 // ---- desktop
-bool system_reduce_motion();                                   // the desktop asks for less animation
+bool system_reduce_motion();
+bool system_dark_mode();                                        // the desktop uses a dark appearance                                   // the desktop asks for less animation
 bool have_trash();                                              // a restorable Trash / Recycle Bin is available
 bool trash(const std::string& path);                            // move one file there
 void open_path(const std::string& path_or_url);                 // default app / file manager / browser (detached)

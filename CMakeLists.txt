@@ -93,8 +93,8 @@ else()
 endif()
 target_include_directories(jev-photos PRIVATE ${CMAKE_BINARY_DIR}/generated)
 # The icon font is linked in with .incbin (no generated source, no compile cost).
-target_compile_definitions(jev-photos PRIVATE ICON_TTF="${TP}/tabler/tabler-icons.ttf")
-set_property(SOURCE src/main.cpp APPEND PROPERTY OBJECT_DEPENDS ${TP}/tabler/tabler-icons.ttf)
+target_compile_definitions(jev-photos PRIVATE ICON_TTF="${TP}/fontawesome/fa-solid-900.ttf")
+set_property(SOURCE src/main.cpp APPEND PROPERTY OBJECT_DEPENDS ${TP}/fontawesome/fa-solid-900.ttf)
 target_link_libraries(jev-photos PRIVATE jevcore imgui glfw ${JEV_STATIC_RUNTIME})
 
 if(WIN32)

@@ -30,6 +30,7 @@ public:
     std::vector<LogLine> tail(size_t n);
     size_t size();
     bool echo = false;  // CLI mode prints to stderr
+    std::string file;   // also appended here (one line each, with the date), when set
 
 private:
     std::mutex mu_;

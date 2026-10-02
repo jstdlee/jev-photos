@@ -19,7 +19,7 @@ SQLITE_ZIP=2025/sqlite-amalgamation-3500400.zip      # 3.50.4
 JSON_VER=v3.12.0
 XXHASH_VER=v0.8.3
 ORT_VER=1.22.0
-TABLER_VER=3.24.0                                    # icon font (MIT)
+FA_VER=6.7.2                                         # Font Awesome Free icon font (OFL 1.1 / CC BY 4.0)
 
 fetch() {  # dir url rev
     if [ -d "$tp/$1/.git" ]; then return; fi
@@ -68,8 +68,8 @@ if [ "$(uname -s)" = Linux ] && [ ! -f "$tp/onnxruntime/lib/libonnxruntime.so" ]
     rm -rf "$tmp"
 fi
 
-mkdir -p "$tp/tabler"
-for f in fonts/tabler-icons.ttf tabler-icons.css; do
-    [ -f "$tp/tabler/$(basename $f)" ] || curl -fsSL -o "$tp/tabler/$(basename $f)" "https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@$TABLER_VER/dist/$f"
+mkdir -p "$tp/fontawesome"
+for f in webfonts/fa-solid-900.ttf css/all.css LICENSE.txt; do
+    [ -f "$tp/fontawesome/$(basename $f)" ] || curl -fsSL -o "$tp/fontawesome/$(basename $f)" "https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@$FA_VER/$f"
 done
 echo "third_party ready"

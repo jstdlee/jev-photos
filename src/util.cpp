@@ -651,6 +651,13 @@ bool system_reduce_motion() {  // GNOME's switch (other desktops: not set, full 
     return r.rc == 0 && trim(r.out) == "false";
 }
 
+bool system_dark_mode() {  // GNOME 42+ color-scheme, else the GTK theme name
+    ProcResult r = run({"gsettings", "get", "org.gnome.desktop.interface", "color-scheme"}, "", 3);
+    if (r.rc == 0 && r.out.find("dark") != std::string::npos) return true;
+    r = run({"gsettings", "get", "org.gnome.desktop.interface", "gtk-theme"}, "", 3);
+    return r.rc == 0 && lower(r.out).find("dark") != std::string::npos;
+}
+
 bool have_trash() { return which("gio"); }
 bool trash(const std::string& path) { return run({"gio", "trash", "--", path}, "", 30).rc == 0; }
 void open_path(const std::string& p) {

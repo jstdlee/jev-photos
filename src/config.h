@@ -14,19 +14,20 @@ enum NameStyle { NAME_DATE_SN, NAME_KEEP_PREFIX, NAME_COUNT };  // 20190512_0000
 enum DescPolicy { DESC_FILL_ONLY, DESC_AGREE, DESC_LLM, DESC_ASK, DESC_COUNT };
 enum AskJudge { JUDGE_LLM, JUDGE_JEV, JUDGE_NONE, JUDGE_LLM_JEV, JUDGE_COUNT };
 
-enum Theme { THEME_DARK, THEME_TOKYO, THEME_LIGHT, THEME_COUNT };
+enum Theme { THEME_DARK, THEME_TOKYO, THEME_LIGHT, THEME_SYSTEM, THEME_COUNT };  // System: Dark or Light, as the desktop is
 
 struct Config {
     std::string lang;  // "en" / "zh_CN"; empty follows $LANG
     float font_size = 16.0f;
     float accent[3] = {0.30f, 0.78f, 0.47f};
-    int theme = THEME_DARK;            // Dark, Tokyo Night, Light
+    int theme = THEME_DARK;            // Dark, Tokyo Night, Light, System
     bool system_titlebar = false;      // use the desktop's title bar instead of our own top bar
     bool first_run_done = false;       // the welcome screen was completed (or folders existed already)
     int goal = 0;                      // welcome choice: 0 browse only, 1 organized copies, 2 rename originals
     bool watch_folders = true;
     bool auto_meta = false;
-    int motion = 0;                    // 0 follow the system, 1 full, 2 reduced (fades only, no movement)            // after each Analyze, write missing dates, keywords, descriptions, places into the files         // look for new photos in the folders now and then, and analyse them quietly
+    int motion = 0;
+    float sidebar_w = 220, inspector_w = 340;  // pane widths (px), kept between sessions                    // 0 follow the system, 1 full, 2 reduced (fades only, no movement)            // after each Analyze, write missing dates, keywords, descriptions, places into the files         // look for new photos in the folders now and then, and analyse them quietly
     int renderer = 0;  // 0 auto (GPU, software fallback if the driver crashes at start), 1 GPU only, 2 software
 
     // The photo folders (scanned together) and the one being looked at. folder is the view: one of folders, or

@@ -50,6 +50,12 @@ void Log::add(int level, const std::string& text) {
     std::lock_guard<std::mutex> l(mu_);
     LogLine ln{level, util::now_iso().substr(11), text};
     if (echo) fprintf(stderr, "%s %s%s\n", ln.time.c_str(), level == 2 ? "ERROR " : level == 1 ? "warn " : "", text.c_str());
+    if (!file.empty())
+        if (FILE* f = fopen(file.c_str(), "ab")) {
+            std::string line = util::now_iso() + (level == 2 ? " ERROR " : level == 1 ? " warn  " : " info  ") + text + "\n";
+            fwrite(line.data(), 1, line.size(), f);
+            fclose(f);
+        }
     lines_.push_back(std::move(ln));
     while (lines_.size() > 5000) lines_.pop_front();
 }

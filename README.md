@@ -275,9 +275,24 @@ or a question with options to jev, and see the raw answer and the time it took.
 it is never recognised, suggested, used as a keyword or written into files again, even after a tag-list upgrade.
 The tag list shows the blocked tags and unblocks them; the list is `blocked-tags.txt` next to `tags.txt`. *Remove
 from this photo* takes a tag off one photo only.
-The **top bar** holds the search, *Analyze* and the activity button (progress and *Stop* while something runs; it
-turns amber when image recognition, the LLM or jev is down, and its popover lists each helper's state and the last
-log lines). Help, settings and the window buttons sit in the top-right corner.
+The **top bar** is the title bar: the photo search, **Analyze** (the one highlighted feature, F5) and, at the top
+right in every view, the **utility cluster** — screenshot · **search** (Ctrl+P) · **tasks and logs** (Ctrl+J) ·
+**help** (F1) · **settings** (Ctrl+,) — then the window buttons. Icons are Font Awesome 6 Free throughout.
+
+**Tasks:** long work (Analyze, single steps, applying a list, Undo, re-tagging, the smart update, the tag check) goes
+into a queue and runs one at a time; asking for more while something runs queues it instead of refusing. The tasks
+button shows the queue's real overall progress as a ring, a badge with how many tasks wait, amber when paused and a
+red dot after errors. Its popover (Ctrl+J):
+
+- **Tasks** — the running task with its stage, a progress bar, `done / total`, % and time left; queued and paused
+  tasks; and the finished ones (done, stopped, with errors). Per task: **Pause** (analysis tasks: they skip what is
+  done, so Resume continues where they stopped; applying and undoing cannot be paused, so the button is not there),
+  **Stop** (after the current photo; what is done is kept), **Resume**, **Cancel** (take it out of the queue), move up /
+  down, **Run it again**, remove. For all: Pause all, Resume all, Cancel all, Clear done. Waiting and paused tasks are
+  kept when you quit and come back paused.
+- **Logs** — newest first, with Info / Warning / Error filters, a filter field, Copy, and the folder of the log file
+  (`jev-photos.log` in the data folder, a new one past 2 MB).
+- The helpers' state (image recognition, the LLM, jev), *Model tests…* and *Open Activity*.
 
 **Photos are drawn smoothly:** thumbnails and the viewer use mipmapped textures with trilinear (and, where the driver
 offers it, anisotropic) filtering. The full-screen viewer follows the theme, shows the thumbnail at once and the full
@@ -303,8 +318,13 @@ a minute (the Ctrl+P palette, rename, delete confirmation, list navigation, pane
 `LANG`). Every interface string is translated; Chinese, Japanese and Korean fonts are all merged, the interface
 language's first.
 
-**Themes:** Dark, Tokyo Night and Light (Settings → Preferences → Appearance, or Ctrl+,). Each theme brings its own accent colour,
-which you can change.
+**Themes:** System (Dark or Light, as the desktop is: GNOME's colour scheme, Windows' app mode), Dark, Tokyo Night and
+Light (Settings → Appearance, or Ctrl+Shift+T to cycle). Each theme brings its own accent colour, which you can change.
+
+**Help** (F1, or the ? at the top right) is searchable (in your language or English) and has five tabs: **Concepts**
+(the five ideas in the order you meet them, each with where you see it and *Show me*), **Glossary** (every term, A–Z,
+with *Show me*), **Shortcuts** (from the one key list the app uses; *Copy*; Ctrl+/ opens it directly), **Search
+syntax** and **About**.
 
 **Undo:** every change *Organize path*, *Auto set meta* or a rename makes is recorded, and files written in place are backed up
 first (`~/.local/share/jev-photos/undo/`). Right after applying, a banner offers **Undo** (Ctrl+Z); *Activity* lists the
@@ -318,10 +338,16 @@ while nothing else runs, new or changed photos are picked up and analysed quietl
 
 | Key | |
 |---|---|
-| Ctrl+F | search |
-| Ctrl+I | show / hide the inspector |
+| Ctrl+P (or Ctrl+K) | search: go to a page, setting or action |
+| F5 | Analyze |
+| Ctrl+J | tasks and logs |
+| F1 / Ctrl+/ | help / its shortcuts |
 | Ctrl+, | settings |
-| Ctrl+P (or Ctrl+K) | feature search: go to a page, setting or action |
+| Ctrl+Shift+T | switch theme |
+| Ctrl+B / Ctrl+I | show / hide the sidebar / the preview pane |
+| F11 | full screen |
+| Ctrl+Q (Linux) / Alt+F4 (Windows) | quit |
+| Ctrl+F | search box |
 | Ctrl+Z | undo what was just applied |
 | F2 | rename the selected photo |
 | d / Delete | move the selected photos to the Trash (asks; Enter confirms; restorable) |
@@ -330,10 +356,12 @@ while nothing else runs, new or changed photos are picked up and analysed quietl
 | Ctrl+wheel | thumbnail size |
 | Ctrl+ / Ctrl- / Ctrl+0 | text size |
 
-The window has no system title bar (Settings → *Title bar* can bring it back): drag the top bar to move it, double-click to maximise, and use the grip in the
-bottom-right corner to resize. Panes are separated by splitters you can drag. **?** (top right) opens help: what is
-what (file name, tags, CLIP, keywords, description, EXIF/XMP, AI prompt, corrections, jev, LLM), keys, the search
-syntax, credits and the project page.
+The window has no system title bar (Settings → *Title bar* can bring it back): drag the top bar to move it,
+double-click to maximise, and drag any edge or corner to resize. Panes are separated by **splitters**: they follow the
+pointer, turn the accent colour while dragged, reset on double-click, and remember their size; dragging the sidebar
+past its minimum folds it away (Ctrl+B brings it back). Settings, Help, Model tests and the Log reopen where you left
+them (`window-layout.ini` in the settings folder). Tooltips appear after 2 s, then at once while you move along a
+toolbar, and show the keys.
 
 The main action of each screen is in the accent colour. Actions that change or remove original files (move, rename
 in place, write into originals, move to Trash, replace a description, delete a tag) are red. Every button and option
@@ -510,7 +538,7 @@ Linux:
 ./build.sh
 ```
 
-This fetches pinned ImGui, GLFW, stb, SQLite 3.50.4, nlohmann/json, xxHash 0.8.3, ONNX Runtime 1.22 and the Tabler
+This fetches pinned ImGui, GLFW, stb, SQLite 3.50.4, nlohmann/json, xxHash 0.8.3, ONNX Runtime 1.22 and the Font Awesome 6 Free
 icon font into `third_party/`, and X11/GL headers if missing (no root needed). Runtime needs `exiv2`
 (`sudo apt install exiv2`); `ffmpeg` is optional for exotic formats.
 

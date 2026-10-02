@@ -173,6 +173,13 @@ bool system_reduce_motion() {
     return !on;
 }
 
+bool system_dark_mode() {  // "Choose your app mode"
+    DWORD light = 1, size = sizeof light;
+    RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr,
+                 &light, &size);
+    return light == 0;
+}
+
 bool have_trash() { return true; }  // the Recycle Bin
 
 bool trash(const std::string& path) {
