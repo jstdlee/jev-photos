@@ -11,6 +11,7 @@
 #include <cstdint>
 
 #include <functional>
+#include <set>
 
 #include <map>
 #include <memory>
@@ -87,7 +88,12 @@ struct TagDef {
 };
 // The editable vocabulary: ~/.config/jev-photos/tags.txt ("# category" headers, one tag per line); created from
 // the built-in list on first use.
-std::vector<TagDef> load_tag_vocabulary();
+std::vector<TagDef> load_tag_vocabulary();  // without blocked tags
+// Tags you deleted never come back: not from recognition, suggestions, keywords or a vocabulary upgrade.
+// Kept in <config>/blocked-tags.txt, one per line (lower case).
+std::set<std::string> blocked_tags();
+bool tag_blocked(const std::string& tag);
+void set_tag_blocked(const std::string& tag, bool blocked);
 std::string tag_vocabulary_path();
 bool save_tag_vocabulary(const std::vector<TagDef>& tags);  // writes tags.txt (grouped by category, in order)
 

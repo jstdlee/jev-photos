@@ -498,6 +498,8 @@ std::string ext_lower(const std::string& p) {
     return lower(e.empty() ? e : e.substr(1));
 }
 
+std::string extension(const std::string& p) { return upath(p).extension().u8string(); }
+
 bool mkdirs(const std::string& p) {
     std::error_code ec;
     fs::create_directories(upath(p), ec);

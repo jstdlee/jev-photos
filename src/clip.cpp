@@ -710,6 +710,50 @@ static std::vector<TagDef> parse_vocabulary(const std::string& s) {
     return out;
 }
 
+static std::mutex g_blocked_mu;
+static std::set<std::string> g_blocked;
+static bool g_blocked_loaded = false;
+static std::string blocked_path() { return util::config_dir() + "/blocked-tags.txt"; }
+
+std::set<std::string> blocked_tags() {
+    std::lock_guard<std::mutex> l(g_blocked_mu);
+    if (!g_blocked_loaded) {
+        g_blocked_loaded = true;
+        std::string s;
+        if (util::read_file(blocked_path(), s))
+            for (auto& line : util::split(s, '\n')) {
+                std::string t = util::lower(util::trim(line));
+                if (!t.empty() && t[0] != '#') g_blocked.insert(t);
+            }
+    }
+    return g_blocked;
+}
+
+bool tag_blocked(const std::string& tag) {
+    std::string t = util::lower(util::trim(tag));
+    if (t.empty()) return false;
+    blocked_tags();  // loaded
+    std::lock_guard<std::mutex> l(g_blocked_mu);
+    return g_blocked.count(t) > 0;
+}
+
+void set_tag_blocked(const std::string& tag, bool blocked) {
+    std::string t = util::lower(util::trim(tag));
+    if (t.empty()) return;
+    blocked_tags();
+    std::lock_guard<std::mutex> l(g_blocked_mu);
+    if (blocked) g_blocked.insert(t);
+    else g_blocked.erase(t);
+    std::string out = "# jev-photos: tags you deleted; they are never suggested or written again. One per line.\n";
+    for (auto& b : g_blocked) out += b + "\n";
+    util::write_file(blocked_path(), out);
+}
+
+static std::vector<TagDef> without_blocked(std::vector<TagDef> v) {
+    v.erase(std::remove_if(v.begin(), v.end(), [](const TagDef& t) { return tag_blocked(t.tag); }), v.end());
+    return v;
+}
+
 std::vector<TagDef> load_tag_vocabulary() {
     std::string s;
     std::string path = tag_vocabulary_path();
@@ -739,7 +783,7 @@ std::vector<TagDef> load_tag_vocabulary() {
         util::write_file(path, header + out);
         s = out;
     }
-    return parse_vocabulary(s);
+    return without_blocked(parse_vocabulary(s));
 }
 
 bool save_tag_vocabulary(const std::vector<TagDef>& tags) {

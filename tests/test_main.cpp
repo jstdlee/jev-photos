@@ -9,6 +9,7 @@
 #include <ctime>
 #include <string>
 
+#include "clip.h"
 #include "dates.h"
 #include "genmeta.h"
 #include "db.h"
@@ -384,6 +385,35 @@ static void test_meta_unicode_name() {
     MetaMap m = read_meta(img);
     CHECK(!m.get("Exif.Photo.DateTimeOriginal").empty() || !m.get("Xmp.photoshop.DateCreated").empty());
     rm_rf(util::dirname(dir));
+}
+
+static void test_blocked_tags() {
+    std::string dir = util::temp_path("blk");
+    util::mkdirs(dir);
+#ifdef _WIN32
+    const char* var = "APPDATA";
+#else
+    const char* var = "XDG_CONFIG_HOME";
+#endif
+    std::string saved = getenv(var) ? getenv(var) : "";
+    set_env(var, dir);
+    Photo p;
+    p.clip_tags = "[[\"forest\", 0.8], [\"Tree\", 0.7]]";
+    CHECK(effective_tags(p).size() == 2);
+    set_tag_blocked("Forest", true);  // case does not matter
+    CHECK(tag_blocked("forest") && tag_blocked(" FOREST "));
+    auto e = effective_tags(p);
+    CHECK(e.size() == 1 && e[0] == "Tree");
+    p.user_tags = "[\"forest\", \"cabin\"]";  // also your own list: deleted means gone everywhere
+    e = effective_tags(p);
+    CHECK(e.size() == 1 && e[0] == "cabin");
+    for (auto& t : load_tag_vocabulary()) CHECK(util::lower(t.tag) != "forest");
+    std::string file;
+    CHECK(util::read_file(dir + "/jev-photos/blocked-tags.txt", file) && file.find("forest") != std::string::npos);
+    set_tag_blocked("forest", false);
+    CHECK(!tag_blocked("forest") && effective_tags(p).size() == 2);
+    set_env(var, saved);
+    rm_rf(dir);
 }
 
 static void test_sha() {
@@ -836,6 +866,7 @@ static void test_journal() {
 int main() {
     test_journal();
     test_meta_unicode_name();
+    test_blocked_tags();
     test_civil();
     test_name_patterns();
     test_decisions();

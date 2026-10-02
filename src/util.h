@@ -75,6 +75,7 @@ std::string basename(const std::string& p);
 std::string dirname(const std::string& p);
 std::string stem(const std::string& p);
 std::string ext_lower(const std::string& p);  // "jpg" (no dot)
+std::string extension(const std::string& p);  // ".JPG" as written ("" if none)
 bool mkdirs(const std::string& p);
 bool copy_file_preserve(const std::string& from, const std::string& to, std::string& err);  // never overwrites
 std::string temp_path(const std::string& tag);  // unique path under $TMPDIR

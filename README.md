@@ -1,4 +1,4 @@
-# <img src="assets/jev-photos.svg" width="40" align="top"> jev photos
+# <img src="assets/jev-photos-256.png" width="48" align="top"> jev photos
 
 Organize a messy photo collection by **recovered capture date**, one folder per month, with names like
 `20190512_00001.jpg`. Date and location decisions use explainable evidence scoring plus the **jev decision API**.
@@ -100,7 +100,7 @@ Trash, the copy that stays, size) with totals and a time estimate before anythin
 | byte-for-byte comparison with the kept copy | only real duplicate candidates (*Byte-verify*, default on) | proof before anything is marked |
 
 On this machine XXH3-128 hashed a 550 MB file at 16.7 GB/s versus 185 MB/s for SHA-256, and most files never
-need a full read at all. The **kept copy** is the one you pinned (radio button in *Duplicates*), else one already in the
+need a full read at all. The **kept copy** is the one you pinned (radio button in *Deduplicate*), else one already in the
 organized folder, else the richest metadata, else a name/folder that doesn't look like a copy (`(1)`, ` copy`, `副本`,
 `backup/`, `备份/`), else the oldest file.
 
@@ -109,7 +109,7 @@ EXIF orientation so rotated copies match. Photos within the *max distance* (defa
 ratios are grouped, and the largest is the representative. This catches resized exports, re-compressed chat copies
 and burst shots. They are **only reported**, never skipped, and hashes are cached, so re-checks are instant.
 
-*Duplicates* lists groups by reclaimable space, with size, pixels, date, hash and a preview, and *Copy report*
+*Deduplicate* lists groups by reclaimable space, with size, pixels, date, hash and a preview, and *Copy report*
 copies it as CSV. The list view shows each file's size.
 `--dupes` prints the groups, and `--stats` includes sizes.
 
@@ -222,7 +222,7 @@ it went to the user.
 ### Corrections (review before anything changes)
 
 Every Analyze ends with a **check** of what jev-photos generated itself. It produces specific proposals with a
-confidence of how sure it is that each change is right and worth making. They are listed in **Tag suggestions**; proposals at 70 % or more are ticked, and you apply or reject them. Rejected proposals are not made
+confidence of how sure it is that each change is right and worth making. They are listed in **Set tags → Suggestions**; proposals at 70 % or more are ticked, and you apply or reject them. Rejected proposals are not made
 again. The file's own metadata (prompt, camera, lens, original dates, descriptions others wrote) is only used as
 evidence and is never a target. Only generated data is: CLIP tags, and the names jev-photos gave.
 
@@ -253,10 +253,21 @@ One window: a **sidebar** on the left, the photos (or the list you are working o
 | Sidebar | |
 |---|---|
 | **Library** | *All photos*, *Favorites*, *AI images* (pictures with generation data), *Years* (click a year for its months), *Places*, and each of your *Folders* (right-click to open or remove; *Add folder…*) |
-| **To review** | what needs you, with a count: *Duplicates* (best done first) · *Unsure dates* (*Accept all likely dates*, or confirm / pick another date in the inspector) · *Tag suggestions* · *Organize* (copy, move or rename into month folders) · *Save info to files* (missing dates, keywords, descriptions and places, written where the files are) |
-| **Tools** | *Tags* (each photo's tags, *Fill in missing tags*, the tag list editor) · *Image recognition* (CLIP: missing / quick / again / re-tag, and *Smart update*) · *Activity* (what ran, **Undo**, jev's decisions, the log) |
+| **Tools** | in the order of the work, with what needs you counted: *Deduplicate* (best done first) · *Fix dates* (how many have a best guess and how many have no date; *Accept all best guesses*, *Only the strong ones*, or confirm / pick another date in the inspector) · *Set tags* (*Photos and tags*: each photo's tags, *Fill in missing tags*, the tag list; *Suggestions*: fixes of generated tags) · *Organize path* (copy, move or rename into month folders) · *Auto set meta* (everything at once: missing dates, keywords, descriptions and places written where the files are; optionally after every Analyze) · *Image recognition* (CLIP: missing / quick / again / re-tag, *Smart update*) · *Activity* (what ran, **Undo**, jev's decisions, the log) |
 
-The library is a grid of thumbnails with a heading per month (or a sortable list: the button next to the search).
+The library is a grid of thumbnails with a heading per month (or a sortable list: the button next to the search);
+**Ctrl+wheel** makes the thumbnails bigger or smaller. In the viewer the **wheel zooms** at the pointer (up to 8×),
+dragging moves the picture, and double-click or **0** fits it again.
+
+**Rename** (F2, the right-click menu in the grid and the list, the inspector and the viewer) renames the file on disk,
+keeps its extension and sidecar, refuses a name already taken, and can be undone from *Activity*. **Delete** moves the
+selected photos (or the one in the viewer) straight to the Trash / Recycle Bin, no dialog: they can be restored from
+there. *Move to Trash…* still lists them first.
+
+**Blocked tags:** deleting a tag (in the tag list, or *Block everywhere* from the × next to a photo's tag) blocks it:
+it is never recognised, suggested, used as a keyword or written into files again, even after a tag-list upgrade.
+The tag list shows the blocked tags and unblocks them; the list is `blocked-tags.txt` next to `tags.txt`. *Remove
+from this photo* takes a tag off one photo only.
 The **top bar** holds the search, *Analyze* and the activity button (progress and *Stop* while something runs; it
 turns amber when image recognition, the LLM or jev is down, and its popover lists each helper's state and the last
 log lines). Help, settings and the window buttons sit in the top-right corner.
@@ -278,7 +289,7 @@ assistant (LLM + jev). The sliders button holds the fields to search, a date ran
 **Themes:** Dark, Tokyo Night and Light (Settings → Preferences → Appearance, or Ctrl+,). Each theme brings its own accent colour,
 which you can change.
 
-**Undo:** every change Organize or *Save info to files* makes is recorded, and files written in place are backed up
+**Undo:** every change *Organize path*, *Auto set meta* or a rename makes is recorded, and files written in place are backed up
 first (`~/.local/share/jev-photos/undo/`). Right after applying, a banner offers **Undo** (Ctrl+Z); *Activity* lists the
 last 10 runs, each with Undo. Undo renames and moves files back, sends copies it made to the Trash, and restores the
 earlier version of files whose info was written. Anything that cannot be put back (something else took the name) is
@@ -294,6 +305,10 @@ while nothing else runs, new or changed photos are picked up and analysed quietl
 | Ctrl+I | show / hide the inspector |
 | Ctrl+, | settings |
 | Ctrl+Z | undo what was just applied |
+| F2 | rename the selected photo |
+| Delete | move the selected photos to the Trash (restorable), no dialog |
+| Ctrl+wheel | thumbnail size |
+| Ctrl+ / Ctrl- / Ctrl+0 | text size |
 
 The window has no system title bar (Settings → *Title bar* can bring it back): drag the top bar to move it, double-click to maximise, and use the grip in the
 bottom-right corner to resize. Panes are separated by splitters you can drag. **?** (top right) opens help: what is
@@ -310,7 +325,7 @@ with a note, while that server is down (Ask search, the LLM check in Analyze), a
 photo with 8 threads). Image analysis: *only photos not analysed yet* (default), *all photos again*, *quick* (ViT-B/32,
 about 6× faster and less accurate, upgraded on a later normal run) or *skip*. Tags: *only missing or outdated*
 (default), *re-tag all* (seconds: from the stored analysis), or *photos with few tags*. The check of generated tags
-against AI prompts uses the LLM on the GPU server, so it is off unless ticked there; *Tag suggestions → Check again…*
+against AI prompts uses the LLM on the GPU server, so it is off unless ticked there; *Set tags → Suggestions → Check again…*
 also asks first.
 
 **Edit tag list** (Tags or Image recognition): a paged, searchable table of the tags CLIP chooses from, with a category filter,
@@ -383,7 +398,7 @@ says why it matched (`desc: lake | lake, mountain…`, `exif: Exif.Image.Model =
 ## How updates are decided
 
 jev-photos separates what a file **is** (its own metadata, never rewritten) from what jev-photos **made** (names,
-tags, keywords and descriptions it generated, which may be refreshed or corrected). Every change is shown in the To review lists
+tags, keywords and descriptions it generated, which may be refreshed or corrected). Every change is shown in the Tools lists
 before it happens.
 
 ```mermaid
@@ -392,7 +407,7 @@ flowchart LR
     F --> M["Made by jev-photos, may be updated:<br/>date-based file name,<br/>CLIP tags, prompt and name keywords,<br/>keywords and description it wrote"]
     G -->|evidence| D{Decision}
     M -->|target| D
-    D --> R[To review: preview with confidence]
+    D --> R[Tools: preview with confidence]
     R -->|you apply| W[Write: only additions, or our own fields]
     R -->|you reject| X[Remembered, not proposed again]
 ```
@@ -437,7 +452,7 @@ flowchart TD
     R1 --> CONF["Confidence: LLM certainty lowered when CLIP saw the tag clearly"]
     R2 --> CONF
     R3 --> CONF
-    CONF --> REV["Tag suggestions: 70% or more ticked"]
+    CONF --> REV["Set tags, Suggestions: 70% or more ticked"]
     REV -->|apply| FIX["tag_fix layer over CLIP tags (re-tagging keeps it)"]
     REV -->|reject| NO[Not proposed again]
     USER["Your own tags"] -->|replace automatic tags, never second-guessed| TAG
@@ -461,7 +476,7 @@ flowchart TD
     LLM --> JEV["jev: is it a placeholder? does ours add information?"]
     JEV --> AG{Do they agree?}
     AG -->|yes| ACT[Apply that action]
-    AG -->|no| YOU["You decide in Save info to files; left unchanged until then"]
+    AG -->|no| YOU["You decide in Auto set meta; left unchanged until then"]
 ```
 
 Settings → *Existing descriptions* can also be: only fill empty fields, LLM alone, or always ask. In PNGs the
@@ -520,8 +535,8 @@ the terminal they are started from.
 
 On first start, add your photo folders and choose what the app may do, then *Start*. Later, **Analyze** (top bar)
 scans, finds duplicates, works out dates and places, tags the pictures and plans the changes; the counts appear under
-**To review** in the sidebar. Nothing is copied or written until you press **Apply** in *Organize* or *Save info to
-files*, and every applied run can be undone. Organized copies go to
+**Tools** in the sidebar. Nothing is copied or written until you press **Apply** in *Organize path* or *Auto set
+meta* (or switch on *Write automatically* there), and every applied run can be undone. Organized copies go to
 `<photo folder>/jev-organized/2019/2019-05/20190512_00001.jpg`; that folder is skipped when the photo folder is
 scanned again, and Settings can put the copies elsewhere.
 
@@ -538,7 +553,9 @@ and the copy that stays, then moves them to the desktop Trash, so they can be re
 | Enter | open viewer | |
 | Space | tick / untick (review lists) | next photo |
 | f | star / unstar | star / unstar |
-| Delete | move the selected photos to the Trash (asks first) | |
+| Delete | move the selected photos to the Trash (restorable, no dialog) | move this photo to the Trash, show the next |
+| F2 | rename | rename |
+| wheel | scroll (Ctrl: thumbnail size) | zoom at the pointer; drag moves, double-click or 0 fits |
 | Esc / q | | close |
 
 Everything the app learns (dates, hashes, tags) is kept in one catalog, `~/.local/share/jev-photos/catalog.sqlite`,
@@ -620,5 +637,6 @@ src/dupes.*      keeper choice, dHash, near-duplicate clustering
 src/main.cpp     ImGui UI and CLI           tests/        unit tests, fixture generator
 src/compat.h     POSIX / Windows differences  src/os_win.cpp  Windows processes, files, Recycle Bin, dialogs
 win/             Windows manifest and icon resource   cmake/  mingw-w64 toolchain file
+scripts/make-icon.py   draws the app icon (macOS-style squircle) into assets/: 1024/256 px PNG, .ico, .svg
 .github/         CI: builds, tests, smoke tests, releases
 ```

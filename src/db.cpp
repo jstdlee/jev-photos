@@ -2,8 +2,10 @@
 
 #include <sqlite3.h>
 
+#include <algorithm>
 #include <set>
 
+#include "clip.h"
 #include "genmeta.h"
 #include "nlohmann/json.hpp"
 #include "util.h"
@@ -116,7 +118,7 @@ std::vector<std::pair<std::string, float>> effective_tag_list(const Photo& p) {
     std::set<std::string> seen;
     auto add = [&](const std::string& t, float c) {
         std::string k = util::lower(util::trim(t));
-        if (!k.empty() && seen.insert(k).second) out.push_back({util::trim(t), c});
+        if (!k.empty() && !tag_blocked(k) && seen.insert(k).second) out.push_back({util::trim(t), c});
     };
     if (!p.user_tags.empty()) {
         for (auto& [t, c] : parse_tag_list(p.user_tags)) add(t, 1.0f);
@@ -424,6 +426,7 @@ void Db::move_src(int64_t id, const std::string& path) {
     Stmt s(db_, "UPDATE photos SET src_path=? WHERE id=?");
     s.b(path).b(id);
     s.run();
+    reindex(id);  // the name is searchable
 }
 
 void Db::save_gen(int64_t id, const std::string& gen_json, const std::string& tool, const std::string& keywords_json) {
@@ -537,9 +540,12 @@ std::vector<TagRow> Db::tag_rows(const std::string& folder, const std::string& m
             if (fj.is_object() && fj.contains("remove"))
                 for (auto& x : fj["remove"]) if (x.is_string()) removed.insert(util::lower(x.get<std::string>()));
             for (auto& t : parse_tag_list(clip))
-                if (!have.count(util::lower(t.first)) && !removed.count(util::lower(t.first))) r.tags.push_back(t);
+                if (!have.count(util::lower(t.first)) && !removed.count(util::lower(t.first)) && !tag_blocked(t.first)) r.tags.push_back(t);
         }
-        for (auto& t : parse_tag_list(gen_kw)) r.prompt_tags.push_back(t.first);
+        r.tags.erase(std::remove_if(r.tags.begin(), r.tags.end(), [](const std::pair<std::string, float>& t) { return tag_blocked(t.first); }),
+                     r.tags.end());
+        for (auto& t : parse_tag_list(gen_kw))
+            if (!tag_blocked(t.first)) r.prompt_tags.push_back(t.first);
         for (auto& t : r.tags) r.best = std::max(r.best, t.second);
         // What the file already carries (from the scan snapshot).
         json m = json::parse(meta.empty() ? "{}" : meta, nullptr, false);

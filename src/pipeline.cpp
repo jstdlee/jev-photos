@@ -977,6 +977,7 @@ void Pipeline::check_corrections(const Config& c, const RunOptions& o) {
         auto propose = [&](const std::string& field, const std::string& action, const std::string& cur, const std::string& to, double conf,
                            const std::string& why, const std::string& src) {
             if (conf < 0.3) return;  // not worth a look
+            if (field == "tag" && action == "add" && tag_blocked(to)) return;  // you deleted that tag
             for (auto& x : out)
                 if (x.field == field && x.current == cur && x.proposed == to) return;
             if (db_.correction_rejected(id, field, cur, to)) return;  // you said no (or it is done)
@@ -1218,6 +1219,8 @@ MetaPlan meta_plan_for(const Photo& p, const util::Civil& when, bool rewrite = f
     if (!p.scene.empty() && p.user_tags.empty()) plan.keywords.push_back(p.scene);
     if (!p.location.empty()) plan.keywords.push_back(p.location);
     if (!p.landmark.empty()) plan.keywords.push_back(p.landmark);
+    plan.keywords.erase(std::remove_if(plan.keywords.begin(), plan.keywords.end(), [](const std::string& k) { return tag_blocked(k); }),
+                        plan.keywords.end());
     plan.rewrite_keywords = rewrite;
     // A copy we made carries the original's keywords plus ours: anything beyond the original's list is ours (files
     // written before Xmp.jev.Keywords existed have no other record).
