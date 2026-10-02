@@ -1390,6 +1390,8 @@ void Pipeline::set_desc_action(int64_t id, const std::string& action) {
             if (it.id == id) {
                 it.desc_action = action;
                 it.desc_by = "you";
+                if (action == "append" || action == "replace") it.include = true;  // you chose a change: it is applied
+                if (util::starts_with(it.note, "description: your choice")) it.note.clear();
                 char key[32];
                 snprintf(key, sizeof key, "%016llx", (unsigned long long)std::hash<std::string>{}(it.desc_old + "\x1f" + it.desc_new));
                 choice = json({{"key", key}, {"action", action}, {"by", "you"}, {"why", "your choice"}}).dump();
@@ -1521,6 +1523,12 @@ std::vector<PlanItem> Pipeline::build_plan(const Config& c, const RunOptions& o)
             if (it.action == "metadata" && w.added <= 0 && w.removed.empty() && it.desc_action != "decide") {
                 progress.skipped++;
                 continue;
+            }
+            // Only waiting for your choice about an existing description: listed (so you can choose) but not ticked and
+            // not counted as an update, so the list does not show the same "updates" on every run.
+            if (it.action == "metadata" && w.added <= 0 && w.removed.empty() && it.desc_action == "decide") {
+                it.include = false;
+                it.note = "description: your choice (keep / append / replace)";
             }
         }
         if (p.needs_review) it.note = it.note.empty() ? "date needs review" : it.note + "; date needs review";

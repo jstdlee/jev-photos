@@ -46,7 +46,7 @@ metadata write to a file whose name uses another script may be reported as faile
 | **2 Decide** | Recovers the capture date from EXIF, XMP, GPS time, file name, folder names, file times and camera-sequence neighbours ([decision model](docs/decision-model.md)). Close calls go to jev. It also decides a location from metadata or folder/file names (rules + VL + jev vote, per folder). |
 | **3 Tag (CLIP)** | CLIP on the CPU (ONNX Runtime, full-precision weights), from each photo's 512 px thumbnail: ViT-L/14 (~0.3–0.4 s per photo, the default once downloaded) or ViT-B/32 (~60 ms). It picks tags per category from an editable vocabulary (`~/.config/jev-photos/tags.txt`, ~220 tags: medium, people, clothing, scene, objects, documents, …) and stores the image embedding for search. See [Tags](#tags-and-exif). |
 | **3b Vision** (advanced, off) | Optional. A vision-language model (OpenAI-compatible or Ollama) writes captions and reads text in screenshots. It needs a model server and a lot of memory. |
-| **4 Organize** | Copies (or moves) into `<photo folder>/jev-organized/2019/2019-05/20190512_00001.jpg`, with the serial per day in time order. Partial dates go to `20190500_…` / `20190000_…`, and undated files to `undated/00000000_…`. Then it extends the metadata of the copy (or an XMP sidecar). |
+| **4 Organize** | Renames each photo in place to its date name (the default), or copies / moves it into `<photo folder>/jev-organized/2019/2019-05/20190512_00001.jpg`; the serial counts per day in time order. The page shows an example from your own photos (*Example: IMG_1234.jpg → 20190512_00001.jpg*). With *copy*, your originals keep their names and the renamed copies are in jev-organized. Partial dates go to `20190500_…` / `20190000_…`, and undated files to `undated/00000000_…`. Then it extends the metadata of the copy (or an XMP sidecar). |
 
 Each stage is resumable. A manual date override in the UI re-files the organized copy on the next *Decide* + *Organize*.
 
@@ -252,8 +252,8 @@ One window: a **sidebar** on the left, the photos (or the list you are working o
 
 | Sidebar | |
 |---|---|
-| **Library** | *All photos*, *Favorites*, *AI images* (pictures with generation data), *Years* (click a year for its months), *Places*, and each of your *Folders* (right-click to open or remove; *Add folder…*) |
-| **Tools** | in the order of the work, with what needs you counted: *Deduplicate* (best done first) · *Fix dates* (how many have a best guess and how many have no date; *Accept all best guesses*, *Only the strong ones*, or confirm / pick another date in the inspector) · *Set tags* (*Photos and tags*: each photo's tags, *Fill in missing tags*, the tag list; *Suggestions*: fixes of generated tags) · *Organize path* (copy, move or rename into month folders) · *Auto set meta* (everything at once: missing dates, keywords, descriptions and places written where the files are; optionally after every Analyze) · *Image recognition* (CLIP: missing / quick / again / re-tag, *Smart update*) · *Activity* (what ran, **Undo**, jev's decisions, the log) |
+| **Library** | *All photos*, *Favorites*, *AIGC* (AI-generated pictures: generation data in the file), *Years* (click a year for its months), *Places*, and each of your *Folders* (right-click to open or remove; *Add folder…*) |
+| **Tools** | in the order of the work, with what needs you counted: *Deduplicate* (best done first) · *Fix dates* (how many have a best guess and how many have no date; *Accept all best guesses*, *Only the strong ones*, or confirm / pick another date in the inspector) · *Set tags* (*Photos and tags*: each photo's tags, *Fill in missing tags*, the tag list; *Suggestions*: fixes of generated tags) · *Organize path* (rename in place, or copy / move into month folders, with an example) · *Auto set meta* (everything at once: missing dates, keywords, descriptions and places written where the files are; optionally after every Analyze) · *Image recognition* (CLIP: missing / quick / again / re-tag, *Smart update*) · *Activity* (what ran, **Undo**, jev's decisions, the log) |
 
 The library is a grid of thumbnails with a heading per month (or a sortable list: the button next to the search);
 **Ctrl+wheel** makes the thumbnails bigger or smaller. In the viewer the **wheel zooms** at the pointer (up to 8×),
@@ -263,6 +263,13 @@ dragging moves the picture, and double-click or **0** fits it again.
 keeps its extension and sidecar, refuses a name already taken, and can be undone from *Activity*. **Delete** moves the
 selected photos (or the one in the viewer) straight to the Trash / Recycle Bin, no dialog: they can be restored from
 there. *Move to Trash…* still lists them first.
+
+**Go to** (Ctrl+K, the ⌘ button in the top bar, or just type in the search): find any page, setting or action by
+name — "dedup", "theme", "screenshot", "timeout" — and go there; a setting opens Settings scrolled to its row, which
+flashes. **Screenshot** (camera button): the whole window, or drag over an area; saved in `Pictures/jev-photos`, path
+copied. **Model tests** (Settings → Advanced, or the activity popover; for development): send your own prompt to the
+language model, the selected photo to the vision model or to image recognition (tags, timings, a text's similarity),
+or a question with options to jev, and see the raw answer and the time it took.
 
 **Blocked tags:** deleting a tag (in the tag list, or *Block everywhere* from the × next to a photo's tag) blocks it:
 it is never recognised, suggested, used as a keyword or written into files again, even after a tag-list upgrade.
@@ -282,7 +289,7 @@ is marked in the sidebar and above the photos; its photos still show the thumbna
 per row with a short explanation, segmented choices and *Off / On* pills. Changes are saved as you make them; the
 vision model and the decision-rule numbers are behind *Show advanced settings*.
 
-**Search** as you type; suggestions (tags, places, years, months, favorites, AI images) become **filter chips** when
+**Search** as you type; suggestions (tags, places, years, months, favorites, AIGC, and pages / settings / actions to *go to*) become **filter chips** when
 picked, and Backspace in an empty field removes the last one. A sentence of four words or more plus Enter asks the
 assistant (LLM + jev). The sliders button holds the fields to search, a date range and regular expressions.
 
@@ -304,6 +311,7 @@ while nothing else runs, new or changed photos are picked up and analysed quietl
 | Ctrl+F | search |
 | Ctrl+I | show / hide the inspector |
 | Ctrl+, | settings |
+| Ctrl+K | go to a page, setting or action |
 | Ctrl+Z | undo what was just applied |
 | F2 | rename the selected photo |
 | Delete | move the selected photos to the Trash (restorable), no dialog |
@@ -595,7 +603,7 @@ build/jev-photos --cli ~/Pictures/phone --stages tag --retag                 # r
 | `vl_max_side`, `vl_concurrency`, `vl_tag_lang` | 1024, 1, English | set `vl_tag_lang=Chinese` for Chinese tags |
 | `layout` | 0 | 0 `2019/2019-05`, 1 `2019-05`, 2 `2019/05` |
 | `write_mode` | 0 | 0 embed into the organized copy, 1 XMP sidecar, 2 database only |
-| `file_op` | 0 | 0 copy, 1 move, 2 rename in place, 3 metadata only |
+| `file_op` | 2 | 0 copy, 1 move, 2 rename in place (default), 3 metadata only |
 | `name_style`, `rewrite_tags` | 0, 1 | 0 `20190512_00001`, 1 keep the original name as prefix; replace keywords written earlier |
 | `clip_model`, `clip_threads` | auto, 8 | auto = ViT-L/14 when downloaded (Settings, or `scripts/fetch-models.sh l14`), else ViT-B/32 |
 | `write_description`, `desc_policy`, `gen_keywords` | 1, 1, 1 | description writing; 0 fill only, 1 LLM + jev agree, 2 LLM, 3 always ask; prompt keywords |

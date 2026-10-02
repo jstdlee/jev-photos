@@ -43,7 +43,7 @@ struct Config {
     std::string library;
     int layout = LAYOUT_Y_YM;
     int write_mode = WRITE_EMBED;
-    int file_op = OP_COPY;
+    int file_op = OP_RENAME;   
     std::string name_sep = "_";        // 20190512_00001.jpg
     int sn_digits = 5;
     int name_style = NAME_DATE_SN;     // NAME_KEEP_PREFIX: the original name without its dates/numbers, then date + sn
