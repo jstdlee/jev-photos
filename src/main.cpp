@@ -145,21 +145,39 @@ static void build_fonts() {
     }
     if (!have) io.Fonts->AddFontDefault();
     // Always merge a CJK face: file and folder names are often Chinese/Japanese even in an English UI.
+    // Chinese, Japanese and Korean all merged (names in any of them show up), the interface language's own face
+    // first: the same character is drawn the Japanese way in Japanese, the Chinese way in Chinese.
+    std::vector<std::vector<std::string>> by_lang;  // zh, ja, ko
 #ifdef _WIN32
-    for (const char* f : {"msyh.ttc", "simsun.ttc", "YuGothM.ttc", "meiryo.ttc", "malgun.ttf"}) {
-        FontFace cjk;
-        if (util::file_exists(windir + "/Fonts/" + f)) cjk.file = windir + "/Fonts/" + f;
+    by_lang = {{"msyh.ttc", "simsun.ttc"}, {"YuGothM.ttc", "meiryo.ttc", "msgothic.ttc"}, {"malgun.ttf", "gulim.ttc"}};
 #else
-    for (const char* pat : {"sans-serif:lang=zh-cn", "sans-serif:lang=ja", "sans-serif:lang=ko"}) {
-        FontFace cjk = fc_match(pat);
+    by_lang = {{"sans-serif:lang=zh-cn"}, {"sans-serif:lang=ja"}, {"sans-serif:lang=ko"}};
 #endif
-        if (cjk.file.empty() || cjk.file == base.file) continue;
-        ImFontConfig m;
-        m.MergeMode = true;
-        m.FontNo = cjk.index;
-        io.Fonts->AddFontFromFileTTF(cjk.file.c_str(), 0.0f, &m);
-        break;
-    }
+    int first = get_lang() == L_JA ? 1 : get_lang() == L_KO ? 2 : 0;
+    std::vector<int> order = {first};
+    for (int k = 0; k < 3; k++)
+        if (k != first) order.push_back(k);
+    std::set<std::string> merged{base.file};
+    for (int k : order)
+        for (auto& cand : by_lang[size_t(k)]) {
+            FontFace cjk;
+#ifdef _WIN32
+            if (util::file_exists(windir + "/Fonts/" + cand)) cjk.file = windir + "/Fonts/" + cand;
+#else
+            cjk = fc_match(cand.c_str());
+#endif
+            if (cjk.file.empty()) continue;
+            std::string key = cjk.file + "#" + std::to_string(cjk.index);
+            if (merged.count(key) || merged.count(cjk.file + (cjk.index ? "" : "#0"))) break;
+            merged.insert(key);
+            ImFontConfig m;
+            m.MergeMode = true;
+            m.FontNo = cjk.index;
+            m.ExtraSizeScale = 1.1f;  // CJK faces look smaller than Latin ones at the same pixel size
+            m.GlyphOffset = ImVec2(0, 1);
+            io.Fonts->AddFontFromFileTTF(cjk.file.c_str(), 0.0f, &m);
+            break;  // one face per language
+        }
     // Icons (private-use codepoints), merged into the same font and nudged down to sit on the text baseline.
     ImFontConfig ic;
     ic.MergeMode = true;
@@ -3709,6 +3727,7 @@ static void draw_settings(App& a) {
         if (choice(tr("Language"), tr("Applies at once, no restart"), &lang, names)) {
             set_lang(Lang(lang));
             c.lang = kLangCodes[lang];
+            a.want_font_rebuild = true;  // the new language's CJK face goes first
         }
     }
     {
@@ -6656,6 +6675,7 @@ int main(int argc, char** argv) {
                         else if (t == "find") app.focus_search = true;
                         else if (t == "rename") { if (app.selected) begin_rename(app, app.selected); }
                         else if (t == "palette") app.palette_open = true;
+                        else if (util::starts_with(t, "lang:")) { set_lang(lang_from_code(t.substr(5).c_str())); app.cfg.lang = t.substr(5); app.want_font_rebuild = true; }
                         else if (t == "modeltests") app.show_model_tests = true;
                         else if (t == "shotarea") { app.shot_mode = 2; app.shot_a = app.shot_b = ImVec2(-1, -1); }
                         else if (util::starts_with(t, "mouse:")) {  // mouse:X;Y  (window pixels)
@@ -6674,6 +6694,10 @@ int main(int argc, char** argv) {
                     glfwSetWindowShouldClose(app.win, GLFW_TRUE);
                 }
             }
+        }
+        if (app.want_font_rebuild) {  // between frames: the atlas may be rebuilt here
+            app.want_font_rebuild = false;
+            build_fonts();
         }
         ImGui::NewFrame();
         draw_ui(app);

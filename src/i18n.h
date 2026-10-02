@@ -1,7 +1,7 @@
-// UI translations keyed by the English text (English, 简体中文).
+// UI translations keyed by the English text (English, 简体中文, 日本語, 한국어).
 #pragma once
 
-enum Lang { L_EN, L_ZH_CN, L_COUNT };
+enum Lang { L_EN, L_ZH_CN, L_JA, L_KO, L_COUNT };
 extern const char* const kLangCodes[L_COUNT];
 extern const char* const kLangNames[L_COUNT];
 
