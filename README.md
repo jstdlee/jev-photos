@@ -5,7 +5,7 @@ Organize a messy photo collection by **recovered capture date**, one folder per 
 A **vision-language model** extracts objects, scenes and tags. Everything is indexed in SQLite for search.
 Originals are never modified, and existing metadata is never overwritten.
 
-![jev photos: month sidebar, decisions table and the date evidence of a camera-reset photo re-dated from its sequence](docs/screenshot.png)
+![jev photos in Tokyo Night: the sidebar (library, what needs review, tools), the search bar and the photo grid with a heading per month](docs/screenshot.png)
 
 Same stack as [gpu-hud](../../gpu-hud): C++17, Dear ImGui, GLFW, OpenGL 3.3. It adds a vendored SQLite (FTS5) and
 the `exiv2` CLI for metadata.
@@ -230,14 +230,25 @@ One window: a **sidebar** on the left, the photos (or the list you are working o
 | **Tools** | *Tags* (each photo's tags, *Fill in missing tags*, the tag list editor) · *Image recognition* (CLIP: missing / quick / again / re-tag, and *Smart update*) · *Activity* (what ran, **Undo**, jev's decisions, the log) |
 
 The library is a grid of thumbnails with a heading per month (or a sortable list: the button next to the search).
-The **top bar** holds the search, *Analyze*, the activity indicator (progress and *Stop* while something runs), the
-**assistant** robot (green when image recognition, the LLM and jev are all up; hover for each), help and settings.
+The **top bar** holds the search, *Analyze* and the activity button (progress and *Stop* while something runs; it
+turns amber when image recognition, the LLM or jev is down, and its popover lists each helper's state and the last
+log lines). Help, settings and the window buttons sit in the top-right corner.
+
+**Photos are drawn smoothly:** thumbnails and the viewer use mipmapped textures with trilinear (and, where the driver
+offers it, anisotropic) filtering. The full-screen viewer follows the theme, shows the thumbnail at once and the full
+image when it is decoded, and says why when a photo cannot be shown. **A folder on a drive that is not connected**
+is marked in the sidebar and above the photos; its photos still show the thumbnails saved earlier
+(`~/.cache/jev-photos/thumbs`), and open in full once the drive is back.
+
+**Settings** (Ctrl+,) is one page in the style of a macOS preferences pane: sections of rounded cards, one setting
+per row with a short explanation, segmented choices and *Off / On* pills. Changes are saved as you make them; the
+vision model and the decision-rule numbers are behind *Show advanced settings*.
 
 **Search** as you type; suggestions (tags, places, years, months, favorites, AI images) become **filter chips** when
 picked, and Backspace in an empty field removes the last one. A sentence of four words or more plus Enter asks the
 assistant (LLM + jev). The sliders button holds the fields to search, a date range and regular expressions.
 
-**Themes:** Dark, Tokyo Night and Light (Settings → Appearance, or Ctrl+,). Each theme brings its own accent colour,
+**Themes:** Dark, Tokyo Night and Light (Settings → Preferences → Appearance, or Ctrl+,). Each theme brings its own accent colour,
 which you can change.
 
 **Undo:** every change Organize or *Save info to files* makes is recorded, and files written in place are backed up
@@ -247,7 +258,7 @@ earlier version of files whose info was written. Anything that cannot be put bac
 left alone and listed in the log.
 
 **First start:** add your photo folders, choose what the app may do (only browse and search; also make organized
-copies; or rename the originals), and *Start*. **Watching** (Settings → Folders, on by default): every 10 minutes,
+copies; or rename the originals), and *Start*. **Watching** (Settings → *Watch the folders*, on by default): every 10 minutes,
 while nothing else runs, new or changed photos are picked up and analysed quietly; nothing in the files changes.
 
 | Key | |
@@ -257,7 +268,7 @@ while nothing else runs, new or changed photos are picked up and analysed quietl
 | Ctrl+, | settings |
 | Ctrl+Z | undo what was just applied |
 
-The window has no system title bar (Settings → Appearance can bring it back): drag the top bar to move it, double-click to maximise, and use the grip in the
+The window has no system title bar (Settings → *Title bar* can bring it back): drag the top bar to move it, double-click to maximise, and use the grip in the
 bottom-right corner to resize. Panes are separated by splitters you can drag. **?** (top right) opens help: what is
 what (file name, tags, CLIP, keywords, description, EXIF/XMP, AI prompt, corrections, jev, LLM), keys, the search
 syntax, credits and the project page.
@@ -519,6 +530,8 @@ build/jev-photos --cli ~/Pictures/phone --stages tag --retag                 # r
 | `search_min_match`, `ask_judge` | 0.30, 3 | meaning-match threshold; Ask judge 0 LLM, 1 jev, 2 none, 3 LLM + jev close calls |
 | `review_below`, `jev_margin`, `jev_date_weight` | 0.55, 0.70, 0.30 | date decision knobs |
 | `loc_w_rules`, `loc_w_vl`, `loc_w_jev`, `loc_accept` | 0.25, 0.60, 0.15, 0.50 | location vote |
+| `theme`, `accent`, `font_size`, `system_titlebar` | 0, green, 16, 0 | 0 Dark, 1 Tokyo Night, 2 Light; accent RGB 0–1; text size; desktop title bar |
+| `watch_folders`, `first_run_done`, `goal` | 1, 0, 0 | rescan quietly every 10 min; welcome screen done; 0 browse, 1 copies, 2 rename |
 
 https URLs go through `curl`, with the API key passed in a 0600 config file rather than on the command line.
 

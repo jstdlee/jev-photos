@@ -2763,7 +2763,14 @@ static void draw_photo_grid(App& a) {
             if (r.favorite) dl->AddText(ImVec2(p0.x + 6, p0.y + 4), ImGui::GetColorU32(g_star), ICON_STAR);
             if (r.needs_review) dl->AddText(ImVec2(p0.x + cell - 30, p0.y + 4), ImGui::GetColorU32(g_warn), ICON_CALENDAR_QUESTION);
             std::string name = util::basename(r.dest_path.empty() ? r.src_path : r.dest_path);
-            if (name.size() > 22) name = name.substr(0, 20) + "…";
+            if (ImGui::CalcTextSize(name.c_str()).x > cell - 14) {  // cut to the tile width (UTF-8 safe), with an ellipsis
+                while (name.size() > 1 && ImGui::CalcTextSize((name + "…").c_str()).x > cell - 14) {
+                    size_t k = name.size() - 1;
+                    while (k > 0 && (name[k] & 0xC0) == 0x80) k--;
+                    name.resize(k);
+                }
+                name += "…";
+            }
             ImGui::TextDisabled("%s", name.c_str());
             ImGui::PopID();
             ImGui::EndGroup();
@@ -5634,6 +5641,7 @@ int main(int argc, char** argv) {
                         else if (t == "analyze") request_analyze(app);
                         else if (t == "undo") { if (!app.undo_run.empty()) start_undo(app, app.undo_run); }
                         else if (t == "find") app.focus_search = true;
+                        else if (t == "inspector") app.inspector_on = !app.inspector_on;
                         else if (util::starts_with(t, "type:")) sio.AddInputCharactersUTF8(t.substr(5).c_str());
                         else if (t == "apply") apply_plan(app);
                         else if (t == "help") app.show_help = true;
