@@ -14,6 +14,9 @@
 // does not return a website screenshot where "diagram" was a 10% guess next to "website".
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+
 #include <map>
 #include <memory>
 #include <string>

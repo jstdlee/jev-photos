@@ -7,6 +7,9 @@
 // product is the cosine similarity.
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+
 #include <functional>
 
 #include <map>

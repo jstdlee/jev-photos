@@ -10,6 +10,9 @@
 //   Midjourney         XMP/EXIF description ending in "Job ID: <uuid>"
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+
 #include <map>
 #include <string>
 #include <utility>

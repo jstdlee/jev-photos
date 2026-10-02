@@ -362,6 +362,30 @@ static void test_meta_roundtrip() {
     rm_rf(dir);
 }
 
+// File names in other scripts reach exiv2 intact (on Windows through CreateProcessW and the UTF-8 manifest).
+static void test_meta_unicode_name() {
+    if (!exiv2_available()) { fprintf(stderr, "skip unicode meta test: no exiv2\n"); return; }
+    std::string dir = util::temp_path("uni") + "/海边 写真 바다";
+    util::mkdirs(dir);
+    CHECK(util::dir_exists(dir));
+    std::string img = dir + "/日落 2019-05-12.jpg";
+    unsigned char px[8 * 8 * 3] = {};
+    CHECK(stbi_write_jpg(img.c_str(), 8, 8, 3, px, 90));
+    CHECK(util::file_exists(img));
+    MetaPlan p;
+    p.date = util::make_civil(2019, 5, 12, 0, 0, 0, util::P_DAY);
+    p.date_trusted = true;
+    p.date_conf = 0.9;
+    p.date_source = "name-date";
+    p.location = "海边";
+    WriteResult w = write_meta(img, read_meta(img), p, MetaTarget::Embed, false);
+    CHECK(w.ok);
+    if (!w.ok) fprintf(stderr, "  exiv2: %s\n", w.error.c_str());
+    MetaMap m = read_meta(img);
+    CHECK(!m.get("Exif.Photo.DateTimeOriginal").empty() || !m.get("Xmp.photoshop.DateCreated").empty());
+    rm_rf(util::dirname(dir));
+}
+
 static void test_sha() {
     std::string p = util::temp_path("sha");
     util::write_file(p, "abc");
@@ -811,6 +835,7 @@ static void test_journal() {
 
 int main() {
     test_journal();
+    test_meta_unicode_name();
     test_civil();
     test_name_patterns();
     test_decisions();

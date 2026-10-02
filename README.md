@@ -8,7 +8,34 @@ Originals are never modified, and existing metadata is never overwritten.
 ![jev photos in Tokyo Night: the sidebar (library, what needs review, tools), the search bar and the photo grid with a heading per month](docs/screenshot.png)
 
 Same stack as [gpu-hud](../../gpu-hud): C++17, Dear ImGui, GLFW, OpenGL 3.3. It adds a vendored SQLite (FTS5) and
-the `exiv2` CLI for metadata.
+the `exiv2` CLI for metadata. Runs on **Linux** (x86_64, aarch64) and **Windows 10/11** (x86_64).
+
+[![build](https://github.com/jstdlee/jev-photos/actions/workflows/build.yml/badge.svg)](https://github.com/jstdlee/jev-photos/actions/workflows/build.yml)
+
+## Download
+
+Every commit to `main` is built, tested and published as a
+[release](https://github.com/jstdlee/jev-photos/releases/latest):
+
+| System | Package | |
+|---|---|---|
+| Windows 10/11 x86_64 | `jev-photos-…-windows-x86_64.zip` | unzip anywhere and run `jev-photos.exe`. exiv2 and the Visual C++ runtime are included. `install-desktop.ps1` adds Start-menu and Desktop shortcuts. |
+| Linux x86_64 / aarch64 | `jev-photos-…-linux-….tar.gz` | unpack and run `bin/jev-photos`. Needs `exiv2` (`sudo apt install exiv2`). `scripts/install-desktop.sh` adds a menu entry and desktop shortcut. |
+
+Image recognition needs a CLIP model, downloaded once from Settings → Image recognition → *Get fast* (ViT-B/32,
+600 MB) or *Get best* (ViT-L/14, 1.7 GB). Everything else works without it.
+
+Where things are kept:
+
+| | Linux | Windows |
+|---|---|---|
+| settings, tag list | `~/.config/jev-photos/` | `%APPDATA%\jev-photos\` |
+| catalog, models, undo backups | `~/.local/share/jev-photos/` | `%LOCALAPPDATA%\jev-photos\` |
+| thumbnails | `~/.cache/jev-photos/thumbs/` | `%LOCALAPPDATA%\jev-photos\cache\thumbs\` |
+
+On Windows the Trash is the Recycle Bin, and *Open file* / *Open folder* use the default apps. File names in any
+language work in the app; exiv2 itself (the bundled Windows build) reads names in the system's language, so a
+metadata write to a file whose name uses another script may be reported as failed (nothing is changed then).
 
 ## What it does
 
@@ -442,12 +469,36 @@ generation chunks (`prompt`, `workflow`, `parameters`) are never touched: XMP go
 
 ## Build
 
+Linux:
+
 ```bash
 ./build.sh
 ```
 
-This fetches pinned ImGui, GLFW, stb, SQLite 3.50.4, nlohmann/json and xxHash 0.8.3 into `third_party/`, and X11/GL headers if
-missing (no root needed). Runtime needs `exiv2` (`sudo apt install exiv2`); `ffmpeg` is optional for exotic formats.
+This fetches pinned ImGui, GLFW, stb, SQLite 3.50.4, nlohmann/json, xxHash 0.8.3, ONNX Runtime 1.22 and the Tabler
+icon font into `third_party/`, and X11/GL headers if missing (no root needed). Runtime needs `exiv2`
+(`sudo apt install exiv2`); `ffmpeg` is optional for exotic formats.
+
+Windows, either natively in [MSYS2](https://www.msys2.org/) (UCRT64 shell) or cross-compiled from Linux:
+
+```bash
+# MSYS2 UCRT64: pacman -S git curl unzip mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja
+scripts/fetch-deps.sh windows
+cmake -S . -B build -G Ninja && cmake --build build
+
+# from Linux (mingw-w64 unpacked into third_party/mingw, no root):
+scripts/fetch-mingw.sh && scripts/fetch-deps.sh windows
+cmake -S . -B build-win -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-x86_64.cmake && cmake --build build-win
+```
+
+The program is self-contained apart from `onnxruntime.dll` (copied next to it) and `exiv2.exe` (put it next to it,
+or on `PATH`). Platform code lives in `src/compat.h` and `src/os_win.cpp`; paths are UTF-8 with forward slashes
+everywhere, and the manifest (`win/`) sets the UTF-8 code page, per-monitor DPI awareness and long paths.
+
+**CI** (`.github/workflows/build.yml`), on every push and pull request: Linux x86_64 and aarch64 and Windows x86_64
+builds, the unit tests on each, and a smoke test of the real program (a command-line analysis of generated photos,
+then the window on software OpenGL, saving a screenshot). Pushes to `main` publish a release `v<VERSION>.<run>`
+with the packages and the screenshots; a `v*` tag publishes that version.
 
 ```bash
 build/jev-photos-tests      # decision-model and metadata-safety unit tests
@@ -460,8 +511,12 @@ DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 __GLX_VENDOR_LIBRARY_NAME=mesa build/jev-pho
 ```bash
 build/jev-photos                  # GUI
 build/jev-photos ~/Pictures/phone # GUI, opened on that folder
+build/jev-photos --version
 scripts/install-desktop.sh        # icon, application-menu entry and a desktop shortcut (--remove undoes it)
 ```
+
+On Windows the same options work (`jev-photos.exe --cli D:\Photos --dry-run`); the command-line modes print to
+the terminal they are started from.
 
 On first start, add your photo folders and choose what the app may do, then *Start*. Later, **Analyze** (top bar)
 scans, finds duplicates, works out dates and places, tags the pictures and plans the changes; the counts appear under
@@ -514,7 +569,7 @@ build/jev-photos --cli ~/Pictures/phone --stages organize --op metadata      # o
 build/jev-photos --cli ~/Pictures/phone --stages tag --retag                 # re-tag after editing tags.txt
 ```
 
-## Settings (`~/.config/jev-photos/config.ini`, mode 0600)
+## Settings (`~/.config/jev-photos/config.ini`, on Windows `%APPDATA%\jev-photos\config.ini`)
 
 | Key | Default | |
 |---|---|---|
@@ -525,7 +580,7 @@ build/jev-photos --cli ~/Pictures/phone --stages tag --retag                 # r
 | `write_mode` | 0 | 0 embed into the organized copy, 1 XMP sidecar, 2 database only |
 | `file_op` | 0 | 0 copy, 1 move, 2 rename in place, 3 metadata only |
 | `name_style`, `rewrite_tags` | 0, 1 | 0 `20190512_00001`, 1 keep the original name as prefix; replace keywords written earlier |
-| `clip_model`, `clip_threads` | auto, 8 | auto = ViT-L/14 when downloaded (`scripts/fetch-models.sh l14`), else ViT-B/32 |
+| `clip_model`, `clip_threads` | auto, 8 | auto = ViT-L/14 when downloaded (Settings, or `scripts/fetch-models.sh l14`), else ViT-B/32 |
 | `write_description`, `desc_policy`, `gen_keywords` | 1, 1, 1 | description writing; 0 fill only, 1 LLM + jev agree, 2 LLM, 3 always ask; prompt keywords |
 | `search_min_match`, `ask_judge` | 0.30, 3 | meaning-match threshold; Ask judge 0 LLM, 1 jev, 2 none, 3 LLM + jev close calls |
 | `review_below`, `jev_margin`, `jev_date_weight` | 0.55, 0.70, 0.30 | date decision knobs |
@@ -537,7 +592,7 @@ https URLs go through `curl`, with the API key passed in a 0600 config file rath
 
 ## Database
 
-`~/.local/share/jev-photos/catalog.sqlite` (override with `--db`):
+`~/.local/share/jev-photos/catalog.sqlite`, on Windows `%LOCALAPPDATA%\jev-photos\catalog.sqlite` (override with `--db`):
 * `photos`: source path, size, quick/full hash (`quick_hash`, `content_hash`), dHash, `dup_of`/`similar_to`, dimensions, original metadata snapshot (JSON), decided date/precision/source/
   confidence/evidence, GPS, location, vision fields, organized path, serial, and metadata write state.
 * `dirs`: the per-folder location decisions with their vote evidence.
@@ -563,4 +618,7 @@ src/jev.*        /v1/systemone client       src/vision.*  VL client, image prep 
 src/db.*         SQLite schema and queries  src/pipeline.* the stages, progress, bulk-copy detection, neighbour pass
 src/dupes.*      keeper choice, dHash, near-duplicate clustering
 src/main.cpp     ImGui UI and CLI           tests/        unit tests, fixture generator
+src/compat.h     POSIX / Windows differences  src/os_win.cpp  Windows processes, files, Recycle Bin, dialogs
+win/             Windows manifest and icon resource   cmake/  mingw-w64 toolchain file
+.github/         CI: builds, tests, smoke tests, releases
 ```

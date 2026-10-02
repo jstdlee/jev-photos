@@ -685,6 +685,7 @@ static ImVec4 kDanger(0.86f, 0.30f, 0.27f, 1);
 static ImVec4 g_warn(0.95f, 0.72f, 0.4f, 1), g_warn_red(1.0f, 0.62f, 0.55f, 1), g_ok(0.5f, 0.9f, 0.6f, 1), g_err(1, 0.5f, 0.4f, 1),
     g_info(0.6f, 0.75f, 1, 1), g_star(1, 0.8f, 0.25f, 1), g_text_dim(0.55f, 0.57f, 0.62f, 1), g_sidebar(0.09f, 0.10f, 0.12f, 1),
     g_panel(0.11f, 0.12f, 0.15f, 1), g_seg_on(1, 1, 1, 0.14f);  // cards, and the chosen pill of a segmented control
+static bool g_seg_shadow = false;                                // the pill casts a soft shadow (light theme)
 
 // Themes: Dark, Tokyo Night (the editor theme: #1a1b26 night, #7aa2f7 blue) and Light. The accent comes from the
 // settings (choosing a theme sets its own accent first).
@@ -694,7 +695,7 @@ struct ThemeColors {
 static ThemeColors theme_colors(int t) {
     auto rgb = [](int hex, float a = 1) { return ImVec4(((hex >> 16) & 255) / 255.0f, ((hex >> 8) & 255) / 255.0f, (hex & 255) / 255.0f, a); };
     if (t == THEME_TOKYO)
-        return {rgb(0x1a1b26), rgb(0x16161e), rgb(0x1f2335), rgb(0x292e42), rgb(0x343a55), rgb(0xc0caf5), rgb(0x737aa2), rgb(0x292e42),
+        return {rgb(0x1a1b26), rgb(0x16161e), rgb(0x1f2335), rgb(0x292e42), rgb(0x343a55), rgb(0xc0caf5), rgb(0x8089b3), rgb(0x292e42),
                 rgb(0x1f2335, 0.98f), rgb(0xf7768e), rgb(0xe0af68), rgb(0xff9e64), rgb(0x9ece6a), rgb(0xf7768e), rgb(0x7dcfff), rgb(0xe0af68)};
     if (t == THEME_LIGHT)
         return {rgb(0xf5f5f7), rgb(0xe9e9ec), rgb(0xffffff), ImVec4(0, 0, 0, 0.06f), ImVec4(0, 0, 0, 0.10f), rgb(0x1d1d1f), rgb(0x6e6e73),
@@ -706,7 +707,7 @@ static ThemeColors theme_colors(int t) {
             ImVec4(0.5f, 0.9f, 0.6f, 1), ImVec4(1, 0.5f, 0.4f, 1), ImVec4(0.6f, 0.75f, 1, 1), ImVec4(1, 0.8f, 0.25f, 1)};
 }
 static void theme_default_accent(int t, float* acc) {
-    const float d[3][3] = {{0.30f, 0.78f, 0.47f}, {0.478f, 0.635f, 0.969f}, {0.0f, 0.44f, 0.89f}};
+    const float d[3][3] = {{0.30f, 0.78f, 0.47f}, {0.478f, 0.635f, 0.969f}, {0.0f, 0.478f, 1.0f}};  // dark: the app's green; Tokyo blue; system blue
     for (int k = 0; k < 3; k++) acc[k] = d[std::clamp(t, 0, 2)][k];
 }
 
@@ -729,6 +730,7 @@ static void apply_style(const Config& c) {
     st.ChildBorderSize = 1;
     st.PopupBorderSize = 1;
     st.ScrollbarSize = 12;
+    st.DisabledAlpha = 0.45f;
     ImVec4 acc(c.accent[0], c.accent[1], c.accent[2], 1);
     auto A = [&](float a) { return ImVec4(acc.x, acc.y, acc.z, a); };
     ImVec4* k = st.Colors;
@@ -762,7 +764,7 @@ static void apply_style(const Config& c) {
     k[ImGuiCol_TitleBg] = th.sidebar;
     k[ImGuiCol_TitleBgActive] = th.panel;
     k[ImGuiCol_ScrollbarBg] = ImVec4(0, 0, 0, 0);
-    k[ImGuiCol_NavCursor] = acc;
+    k[ImGuiCol_NavCursor] = A(0.6f);  // keyboard focus ring
     k[ImGuiCol_TextSelectedBg] = A(0.35f);
     k[ImGuiCol_ModalWindowDimBg] = ImVec4(0, 0, 0, c.theme == THEME_LIGHT ? 0.25f : 0.55f);
     g_accent = acc;
@@ -777,6 +779,7 @@ static void apply_style(const Config& c) {
     g_sidebar = th.sidebar;
     g_panel = th.panel;
     g_seg_on = c.theme == THEME_LIGHT ? ImVec4(1, 1, 1, 1) : th.frame_hover;
+    g_seg_shadow = c.theme == THEME_LIGHT;
 }
 
 static std::string fmt_eta(double s) {
@@ -3173,7 +3176,7 @@ static void card_end() {
 }
 
 // One row. Returns the screen position where a control of width ctrl_w goes (vertically centred, right-aligned).
-static ImVec2 row(const char* title, const char* desc, float ctrl_w, const char* more = nullptr) {
+static ImVec2 row(const char* title, const char* desc, float ctrl_w, const char* more = nullptr, bool error = false) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImGui::SetCursorPosX(g_card.x0);
     ImVec2 top = ImGui::GetCursorScreenPos();
@@ -3196,7 +3199,8 @@ static ImVec2 row(const char* title, const char* desc, float ctrl_w, const char*
             cut = true;
         }
         if (cut) d += "…";
-        ImGui::TextDisabled("%s", d.c_str());
+        if (error) ImGui::TextColored(kDanger, "%s", d.c_str());  // errors replace the grey line, in the row itself
+        else ImGui::TextDisabled("%s", d.c_str());
         ImGui::PopFont();
         if (cut || more) tip(more ? (std::string(desc) + "\n" + more) : std::string(desc));
     } else if (more) {
@@ -3230,24 +3234,43 @@ static bool seg(const char* id, int* v, const std::vector<std::string>& labels) 
     float h = ImGui::GetFrameHeight(), w = seg_width(labels);
     dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), ImGui::GetColorU32(ImGuiCol_FrameBg), 7.0f);
     bool changed = false;
-    float x = p.x + 2;
     ImGui::PushID(id);
+    // where the chosen pill should be (relative to the track), and where it is drawn now: it slides there in ~150 ms
+    float sel_x = 2, sel_w = 0, x = 2;
+    for (int i = 0; i < int(labels.size()); i++) {
+        float iw = ImGui::CalcTextSize(labels[size_t(i)].c_str()).x + 22;
+        if (i == *v) { sel_x = x; sel_w = iw; }
+        x += iw;
+    }
+    ImGuiStorage* st = ImGui::GetStateStorage();
+    ImGuiID kx = ImGui::GetID("##pill_x"), kw = ImGui::GetID("##pill_w");
+    float cx = st->GetFloat(kx, -1), cw = st->GetFloat(kw, -1);
+    if (cx < 0 || ImGui::IsWindowAppearing()) { cx = sel_x; cw = sel_w; }
+    float k = 1.0f - std::exp(-ImGui::GetIO().DeltaTime / 0.035f);  // ease-out, settles in ~150 ms
+    cx += (sel_x - cx) * k;
+    cw += (sel_w - cw) * k;
+    if (std::fabs(sel_x - cx) < 0.5f && std::fabs(sel_w - cw) < 0.5f) { cx = sel_x; cw = sel_w; }
+    else g_wake_at = glfwGetTime() + 0.016;  // keep drawing until it arrives
+    st->SetFloat(kx, cx);
+    st->SetFloat(kw, cw);
+    if (sel_w > 0) {
+        ImVec2 a(p.x + cx, p.y + 2), b(p.x + cx + cw, p.y + h - 2);
+        if (g_seg_shadow) dl->AddRectFilled(ImVec2(a.x, a.y + 1), ImVec2(b.x, b.y + 1), IM_COL32(0, 0, 0, 22), 6.0f);  // soft 1 px shadow
+        dl->AddRectFilled(a, b, ImGui::GetColorU32(g_seg_on), 6.0f);
+        dl->AddRect(a, b, ImGui::GetColorU32(ImGuiCol_Border), 6.0f);
+    }
+    x = p.x + 2;
     for (int i = 0; i < int(labels.size()); i++) {
         float iw = ImGui::CalcTextSize(labels[size_t(i)].c_str()).x + 22;
         ImGui::SetCursorScreenPos(ImVec2(x, p.y));
         ImGui::PushID(i);
         if (ImGui::InvisibleButton("##s", ImVec2(iw, h)) && *v != i) { *v = i; changed = true; }
-        bool hov = ImGui::IsItemHovered();
+        bool hov = ImGui::IsItemHovered(), held = ImGui::IsItemActive();
         ImGui::PopID();
-        ImVec2 a(x, p.y + 2), b(x + iw, p.y + h - 2);
-        if (*v == i) {
-            dl->AddRectFilled(a, b, ImGui::GetColorU32(g_seg_on), 6.0f);
-            dl->AddRect(a, b, ImGui::GetColorU32(ImGuiCol_Border), 6.0f);
-        } else if (hov) {
-            dl->AddRectFilled(a, b, ImGui::GetColorU32(ImGuiCol_FrameBgHovered), 6.0f);
-        }
+        if (held) dl->AddRectFilled(ImVec2(x, p.y + 2), ImVec2(x + iw, p.y + h - 2), IM_COL32(0, 0, 0, 26), 6.0f);  // pressed
+        bool on = *v == i;
         ImVec2 ts = ImGui::CalcTextSize(labels[size_t(i)].c_str());
-        dl->AddText(ImVec2(x + (iw - ts.x) / 2, p.y + (h - ts.y) / 2), ImGui::GetColorU32(*v == i ? ImGuiCol_Text : ImGuiCol_TextDisabled),
+        dl->AddText(ImVec2(x + (iw - ts.x) / 2, p.y + (h - ts.y) / 2), ImGui::GetColorU32(on || hov ? ImGuiCol_Text : ImGuiCol_TextDisabled),
                     labels[size_t(i)].c_str());
         x += iw;
     }
@@ -3347,7 +3370,7 @@ static void draw_settings(App& a) {
         int si = 0;
         for (int i = 0; i < 4; i++)
             if (std::fabs(c.font_size - sizes[i]) < std::fabs(c.font_size - sizes[si])) si = i;
-        if (choice(tr("Text size"), tr("Everything in the window, larger"), &si, {"100%", "110%", "125%", "150%"})) c.font_size = sizes[si];
+        if (choice(tr("Text size"), tr("Everything in the window, larger; Ctrl+ Ctrl– Ctrl+0 too"), &si, {"100%", "110%", "125%", "150%"})) c.font_size = sizes[si];
     }
     {
         int tb = c.system_titlebar ? 1 : 0;
@@ -3444,7 +3467,8 @@ static void draw_settings(App& a) {
         if (!have_b32) btns.push_back({"b32", tr("Get fast (600 MB)")});
         if (!have_l14) btns.push_back({"l14", tr("Get best (1.7 GB)")});
         for (auto& b : btns) bw += ImGui::CalcTextSize(b.second).x + 20;
-        ImVec2 top = row(tr("Models"), desc.c_str(), std::max(bw, 1.0f), dl->busy ? nullptr : tr("Saved in your app data folder; downloaded once"));
+        ImVec2 top = row(tr("Models"), desc.c_str(), std::max(bw, 1.0f), dl->busy ? nullptr : tr("Saved in your app data folder; downloaded once"),
+                         !dl->busy && !er.empty());
         ImGui::BeginDisabled(dl->busy);
         for (size_t i = 0; i < btns.size(); i++) {
             if (i) ImGui::SameLine(0, 6);
@@ -4218,9 +4242,10 @@ static bool side_item(App& a, const char* icon, const std::string& label, bool s
     ImU32 col = ImGui::GetColorU32(ImGuiCol_Text), dim = ImGui::GetColorU32(ImGuiCol_TextDisabled);
     dl->AddText(ImVec2(p0.x + 6, y), selected ? ImGui::GetColorU32(g_accent) : dim, icon);
     std::string shown = label;
-    float maxw = p1.x - p0.x - 70;
+    float lx = 12 + ImGui::GetFontSize() * 1.15f;  // label after the icon, at any text size
+    float maxw = p1.x - p0.x - lx - 40;
     while (shown.size() > 4 && ImGui::CalcTextSize(shown.c_str()).x > maxw) shown = shown.substr(0, shown.size() - 4) + "…";
-    dl->AddText(ImVec2(p0.x + 30, y), col, shown.c_str());
+    dl->AddText(ImVec2(p0.x + lx, y), col, shown.c_str());
     if (count >= 0) {
         std::string n = count >= 10000 ? util::fmt("%.0fk", count / 1000.0) : std::to_string(count);
         ImVec2 ts = ImGui::CalcTextSize(n.c_str());
@@ -4804,7 +4829,13 @@ static void draw_settings_window(App& a) {
     ImGui::SetNextWindowSize(ImVec2(820, 640), ImGuiCond_FirstUseEver);
     ImVec2 vs = ImGui::GetMainViewport()->Size;
     ImGui::SetNextWindowPos(ImVec2(vs.x / 2, vs.y / 2), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
-    if (ImGui::Begin(tr("Settings###settingswin"), &a.show_settings, ImGuiWindowFlags_NoCollapse)) draw_settings(a);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(600, 360), ImVec2(FLT_MAX, FLT_MAX));
+    if (ImGui::Begin(tr("Settings###settingswin"), &a.show_settings, ImGuiWindowFlags_NoCollapse)) {
+        draw_settings(a);
+        if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && !ImGui::GetIO().WantTextInput && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) &&
+            ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+            a.show_settings = false;  // Esc closes, like a native preferences window
+    }
     ImGui::End();
 }
 
@@ -4991,6 +5022,20 @@ static void draw_ui(App& a) {
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_I, false)) a.inspector_on = !a.inspector_on;
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Comma, false)) a.show_settings = !a.show_settings;
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F, false)) a.focus_search = true;
+    {  // Ctrl+ / Ctrl- / Ctrl+0: text size in the same steps as Settings (100, 110, 125, 150 %)
+        static const float sizes[] = {16, 17.6f, 20, 24};
+        int si = 0;
+        for (int i = 0; i < 4; i++)
+            if (std::fabs(a.cfg.font_size - sizes[i]) < std::fabs(a.cfg.font_size - sizes[si])) si = i;
+        int to = si;
+        if (io.KeyCtrl && (ImGui::IsKeyPressed(ImGuiKey_Equal, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadAdd, false))) to = std::min(3, si + 1);
+        if (io.KeyCtrl && (ImGui::IsKeyPressed(ImGuiKey_Minus, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract, false))) to = std::max(0, si - 1);
+        if (io.KeyCtrl && (ImGui::IsKeyPressed(ImGuiKey_0, false) || ImGui::IsKeyPressed(ImGuiKey_Keypad0, false))) to = 0;
+        if (to != si && !io.WantTextInput) {
+            a.cfg.font_size = sizes[to];
+            save_config(a.cfg, a.config_file);
+        }
+    }
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z, false) && !io.WantTextInput && !a.undo_run.empty() && glfwGetTime() < a.undo_until) start_undo(a, a.undo_run);
     bool first_run = !a.cfg.first_run_done && a.stats.total == 0 && !a.pipe->running();
 

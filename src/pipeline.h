@@ -1,6 +1,9 @@
 // The four resumable stages: scan -> decide (date + location) -> vision -> organize (+ metadata write).
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+
 #include <atomic>
 #include <chrono>
 #include <deque>
