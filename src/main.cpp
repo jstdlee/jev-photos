@@ -4014,6 +4014,109 @@ static void text(const char* title, const char* desc, char* buf, size_t n, float
     if (ImGui::IsItemDeactivatedAfterEdit()) g_dirty = true;
     row_end(top, desc);
 }
+// A suggested model: its Ollama name, download size and what it is good for.
+struct ModelHint {
+    const char *name, *size, *note;
+};
+static const ModelHint kLlmHints[] = {
+    {"qwen3:4b-instruct", "2.5 GB", "Small and fast; enough for Ask search on most computers"},
+    {"gemma4:e4b", "9.5 GB", "Good in many languages"},
+    {"qwen3:30b-a3b-instruct-2507-q4_K_M", "19 GB", "Better answers and still fast (3B active); needs about 24 GB memory"},
+    {"qwen3.8:27b", "18 GB", "Best answers; slow without a strong GPU"},
+};
+static const ModelHint kVlHints[] = {
+    {"qwen3-vl:2b-instruct", "1.9 GB", "The default: small and fast"},
+    {"qwen3-vl:4b-instruct", "3.3 GB", "Reads text in screenshots better"},
+    {"qwen3-vl:8b-instruct", "6.1 GB", "The best captions of these; slower"},
+    {"gemma4:e4b", "9.5 GB", "Also a good language model: one model for both jobs"},
+};
+// Model name: a text field and a list beside it with the models the server has, then suggested ones.
+static void model_field(const char* title, const char* desc, char* buf, size_t n, const char* url, const char* key, const ModelHint* hints,
+                        int nh) {
+    struct List {
+        std::mutex mu;
+        std::string err;
+        std::vector<std::string> names;
+        std::atomic<bool> busy{false};
+    };
+    static std::map<std::string, std::shared_ptr<List>> lists;
+    std::string id = std::string(title) + desc;
+    auto& L = lists[id];
+    if (!L) L = std::make_shared<List>();
+    const float w = 300, bw = ImGui::GetFrameHeight();
+    ImVec2 top = row(title, desc, w);
+    ImGui::SetNextItemWidth(w - bw - 4);
+    ImGui::InputText(("##" + id).c_str(), buf, n);
+    if (ImGui::IsItemDeactivatedAfterEdit()) g_dirty = true;
+    ImGui::SameLine(0, 4);
+    std::string pid = "models##" + id;
+    if (ImGui::Button((ICON_CHEVRON_DOWN "##b" + id).c_str(), ImVec2(bw, 0))) {
+        ImGui::OpenPopup(pid.c_str());
+        if (!L->busy.exchange(true)) {
+            std::thread([L, u = std::string(url), k = std::string(key)] {
+                std::vector<std::string> names;
+                std::string err;
+                bool ok = list_models(u, k, names, err);
+                {
+                    std::lock_guard<std::mutex> l(L->mu);
+                    L->names = names;
+                    L->err = ok ? "" : err;
+                }
+                L->busy = false;
+                glfwPostEmptyEvent();
+            }).detach();
+        }
+    }
+    tip(tr("Models on the server, and suggested ones"));
+    {  // below the button, or above it when there is more room there
+        ImVec2 lo = ImGui::GetItemRectMin(), hi = ImGui::GetItemRectMax();
+        float below = ImGui::GetMainViewport()->WorkSize.y - hi.y - 12, above = lo.y - 12;
+        bool up = below < 360 && above > below;
+        ImGui::SetNextWindowPos(ImVec2(hi.x, up ? lo.y - 4 : hi.y + 4), ImGuiCond_Appearing, ImVec2(1, up ? 1.0f : 0.0f));
+        ImGui::SetNextWindowSizeConstraints(ImVec2(380, 0), ImVec2(std::min(760.0f, ImGui::GetMainViewport()->WorkSize.x - 40),
+                                                                      std::min(520.0f, up ? above : below)));
+    }
+    if (ImGui::BeginPopup(pid.c_str())) {
+        std::vector<std::string> names;
+        std::string err;
+        {
+            std::lock_guard<std::mutex> l(L->mu);
+            names = L->names;
+            err = L->err;
+        }
+        auto pick = [&](const std::string& m) {
+            snprintf(buf, n, "%s", m.c_str());
+            g_dirty = true;
+            ImGui::CloseCurrentPopup();
+        };
+        ImGui::SeparatorText(tr("On this server"));
+        if (L->busy) ImGui::TextDisabled("%s", tr("Asking the server..."));
+        else if (!err.empty()) ImGui::TextColored(kDanger, "%s%s", tr("Cannot reach the server: "), err.c_str());
+        else if (names.empty()) ImGui::TextDisabled("%s", tr("The server lists no models"));
+        for (auto& m : names)
+            if (ImGui::Selectable(m.c_str(), m == buf)) pick(m);
+        ImGui::SeparatorText(tr("Suggested"));
+        for (int i = 0; i < nh; i++) {
+            const ModelHint& h = hints[i];
+            bool have = std::find(names.begin(), names.end(), h.name) != names.end();
+            ImGui::PushID(i);
+            if (ImGui::Selectable(h.name, h.name == std::string(buf))) pick(h.name);
+            if (!have) tip(std::string(tr("Get it with: ")) + "ollama pull " + h.name);
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s%s%s", h.size, have ? "  ·  " : "", have ? tr("installed") : "");
+            ImGui::Indent();
+            ImGui::TextDisabled("%s", tr(h.note));
+            ImGui::Unindent();
+            ImGui::PopID();
+        }
+        ImGui::Spacing();
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 520);
+        ImGui::TextDisabled("%s", tr("Suggested names are Ollama names; other servers may call them differently."));
+        ImGui::PopTextWrapPos();
+        ImGui::EndPopup();
+    }
+    row_end(top, desc);
+}
 static void number(const char* title, const char* desc, int* v, int step = 1) {
     ImVec2 top = row(title, desc, 130);
     ImGui::SetNextItemWidth(130);
@@ -4214,7 +4317,8 @@ static void draw_settings(App& a) {
     card_begin();
     toggle(tr("Use the language model"), tr("Ask search, keywords from prompts, description and tag checks"), &c.llm_enabled);
     text(tr("Address"), tr("An OpenAI-compatible server"), a.llm_url, sizeof a.llm_url, 300, "http://127.0.0.1:8888/v1");
-    text(tr("Model"), tr("The model name on that server"), a.llm_model, sizeof a.llm_model, 300);
+    model_field(tr("Model"), tr("The model name on that server"), a.llm_model, sizeof a.llm_model, a.llm_url, a.llm_key, kLlmHints,
+                IM_ARRAYSIZE(kLlmHints));
     text(tr("API key"), tr("Only for servers that need one; kept in the settings file (mode 0600)"), a.llm_key, sizeof a.llm_key, 300, "", true);
     toggle(tr("Disable thinking"), tr("Much faster answers from reasoning models (Qwen3 style)"), &c.llm_no_think);
     {
@@ -4252,7 +4356,8 @@ static void draw_settings(App& a) {
         card_begin();
         toggle(tr("Use a vision model"), tr("Captions and text in screenshots; needs a model server and a lot of memory"), &c.vl_enabled);
         text(tr("Address"), tr("OpenAI-compatible, e.g. http://127.0.0.1:11434/v1"), a.vl_url, sizeof a.vl_url, 300);
-        text(tr("Model"), tr("The vision model name"), a.vl_model, sizeof a.vl_model, 300);
+        model_field(tr("Model"), tr("The vision model name"), a.vl_model, sizeof a.vl_model, a.vl_url, a.vl_key, kVlHints,
+                    IM_ARRAYSIZE(kVlHints));
         text(tr("API key"), tr("Only when the server needs one"), a.vl_key, sizeof a.vl_key, 300, "", true);
         text(tr("Tag language"), tr("The language of the tags it writes"), a.vl_lang, sizeof a.vl_lang, 160);
         slider_i(tr("Screenshot image side"), tr("Size of images sent for screenshots and text (px)"), &c.vl_max_side, 384, 1024);
@@ -7398,8 +7503,12 @@ int main(int argc, char** argv) {
             static size_t si = 0;
             static double next_t = glfwGetTime() + 3.0;
             static ImGuiKey release = ImGuiKey_None;
+            static bool mouse_up = false;
             ImGuiIO& sio = ImGui::GetIO();
-            if (release != ImGuiKey_None) {
+            if (mouse_up) {
+                sio.AddMouseButtonEvent(0, false);
+                mouse_up = false;
+            } else if (release != ImGuiKey_None) {
                 sio.AddKeyEvent(release, false);
                 release = ImGuiKey_None;
             } else if (glfwGetTime() >= next_t) {
@@ -7438,6 +7547,7 @@ int main(int argc, char** argv) {
                             auto xy = util::split(t.substr(6), ';');
                             if (xy.size() == 2) sio.AddMousePosEvent(float(atof(xy[0].c_str())), float(atof(xy[1].c_str())));
                         }
+                        else if (t == "click") { sio.AddMouseButtonEvent(0, true); mouse_up = true; }
                         else if (util::starts_with(t, "wheel:")) sio.AddMouseWheelEvent(0, float(atof(t.substr(6).c_str())));
                         else if (t == "inspector") app.inspector_on = !app.inspector_on;
                         else if (util::starts_with(t, "type:")) sio.AddInputCharactersUTF8(t.substr(5).c_str());

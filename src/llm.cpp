@@ -1,5 +1,7 @@
 #include "llm.h"
 
+#include <algorithm>
+
 #include "http.h"
 #include "nlohmann/json.hpp"
 #include "util.h"
@@ -43,4 +45,19 @@ bool llm_health(const Config& c, std::string& detail) {
         for (auto& m : j["data"]) found |= m.value("id", "") == c.llm_model;
     detail = found ? c.llm_model + " ready" : "server up, model " + c.llm_model + " not listed";
     return found;
+}
+
+bool list_models(const std::string& url, const std::string& key, std::vector<std::string>& names, std::string& err) {
+    names.clear();
+    HttpResponse h = http_get(url_join(url, "/models"), key, 5);
+    if (!h.ok()) {
+        err = h.error.empty() ? "HTTP " + std::to_string(h.status) : h.error;
+        return false;
+    }
+    json j = json::parse(h.body, nullptr, false);
+    if (j.contains("data") && j["data"].is_array())
+        for (auto& m : j["data"])
+            if (m.is_object() && m.contains("id") && m["id"].is_string()) names.push_back(m["id"].get<std::string>());
+    std::sort(names.begin(), names.end());
+    return true;
 }
